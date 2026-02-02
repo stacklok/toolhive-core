@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    uses: ./.github/workflows/lint.yml
+
+  test:
+    name: Test
+    uses: ./.github/workflows/test.yml
+    secrets: inherit
+
+  license-headers:
+    name: License Headers
+    uses: ./.github/workflows/license-headers.yml
+
+  security:
+    name: Security
+    # TODO: Add security-events: write once repo is public
+    uses: ./.github/workflows/security.yml

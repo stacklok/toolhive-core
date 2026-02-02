@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+version: '3'
+
+tasks:
+  default:
+    desc: Run all checks (lint + test)
+    deps: [lint, test]
+
+  lint:
+    desc: Run linting tools
+    cmds:
+      - golangci-lint run ./...
+      - go vet ./...
+
+  lint-fix:
+    desc: Run linting tools and apply fixes
+    cmds:
+      - golangci-lint run --fix ./...
+
+  test:
+    desc: Run unit tests with race detection
+    cmds:
+      - go test -race ./...
+
+  test-coverage:
+    desc: Run unit tests with coverage analysis
+    cmds:
+      - go test -race -coverprofile=coverage.out -covermode=atomic ./...
+      - go tool cover -func=coverage.out
+      - echo "Generating HTML coverage report in coverage.html"
+      - go tool cover -html=coverage.out -o coverage.html
+
+  addlicense-install:
+    desc: Install the addlicense tool for license header management
+    status:
+      - which addlicense
+    cmds:
+      - go install github.com/google/addlicense@latest
+
+  license-check:
+    desc: Check that all Go files have proper SPDX license headers
+    deps: [addlicense-install]
+    cmds:
+      - addlicense -check -f .github/license-header.txt -ignore '**/mocks/**' -ignore '**/testdata/**' -ignore 'vendor/**' -ignore '**/*.pb.go' -ignore '**/zz_generated*.go' $(find . -name '*.go' -type f)
+
+  license-fix:
+    desc: Add SPDX license headers to Go files that are missing them
+    deps: [addlicense-install]
+    cmds:
+      - addlicense -f .github/license-header.txt -ignore '**/mocks/**' -ignore '**/testdata/**' -ignore 'vendor/**' -ignore '**/*.pb.go' -ignore '**/zz_generated*.go' $(find . -name '*.go' -type f)
+
+  mock-install:
+    desc: Install the mockgen tool for mock generation
+    status:
+      - which mockgen
+    cmds:
+      - go install go.uber.org/mock/mockgen@latest
+
+  gen:
+    desc: Generate mock files using go generate
+    deps: [mock-install]
+    cmds:
+      - go generate ./...
+
+  tidy:
+    desc: Tidy and verify go modules
+    cmds:
+      - go mod tidy
+      - go mod verify
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - rm -f coverage.out coverage.html

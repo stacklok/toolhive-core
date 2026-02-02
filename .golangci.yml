@@ -1,0 +1,128 @@
+# SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+version: "2"
+run:
+  issues-exit-code: 1
+output:
+  formats:
+    text:
+      path: stdout
+      print-linter-name: true
+      print-issued-lines: true
+linters:
+  default: none
+  enable:
+    - depguard
+    - errcheck
+    - exhaustive
+    - goconst
+    - gocyclo
+    - gosec
+    - govet
+    - ineffassign
+    - lll
+    - paralleltest
+    - revive
+    - staticcheck
+    - thelper
+    - tparallel
+    - unparam
+    - unused
+  settings:
+    depguard:
+      rules:
+        prevent_unmaintained_packages:
+          list-mode: lax
+          files:
+            - $all
+            - '!$test'
+          deny:
+            - pkg: io/ioutil
+              desc: this is deprecated
+    gocyclo:
+      min-complexity: 15
+    gosec:
+      excludes:
+        - G601
+    lll:
+      line-length: 130
+    revive:
+      severity: warning
+      rules:
+        - name: blank-imports
+          severity: warning
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: duplicated-imports
+        - name: error-naming
+        - name: error-return
+        - name: exported
+          severity: error
+        - name: if-return
+        - name: identical-branches
+        - name: indent-error-flow
+        - name: import-shadowing
+        - name: package-comments
+        - name: redefines-builtin-id
+        - name: struct-tag
+        - name: unconditional-recursion
+        - name: unnecessary-stmt
+        - name: unreachable-code
+        - name: unused-parameter
+        - name: unused-receiver
+        - name: unhandled-error
+          disabled: true
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - lll
+          - gocyclo
+          - errcheck
+          - dupl
+          - gosec
+        path: (.+)_test\.go
+      - linters:
+          - lll
+        path: .golangci.yml
+      # These are auto-generated, so it makes no sense including them.
+      - linters:
+          - dupl
+          - errcheck
+          - gci
+          - gocyclo
+          - gosec
+          - lll
+        path: (.*)mock_(.+)\.go
+      # These are auto-generated, so it makes no sense including them.
+      - linters:
+          - dupl
+          - errcheck
+          - gci
+          - gocyclo
+          - gosec
+          - lll
+        path: (.*)zz_generated\.deepcopy\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+      - scripts$
+formatters:
+  enable:
+    - gci
+    - gofmt
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/stacklok/toolhive-core)
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+      - scripts$
