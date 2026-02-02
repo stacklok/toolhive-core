@@ -29,7 +29,5 @@ jobs:
 
   security:
     name: Security
-    permissions:
-      contents: read
-      security-events: write
+    # TODO: Add security-events: write once repo is public
     uses: ./.github/workflows/security.yml
