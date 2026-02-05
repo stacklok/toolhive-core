@@ -3,9 +3,12 @@ module github.com/stacklok/toolhive-core
 go 1.25.6
 
 require (
+	github.com/go-logr/logr v1.4.3
+	github.com/go-logr/zapr v1.3.0
 	github.com/google/cel-go v0.27.0
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/mock v0.6.0
+	go.uber.org/zap v1.27.1
 	golang.org/x/net v0.49.0
 )
 
