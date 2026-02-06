@@ -7,15 +7,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
-	"oras.land/oras-go/v2/content/memory"
-	"oras.land/oras-go/v2/errdef"
 	"oras.land/oras-go/v2/registry"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
@@ -29,38 +27,33 @@ const MaxManifestSize int64 = 1 * 1024 * 1024
 const MaxBlobSize int64 = 100 * 1024 * 1024
 
 // maxIndexManifests is the maximum number of manifests in an image index.
-// Skill artifacts typically have 2-3 platforms; 32 is generous.
 const maxIndexManifests = 32
 
 // maxManifestLayers is the maximum number of layers in a manifest.
-// Skill artifacts typically have 1 layer; 64 is generous.
 const maxManifestLayers = 64
 
-// Compile-time check that Registry implements RegistryClient.
-var _ RegistryClient = (*Registry)(nil)
-
-// registryTarget combines the ORAS interfaces needed for both push (Target) and pull (ReadOnlyTarget).
-type registryTarget interface {
-	oras.Target
-}
+// Compile-time interface checks.
+var (
+	_ RegistryClient = (*Registry)(nil)
+	_ oras.Target    = (*storeAdapter)(nil)
+	_ oras.Target    = (*validatingTarget)(nil)
+)
 
 // Registry provides operations for pushing and pulling skills from OCI registries.
 type Registry struct {
 	credStore credentials.Store
-	plainHTTP bool // Use HTTP instead of HTTPS (insecure)
+	plainHTTP bool
 
 	// newTarget creates an oras.Target for the given reference.
 	// Defaults to creating an authenticated remote.Repository.
 	// Override in tests to inject an in-memory store.
-	newTarget func(ref registry.Reference) (registryTarget, error)
+	newTarget func(ref registry.Reference) (oras.Target, error)
 }
 
 // RegistryOption configures a Registry.
 type RegistryOption func(*Registry)
 
 // WithPlainHTTP configures whether the registry client uses plain HTTP (insecure) connections.
-// When enabled, the client will use HTTP instead of HTTPS.
-// This is useful for local development registries that don't have TLS.
 func WithPlainHTTP(enabled bool) RegistryOption {
 	return func(r *Registry) {
 		r.plainHTTP = enabled
@@ -84,7 +77,6 @@ func NewRegistry(opts ...RegistryOption) (*Registry, error) {
 		opt(r)
 	}
 
-	// Use Docker credential store if none was provided
 	if r.credStore == nil {
 		credStore, err := credentials.NewStoreFromDocker(credentials.StoreOptions{})
 		if err != nil {
@@ -93,7 +85,6 @@ func NewRegistry(opts ...RegistryOption) (*Registry, error) {
 		r.credStore = credStore
 	}
 
-	// Default to creating remote repositories
 	if r.newTarget == nil {
 		r.newTarget = r.defaultNewTarget
 	}
@@ -109,46 +100,27 @@ func (r *Registry) Push(ctx context.Context, store *Store, artifactDigest digest
 		return err
 	}
 
-	// Check if this is an index or manifest
-	isIndex, err := store.IsIndex(ctx, artifactDigest)
+	adapter := newStoreAdapter(store)
+
+	// Resolve the artifact to get its descriptor for oras.CopyGraph
+	desc, err := adapter.descriptorFromDigest(ctx, artifactDigest)
 	if err != nil {
-		return fmt.Errorf("checking artifact type: %w", err)
+		return fmt.Errorf("resolving artifact descriptor: %w", err)
 	}
 
-	// Create in-memory store for the push operation
-	memStore := memory.New()
-
-	var tagDesc ocispec.Descriptor
-
-	if isIndex {
-		tagDesc, err = r.stageIndex(ctx, store, memStore, artifactDigest)
-		if err != nil {
-			return err
-		}
-	} else {
-		tagDesc, err = r.stageManifest(ctx, store, memStore, artifactDigest)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Tag in memory store using just the tag/digest part
-	if err := memStore.Tag(ctx, tagDesc, parsedRef.Reference); err != nil {
-		return fmt.Errorf("tagging artifact: %w", err)
-	}
-
-	// Create remote target
 	target, err := r.newTarget(parsedRef)
 	if err != nil {
 		return fmt.Errorf("getting repository: %w", err)
 	}
 
-	// Copy from memory store to remote
-	_, err = oras.Copy(
-		ctx, memStore, parsedRef.Reference, target, parsedRef.Reference, oras.DefaultCopyOptions,
-	)
-	if err != nil {
+	// Copy the content graph (blobs → manifests → index) to the remote
+	if err := oras.CopyGraph(ctx, adapter, target, desc, oras.DefaultCopyGraphOptions); err != nil {
 		return fmt.Errorf("pushing to registry: %w", err)
+	}
+
+	// Tag on the remote with the requested reference
+	if err := target.Tag(ctx, desc, parsedRef.Reference); err != nil {
+		return fmt.Errorf("tagging remote: %w", err)
 	}
 
 	return nil
@@ -167,381 +139,167 @@ func (r *Registry) Pull(ctx context.Context, store *Store, ref string) (digest.D
 		return "", fmt.Errorf("getting repository: %w", err)
 	}
 
-	// Create size-limited in-memory store to prevent OOM attacks.
-	memStore := newSizeLimitedStore()
+	adapter := newStoreAdapter(store)
+	validated := newValidatingTarget(adapter)
 
-	// Copy from remote to memory store
+	// Copy from remote to the validated local store
 	desc, err := oras.Copy(
-		ctx, target, parsedRef.Reference, memStore, parsedRef.Reference, oras.DefaultCopyOptions,
+		ctx, target, parsedRef.Reference, validated, parsedRef.Reference, oras.DefaultCopyOptions,
 	)
 	if err != nil {
 		return "", fmt.Errorf("pulling from registry: %w", err)
 	}
 
-	// Detect if this is an index or manifest.
-	// Use the underlying memory.Store for read operations - size limits were
-	// already enforced during the oras.Copy above via the sizeLimitedStore wrapper.
-	if desc.MediaType == MediaTypeImageIndex {
-		indexDigest, err := r.storeIndex(ctx, store, memStore.store, desc)
-		if err != nil {
-			return "", err
-		}
-		if err := store.Tag(ctx, indexDigest, ref); err != nil {
-			return "", fmt.Errorf("tagging index locally: %w", err)
-		}
-		return indexDigest, nil
+	// oras.Copy already tagged with the short reference (parsedRef.Reference, e.g. "v1.0.0").
+	// Additionally tag with the full OCI reference for local resolution.
+	if err := store.Tag(ctx, desc.Digest, ref); err != nil {
+		return "", fmt.Errorf("tagging locally: %w", err)
 	}
 
-	// Handle direct manifest (single-platform artifact)
-	return r.storeManifestFromMemory(ctx, store, memStore.store, desc, ref)
+	return desc.Digest, nil
 }
 
-// stageIndex stages an index and its referenced manifests/blobs to memory store.
-func (r *Registry) stageIndex(
-	ctx context.Context, store *Store, memStore *memory.Store, indexDigest digest.Digest,
-) (ocispec.Descriptor, error) {
-	index, err := store.GetIndex(ctx, indexDigest)
-	if err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("getting index: %w", err)
-	}
-
-	if len(index.Manifests) > maxIndexManifests {
-		return ocispec.Descriptor{}, fmt.Errorf(
-			"index has %d manifests, exceeds maximum of %d", len(index.Manifests), maxIndexManifests,
-		)
-	}
-
-	indexBytes, err := store.GetManifest(ctx, indexDigest)
-	if err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("getting index bytes: %w", err)
-	}
-
-	// Stage manifests referenced by the index (deduplicate shared digests)
-	stagedManifests := make(map[string]bool)
-	for _, desc := range index.Manifests {
-		if stagedManifests[desc.Digest] {
-			continue
-		}
-		stagedManifests[desc.Digest] = true
-
-		manifestDigest, err := digest.Parse(desc.Digest)
-		if err != nil {
-			return ocispec.Descriptor{}, fmt.Errorf("parsing manifest digest: %w", err)
-		}
-
-		if _, err := r.stageManifest(ctx, store, memStore, manifestDigest); err != nil {
-			return ocispec.Descriptor{}, fmt.Errorf("staging manifest %s: %w", desc.Digest, err)
-		}
-	}
-
-	// Stage the index itself
-	indexDesc := ocispec.Descriptor{
-		MediaType:    index.MediaType,
-		Digest:       indexDigest,
-		Size:         int64(len(indexBytes)),
-		ArtifactType: index.ArtifactType,
-		Annotations:  index.Annotations,
-	}
-	if err := memStore.Push(ctx, indexDesc, bytes.NewReader(indexBytes)); err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("staging index: %w", err)
-	}
-
-	return indexDesc, nil
+// storeAdapter wraps a Store to satisfy ORAS content interfaces,
+// routing content by media type to the appropriate Store methods.
+type storeAdapter struct {
+	store *Store
 }
 
-// stageManifest stages a manifest and its blobs to memory store.
-func (r *Registry) stageManifest(
-	ctx context.Context, store *Store, memStore *memory.Store, manifestDigest digest.Digest,
-) (ocispec.Descriptor, error) {
-	manifestBytes, err := store.GetManifest(ctx, manifestDigest)
+func newStoreAdapter(store *Store) *storeAdapter {
+	return &storeAdapter{store: store}
+}
+
+// Push routes content to PutManifest or PutBlob based on media type.
+// Verifies the content digest matches the expected descriptor.
+func (a *storeAdapter) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
+	data, err := io.ReadAll(io.LimitReader(content, MaxBlobSize+1))
 	if err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("getting manifest: %w", err)
+		return fmt.Errorf("reading content: %w", err)
+	}
+	if int64(len(data)) > MaxBlobSize {
+		return fmt.Errorf("content exceeds maximum size of %d bytes", MaxBlobSize)
 	}
 
-	var manifest ocispec.Manifest
-	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("parsing manifest: %w", err)
+	// Verify digest integrity
+	actual := digest.FromBytes(data)
+	if actual != expected.Digest {
+		return fmt.Errorf("digest mismatch: expected %s, got %s", expected.Digest, actual)
 	}
 
-	if len(manifest.Layers) > maxManifestLayers {
-		return ocispec.Descriptor{}, fmt.Errorf(
-			"manifest has %d layers, exceeds maximum of %d", len(manifest.Layers), maxManifestLayers,
-		)
+	if isManifestMediaType(expected.MediaType) {
+		_, err = a.store.PutManifest(ctx, data)
+	} else {
+		_, err = a.store.PutBlob(ctx, data)
 	}
+	return err
+}
 
-	if err := r.stageBlobs(ctx, store, memStore, &manifest); err != nil {
+// Fetch retrieves content from the store by descriptor.
+func (a *storeAdapter) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {
+	var data []byte
+	var err error
+
+	if isManifestMediaType(target.MediaType) {
+		data, err = a.store.GetManifest(ctx, target.Digest)
+	} else {
+		data, err = a.store.GetBlob(ctx, target.Digest)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// Exists checks whether content exists in the store.
+func (a *storeAdapter) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
+	if isManifestMediaType(target.MediaType) {
+		_, err := a.store.GetManifest(ctx, target.Digest)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	}
+	_, err := a.store.GetBlob(ctx, target.Digest)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// Resolve resolves a reference (tag or digest) to a full descriptor.
+func (a *storeAdapter) Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error) {
+	d, err := a.store.Resolve(ctx, reference)
+	if err != nil {
 		return ocispec.Descriptor{}, err
 	}
-
-	manifestDesc := ocispec.Descriptor{
-		MediaType:    manifest.MediaType,
-		Digest:       manifestDigest,
-		Size:         int64(len(manifestBytes)),
-		ArtifactType: manifest.ArtifactType,
-		Annotations:  manifest.Annotations,
-	}
-	if err := memStore.Push(ctx, manifestDesc, bytes.NewReader(manifestBytes)); err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("staging manifest: %w", err)
-	}
-
-	return manifestDesc, nil
+	return a.descriptorFromDigest(ctx, d)
 }
 
-// stageBlobs stages config and layer blobs from local store to memory store.
-// Blobs that already exist in the memory store are skipped (this happens when
-// multiple platform manifests share the same blobs).
-func (*Registry) stageBlobs(
-	ctx context.Context, store *Store, memStore *memory.Store, manifest *ocispec.Manifest,
-) error {
-	configBytes, err := store.GetBlob(ctx, manifest.Config.Digest)
+// Tag associates a reference with a descriptor in the store.
+func (a *storeAdapter) Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error {
+	return a.store.Tag(ctx, desc.Digest, reference)
+}
+
+// descriptorFromDigest reads content to build a full OCI descriptor.
+func (a *storeAdapter) descriptorFromDigest(ctx context.Context, d digest.Digest) (ocispec.Descriptor, error) {
+	data, err := a.store.GetManifest(ctx, d)
 	if err != nil {
-		return fmt.Errorf("getting config blob: %w", err)
-	}
-	configDesc := ocispec.Descriptor{
-		MediaType: manifest.Config.MediaType,
-		Digest:    manifest.Config.Digest,
-		Size:      int64(len(configBytes)),
-	}
-	if err := memStore.Push(ctx, configDesc, bytes.NewReader(configBytes)); err != nil &&
-		!errors.Is(err, errdef.ErrAlreadyExists) {
-		return fmt.Errorf("staging config: %w", err)
+		return ocispec.Descriptor{}, fmt.Errorf("reading content for descriptor: %w", err)
 	}
 
-	for _, layer := range manifest.Layers {
-		layerBytes, err := store.GetBlob(ctx, layer.Digest)
-		if err != nil {
-			return fmt.Errorf("getting layer blob: %w", err)
-		}
-		layerDesc := ocispec.Descriptor{
-			MediaType: layer.MediaType,
-			Digest:    layer.Digest,
-			Size:      int64(len(layerBytes)),
-		}
-		if err := memStore.Push(ctx, layerDesc, bytes.NewReader(layerBytes)); err != nil &&
-			!errors.Is(err, errdef.ErrAlreadyExists) {
-			return fmt.Errorf("staging layer: %w", err)
-		}
+	var header struct {
+		MediaType string `json:"mediaType"`
+	}
+	if err := json.Unmarshal(data, &header); err != nil {
+		return ocispec.Descriptor{}, fmt.Errorf("parsing media type: %w", err)
 	}
 
-	return nil
+	return ocispec.Descriptor{
+		MediaType: header.MediaType,
+		Digest:    d,
+		Size:      int64(len(data)),
+	}, nil
 }
 
-// storeIndex stores an index and its referenced content from memory to local store.
-func (r *Registry) storeIndex(
-	ctx context.Context, store *Store, memStore *memory.Store, desc ocispec.Descriptor,
-) (digest.Digest, error) {
-	indexReader, err := memStore.Fetch(ctx, desc)
-	if err != nil {
-		return "", fmt.Errorf("fetching index: %w", err)
-	}
-
-	// Defense-in-depth: re-enforce size limits even though sizeLimitedStore already checked
-	limitedReader := io.LimitReader(indexReader, MaxManifestSize+1)
-	indexBytes, err := io.ReadAll(limitedReader)
-	if closeErr := indexReader.Close(); closeErr != nil && err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return "", fmt.Errorf("reading index: %w", err)
-	}
-
-	if int64(len(indexBytes)) > MaxManifestSize {
-		return "", fmt.Errorf("index exceeds maximum size of %d bytes", MaxManifestSize)
-	}
-
-	var index ImageIndex
-	if err := json.Unmarshal(indexBytes, &index); err != nil {
-		return "", fmt.Errorf("parsing index: %w", err)
-	}
-
-	if len(index.Manifests) > maxIndexManifests {
-		return "", fmt.Errorf(
-			"index has %d manifests, exceeds maximum of %d", len(index.Manifests), maxIndexManifests,
-		)
-	}
-
-	// Store manifests referenced by the index
-	storedManifests := make(map[string]bool)
-	for _, manifestDesc := range index.Manifests {
-		if storedManifests[manifestDesc.Digest] {
-			continue
-		}
-		storedManifests[manifestDesc.Digest] = true
-
-		manifestDigest, err := digest.Parse(manifestDesc.Digest)
-		if err != nil {
-			return "", fmt.Errorf("parsing manifest digest: %w", err)
-		}
-
-		ociDesc := ocispec.Descriptor{
-			MediaType: manifestDesc.MediaType,
-			Digest:    manifestDigest,
-			Size:      manifestDesc.Size,
-		}
-
-		if _, err := r.storeManifestFromMemory(ctx, store, memStore, ociDesc, ""); err != nil {
-			return "", fmt.Errorf("storing manifest %s: %w", manifestDesc.Digest, err)
-		}
-	}
-
-	indexDigest, err := store.PutManifest(ctx, indexBytes)
-	if err != nil {
-		return "", fmt.Errorf("storing index: %w", err)
-	}
-
-	return indexDigest, nil
+// validatingTarget wraps an oras.Target to enforce size and count limits
+// on pushed content. This prevents OOM and resource exhaustion from
+// malicious registries during pull operations.
+type validatingTarget struct {
+	inner oras.Target
 }
 
-// storeManifestFromMemory stores a manifest and its blobs from memory to local store.
-func (r *Registry) storeManifestFromMemory(
-	ctx context.Context, store *Store, memStore *memory.Store, desc ocispec.Descriptor, ref string,
-) (digest.Digest, error) {
-	manifest, manifestBytes, err := r.fetchManifest(ctx, memStore, desc)
-	if err != nil {
-		return "", err
-	}
-
-	if err := r.storeBlobs(ctx, store, memStore, manifest); err != nil {
-		return "", err
-	}
-
-	storedDigest, err := store.PutManifest(ctx, manifestBytes)
-	if err != nil {
-		return "", fmt.Errorf("storing manifest: %w", err)
-	}
-
-	if ref != "" {
-		if err := store.Tag(ctx, storedDigest, ref); err != nil {
-			return "", fmt.Errorf("tagging locally: %w", err)
-		}
-	}
-
-	return storedDigest, nil
+func newValidatingTarget(inner oras.Target) *validatingTarget {
+	return &validatingTarget{inner: inner}
 }
 
-// fetchManifest fetches and parses a manifest from a memory store.
-func (*Registry) fetchManifest(
-	ctx context.Context, memStore *memory.Store, desc ocispec.Descriptor,
-) (*ocispec.Manifest, []byte, error) {
-	manifestReader, err := memStore.Fetch(ctx, desc)
-	if err != nil {
-		return nil, nil, fmt.Errorf("fetching manifest: %w", err)
-	}
-
-	// Defense-in-depth: re-enforce size limits even though sizeLimitedStore already checked
-	limitedReader := io.LimitReader(manifestReader, MaxManifestSize+1)
-	manifestBytes, err := io.ReadAll(limitedReader)
-	if closeErr := manifestReader.Close(); closeErr != nil && err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return nil, nil, fmt.Errorf("reading manifest: %w", err)
-	}
-
-	if int64(len(manifestBytes)) > MaxManifestSize {
-		return nil, nil, fmt.Errorf("manifest exceeds maximum size of %d bytes", MaxManifestSize)
-	}
-
-	var manifest ocispec.Manifest
-	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
-		return nil, nil, fmt.Errorf("parsing manifest: %w", err)
-	}
-
-	if len(manifest.Layers) > maxManifestLayers {
-		return nil, nil, fmt.Errorf(
-			"manifest has %d layers, exceeds maximum of %d", len(manifest.Layers), maxManifestLayers,
-		)
-	}
-
-	return &manifest, manifestBytes, nil
+// Fetch delegates to the inner target.
+func (v *validatingTarget) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {
+	return v.inner.Fetch(ctx, target)
 }
 
-// storeBlobs stores config and layer blobs from memory store to local store.
-func (*Registry) storeBlobs(
-	ctx context.Context, store *Store, memStore *memory.Store, manifest *ocispec.Manifest,
-) error {
-	if err := storeBlobFromMemory(ctx, store, memStore, manifest.Config); err != nil {
-		return fmt.Errorf("storing config: %w", err)
-	}
-
-	for _, layer := range manifest.Layers {
-		if err := storeBlobFromMemory(ctx, store, memStore, layer); err != nil {
-			return fmt.Errorf("storing layer: %w", err)
-		}
-	}
-
-	return nil
+// Exists delegates to the inner target.
+func (v *validatingTarget) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
+	return v.inner.Exists(ctx, target)
 }
 
-// storeBlobFromMemory fetches a blob from memory store and stores it in local store.
-func storeBlobFromMemory(
-	ctx context.Context, store *Store, memStore *memory.Store, desc ocispec.Descriptor,
-) error {
-	reader, err := memStore.Fetch(ctx, desc)
-	if err != nil {
-		return fmt.Errorf("fetching blob: %w", err)
-	}
-
-	limitedReader := io.LimitReader(reader, MaxBlobSize+1)
-	data, err := io.ReadAll(limitedReader)
-	if closeErr := reader.Close(); closeErr != nil && err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return fmt.Errorf("reading blob: %w", err)
-	}
-
-	if int64(len(data)) > MaxBlobSize {
-		return fmt.Errorf("blob exceeds maximum size of %d bytes", MaxBlobSize)
-	}
-
-	if _, err := store.PutBlob(ctx, data); err != nil {
-		return fmt.Errorf("storing blob: %w", err)
-	}
-	return nil
+// Resolve delegates to the inner target.
+func (v *validatingTarget) Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error) {
+	return v.inner.Resolve(ctx, reference)
 }
 
-// sizeLimitedStore wraps a memory store to enforce size limits during Push operations.
-// This prevents OOM attacks by rejecting oversized content before it's stored in memory.
-// Uses explicit composition (not embedding) to avoid exposing unguarded methods.
-type sizeLimitedStore struct {
-	store *memory.Store
+// Tag delegates to the inner target.
+func (v *validatingTarget) Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error {
+	return v.inner.Tag(ctx, desc, reference)
 }
 
-// newSizeLimitedStore creates a new size-limited store wrapper.
-func newSizeLimitedStore() *sizeLimitedStore {
-	return &sizeLimitedStore{store: memory.New()}
-}
-
-// Exists delegates to the underlying store.
-func (s *sizeLimitedStore) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
-	return s.store.Exists(ctx, target)
-}
-
-// Fetch delegates to the underlying store.
-func (s *sizeLimitedStore) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {
-	return s.store.Fetch(ctx, target)
-}
-
-// Resolve delegates to the underlying store.
-func (s *sizeLimitedStore) Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error) {
-	return s.store.Resolve(ctx, reference)
-}
-
-// Tag delegates to the underlying store.
-func (s *sizeLimitedStore) Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error {
-	return s.store.Tag(ctx, desc, reference)
-}
-
-// Predecessors delegates to the underlying store.
-func (s *sizeLimitedStore) Predecessors(
-	ctx context.Context, node ocispec.Descriptor,
-) ([]ocispec.Descriptor, error) {
-	return s.store.Predecessors(ctx, node)
-}
-
-// Push validates content size before storing to prevent OOM attacks.
-func (s *sizeLimitedStore) Push(ctx context.Context, desc ocispec.Descriptor, content io.Reader) error {
+// Push validates size and structure limits before delegating to the inner target.
+func (v *validatingTarget) Push(ctx context.Context, desc ocispec.Descriptor, content io.Reader) error {
 	maxSize := MaxBlobSize
 	if isManifestMediaType(desc.MediaType) {
 		maxSize = MaxManifestSize
@@ -550,7 +308,6 @@ func (s *sizeLimitedStore) Push(ctx context.Context, desc ocispec.Descriptor, co
 	if desc.Size < 0 {
 		return fmt.Errorf("invalid negative content size %d", desc.Size)
 	}
-
 	if desc.Size > maxSize {
 		return fmt.Errorf(
 			"content size %d exceeds maximum allowed size %d for media type %q",
@@ -558,9 +315,8 @@ func (s *sizeLimitedStore) Push(ctx context.Context, desc ocispec.Descriptor, co
 		)
 	}
 
-	// Wrap the reader to enforce the limit in case descriptor.Size is lying
+	// Read with a limit to defend against lying descriptors
 	limitedReader := io.LimitReader(content, maxSize+1)
-
 	data, err := io.ReadAll(limitedReader)
 	if err != nil {
 		return fmt.Errorf("reading content: %w", err)
@@ -573,8 +329,45 @@ func (s *sizeLimitedStore) Push(ctx context.Context, desc ocispec.Descriptor, co
 		)
 	}
 
-	if err := s.store.Push(ctx, desc, bytes.NewReader(data)); err != nil {
-		return fmt.Errorf("pushing to underlying store: %w", err)
+	// Verify digest integrity — defense-in-depth against a lying registry
+	actual := digest.FromBytes(data)
+	if actual != desc.Digest {
+		return fmt.Errorf("digest mismatch: expected %s, got %s", desc.Digest, actual)
+	}
+
+	// Validate manifest/index structure limits
+	if err := validateManifestCounts(desc.MediaType, data); err != nil {
+		return err
+	}
+
+	return v.inner.Push(ctx, desc, bytes.NewReader(data))
+}
+
+// validateManifestCounts checks layer/manifest counts for resource exhaustion prevention.
+func validateManifestCounts(mediaType string, data []byte) error {
+	switch mediaType {
+	case MediaTypeImageIndex:
+		var index ImageIndex
+		if err := json.Unmarshal(data, &index); err != nil {
+			return fmt.Errorf("parsing index: %w", err)
+		}
+		if len(index.Manifests) > maxIndexManifests {
+			return fmt.Errorf(
+				"index has %d manifests, exceeds maximum of %d",
+				len(index.Manifests), maxIndexManifests,
+			)
+		}
+	case MediaTypeImageManifest:
+		var manifest ocispec.Manifest
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			return fmt.Errorf("parsing manifest: %w", err)
+		}
+		if len(manifest.Layers) > maxManifestLayers {
+			return fmt.Errorf(
+				"manifest has %d layers, exceeds maximum of %d",
+				len(manifest.Layers), maxManifestLayers,
+			)
+		}
 	}
 	return nil
 }
@@ -604,7 +397,7 @@ func parseReference(ref string) (registry.Reference, error) {
 }
 
 // defaultNewTarget creates a remote repository client for the given parsed reference.
-func (r *Registry) defaultNewTarget(ref registry.Reference) (registryTarget, error) {
+func (r *Registry) defaultNewTarget(ref registry.Reference) (oras.Target, error) {
 	repoPath := ref.Registry + "/" + ref.Repository
 
 	repo, err := remote.NewRepository(repoPath)

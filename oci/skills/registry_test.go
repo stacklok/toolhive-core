@@ -12,6 +12,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/memory"
 	"oras.land/oras-go/v2/registry"
 )
@@ -44,32 +45,15 @@ func TestParseReference(t *testing.T) {
 		ref     string
 		wantErr bool
 	}{
-		{
-			name:    "valid reference with tag",
-			ref:     "ghcr.io/myorg/skill:v1.0.0",
-			wantErr: false,
-		},
-		{
-			name:    "valid reference with digest",
-			ref:     "ghcr.io/myorg/skill@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-			wantErr: false,
-		},
-		{
-			name:    "missing tag or digest",
-			ref:     "ghcr.io/myorg/skill",
-			wantErr: true,
-		},
-		{
-			name:    "invalid reference",
-			ref:     ":::invalid",
-			wantErr: true,
-		},
+		{"valid tag", "ghcr.io/myorg/skill:v1.0.0", false},
+		{"valid digest", "ghcr.io/myorg/skill@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", false},
+		{"missing tag or digest", "ghcr.io/myorg/skill", true},
+		{"invalid reference", ":::invalid", true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-
 			_, err := parseReference(tt.ref)
 			if tt.wantErr {
 				require.Error(t, err)
@@ -100,60 +84,54 @@ func TestIsManifestMediaType(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-
-			got := isManifestMediaType(tt.mediaType)
-			assert.Equal(t, tt.want, got)
+			assert.Equal(t, tt.want, isManifestMediaType(tt.mediaType))
 		})
 	}
 }
 
-func TestSizeLimitedStore_RejectOversizedContent(t *testing.T) {
+// --- validatingTarget tests ---
+
+func TestValidatingTarget_RejectOversizedContent(t *testing.T) {
 	t.Parallel()
 
 	ctx := t.Context()
-	store := newSizeLimitedStore()
+	vt := newValidatingTarget(memory.New())
 
-	// Create a descriptor that claims to exceed MaxManifestSize
-	oversizedManifest := make([]byte, MaxManifestSize+1)
-	manifestDigest := digest.FromBytes(oversizedManifest)
-
-	manifestDesc := ocispec.Descriptor{
-		MediaType: MediaTypeImageManifest,
-		Digest:    manifestDigest,
-		Size:      int64(len(oversizedManifest)),
-	}
-
-	err := store.Push(ctx, manifestDesc, bytes.NewReader(oversizedManifest))
-	require.Error(t, err, "should reject oversized manifest")
-	assert.Contains(t, err.Error(), "exceeds maximum allowed size")
-}
-
-func TestSizeLimitedStore_RejectLyingDescriptor(t *testing.T) {
-	t.Parallel()
-
-	ctx := t.Context()
-	store := newSizeLimitedStore()
-
-	// Descriptor claims small size but actual content exceeds the limit.
 	oversized := make([]byte, MaxManifestSize+1)
-	oversizedDigest := digest.FromBytes(oversized)
-
 	desc := ocispec.Descriptor{
 		MediaType: MediaTypeImageManifest,
-		Digest:    oversizedDigest,
-		Size:      10, // lying about size
+		Digest:    digest.FromBytes(oversized),
+		Size:      int64(len(oversized)),
 	}
 
-	err := store.Push(ctx, desc, bytes.NewReader(oversized))
-	require.Error(t, err, "should reject content that exceeds limit regardless of descriptor size")
+	err := vt.Push(ctx, desc, bytes.NewReader(oversized))
+	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exceeds maximum allowed size")
 }
 
-func TestSizeLimitedStore_RejectNegativeSize(t *testing.T) {
+func TestValidatingTarget_RejectLyingDescriptor(t *testing.T) {
 	t.Parallel()
 
 	ctx := t.Context()
-	store := newSizeLimitedStore()
+	vt := newValidatingTarget(memory.New())
+
+	oversized := make([]byte, MaxManifestSize+1)
+	desc := ocispec.Descriptor{
+		MediaType: MediaTypeImageManifest,
+		Digest:    digest.FromBytes(oversized),
+		Size:      10, // lying
+	}
+
+	err := vt.Push(ctx, desc, bytes.NewReader(oversized))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds maximum allowed size")
+}
+
+func TestValidatingTarget_RejectNegativeSize(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	vt := newValidatingTarget(memory.New())
 
 	desc := ocispec.Descriptor{
 		MediaType: MediaTypeImageManifest,
@@ -161,270 +139,168 @@ func TestSizeLimitedStore_RejectNegativeSize(t *testing.T) {
 		Size:      -1,
 	}
 
-	err := store.Push(ctx, desc, bytes.NewReader([]byte("test")))
+	err := vt.Push(ctx, desc, bytes.NewReader([]byte("test")))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid negative content size")
 }
 
-func TestSizeLimitedStore_AcceptValidContent(t *testing.T) {
+func TestValidatingTarget_AcceptValidContent(t *testing.T) {
 	t.Parallel()
 
 	ctx := t.Context()
-	store := newSizeLimitedStore()
+	inner := memory.New()
+	vt := newValidatingTarget(inner)
 
 	content := []byte(`{"schemaVersion": 2}`)
-	contentDigest := digest.FromBytes(content)
-
 	desc := ocispec.Descriptor{
 		MediaType: MediaTypeImageManifest,
-		Digest:    contentDigest,
+		Digest:    digest.FromBytes(content),
 		Size:      int64(len(content)),
 	}
 
-	err := store.Push(ctx, desc, bytes.NewReader(content))
+	err := vt.Push(ctx, desc, bytes.NewReader(content))
 	require.NoError(t, err)
 
-	exists, err := store.Exists(ctx, desc)
+	exists, err := inner.Exists(ctx, desc)
 	require.NoError(t, err)
-	assert.True(t, exists, "content should be stored after successful Push")
+	assert.True(t, exists)
 }
 
-func TestStageBlobs_SharedBlobs(t *testing.T) {
+func TestValidateManifestCounts(t *testing.T) {
 	t.Parallel()
 
-	ctx := t.Context()
-
-	store, err := NewStore(t.TempDir())
-	require.NoError(t, err)
-
-	configContent := []byte(`{"architecture":"amd64","os":"linux"}`)
-	layerContent := []byte("skill content")
-
-	configDigest, err := store.PutBlob(ctx, configContent)
-	require.NoError(t, err)
-
-	layerDigest, err := store.PutBlob(ctx, layerContent)
-	require.NoError(t, err)
-
-	manifest := &ocispec.Manifest{
-		Config: ocispec.Descriptor{
-			MediaType: MediaTypeImageConfig,
-			Digest:    configDigest,
-			Size:      int64(len(configContent)),
-		},
-		Layers: []ocispec.Descriptor{
-			{
-				MediaType: MediaTypeImageLayer,
-				Digest:    layerDigest,
-				Size:      int64(len(layerContent)),
-			},
-		},
-	}
-
-	memStore := memory.New()
-	reg := &Registry{}
-
-	// Stage blobs first time
-	err = reg.stageBlobs(ctx, store, memStore, manifest)
-	require.NoError(t, err)
-
-	// Stage blobs second time (simulates shared blobs in multi-platform push).
-	// Should NOT fail with ErrAlreadyExists.
-	err = reg.stageBlobs(ctx, store, memStore, manifest)
-	require.NoError(t, err, "should handle already-staged blobs gracefully")
-}
-
-func TestStageBlobs_MultipleLayers(t *testing.T) {
-	t.Parallel()
-
-	ctx := t.Context()
-
-	store, err := NewStore(t.TempDir())
-	require.NoError(t, err)
-
-	configContent := []byte(`{"architecture":"amd64","os":"linux"}`)
-	layer1Content := []byte("layer 1 content")
-	layer2Content := []byte("layer 2 content")
-
-	configDigest, err := store.PutBlob(ctx, configContent)
-	require.NoError(t, err)
-
-	layer1Digest, err := store.PutBlob(ctx, layer1Content)
-	require.NoError(t, err)
-
-	layer2Digest, err := store.PutBlob(ctx, layer2Content)
-	require.NoError(t, err)
-
-	manifest := &ocispec.Manifest{
-		Config: ocispec.Descriptor{
-			MediaType: MediaTypeImageConfig,
-			Digest:    configDigest,
-			Size:      int64(len(configContent)),
-		},
-		Layers: []ocispec.Descriptor{
-			{
-				MediaType: MediaTypeImageLayer,
-				Digest:    layer1Digest,
-				Size:      int64(len(layer1Content)),
-			},
-			{
-				MediaType: MediaTypeImageLayer,
-				Digest:    layer2Digest,
-				Size:      int64(len(layer2Content)),
-			},
-		},
-	}
-
-	memStore := memory.New()
-	reg := &Registry{}
-
-	err = reg.stageBlobs(ctx, store, memStore, manifest)
-	require.NoError(t, err)
-
-	// Verify blobs were staged
-	exists, err := memStore.Exists(ctx, manifest.Config)
-	require.NoError(t, err)
-	assert.True(t, exists, "config blob should be staged")
-
-	for i, layer := range manifest.Layers {
-		exists, err := memStore.Exists(ctx, layer)
+	t.Run("too many manifests in index", func(t *testing.T) {
+		t.Parallel()
+		index := ImageIndex{
+			SchemaVersion: 2,
+			MediaType:     MediaTypeImageIndex,
+			Manifests:     make([]IndexDescriptor, maxIndexManifests+1),
+		}
+		data, err := json.Marshal(index)
 		require.NoError(t, err)
-		assert.True(t, exists, "layer %d blob should be staged", i)
-	}
+
+		err = validateManifestCounts(MediaTypeImageIndex, data)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "exceeds maximum")
+	})
+
+	t.Run("too many layers in manifest", func(t *testing.T) {
+		t.Parallel()
+		manifest := ocispec.Manifest{
+			MediaType: MediaTypeImageManifest,
+			Layers:    make([]ocispec.Descriptor, maxManifestLayers+1),
+		}
+		data, err := json.Marshal(manifest)
+		require.NoError(t, err)
+
+		err = validateManifestCounts(MediaTypeImageManifest, data)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "exceeds maximum")
+	})
+
+	t.Run("valid counts", func(t *testing.T) {
+		t.Parallel()
+		manifest := ocispec.Manifest{
+			MediaType: MediaTypeImageManifest,
+			Layers:    make([]ocispec.Descriptor, 2),
+		}
+		data, err := json.Marshal(manifest)
+		require.NoError(t, err)
+
+		err = validateManifestCounts(MediaTypeImageManifest, data)
+		require.NoError(t, err)
+	})
 }
 
-func TestFetchManifest_ValidManifest(t *testing.T) {
+// --- storeAdapter tests ---
+
+func TestStoreAdapter_PushFetchRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	ctx := t.Context()
-	memStore := memory.New()
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	adapter := newStoreAdapter(store)
 
-	manifest := ocispec.Manifest{
-		MediaType: MediaTypeImageManifest,
-		Config: ocispec.Descriptor{
-			MediaType: MediaTypeImageConfig,
-			Digest:    digest.FromString("config"),
-			Size:      10,
-		},
+	// Push a blob
+	blobContent := []byte("test blob data")
+	blobDesc := ocispec.Descriptor{
+		MediaType: "application/octet-stream",
+		Digest:    digest.FromBytes(blobContent),
+		Size:      int64(len(blobContent)),
 	}
+	err = adapter.Push(ctx, blobDesc, bytes.NewReader(blobContent))
+	require.NoError(t, err)
+
+	// Fetch it back
+	rc, err := adapter.Fetch(ctx, blobDesc)
+	require.NoError(t, err)
+	defer rc.Close()
+	var buf bytes.Buffer
+	_, err = buf.ReadFrom(rc)
+	require.NoError(t, err)
+	assert.Equal(t, blobContent, buf.Bytes())
+
+	// Exists
+	exists, err := adapter.Exists(ctx, blobDesc)
+	require.NoError(t, err)
+	assert.True(t, exists)
+
+	// Non-existent
+	fakeDesc := ocispec.Descriptor{
+		MediaType: "application/octet-stream",
+		Digest:    digest.FromString("fake"),
+		Size:      4,
+	}
+	exists, err = adapter.Exists(ctx, fakeDesc)
+	require.NoError(t, err)
+	assert.False(t, exists)
+}
+
+func TestStoreAdapter_ResolveAndTag(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+	adapter := newStoreAdapter(store)
+
+	// Build and store a manifest
+	manifest := ocispec.Manifest{MediaType: MediaTypeImageManifest}
 	manifestBytes, err := json.Marshal(manifest)
 	require.NoError(t, err)
 
-	manifestDigest := digest.FromBytes(manifestBytes)
+	manifestDigest, err := store.PutManifest(ctx, manifestBytes)
+	require.NoError(t, err)
+
+	// Tag via adapter
 	desc := ocispec.Descriptor{
 		MediaType: MediaTypeImageManifest,
 		Digest:    manifestDigest,
 		Size:      int64(len(manifestBytes)),
 	}
-	err = memStore.Push(ctx, desc, bytes.NewReader(manifestBytes))
+	err = adapter.Tag(ctx, desc, "my-tag")
 	require.NoError(t, err)
 
-	reg := &Registry{}
-	got, gotBytes, err := reg.fetchManifest(ctx, memStore, desc)
+	// Resolve via adapter
+	resolved, err := adapter.Resolve(ctx, "my-tag")
 	require.NoError(t, err)
-	assert.Equal(t, manifestBytes, gotBytes)
-	assert.Equal(t, MediaTypeImageManifest, got.MediaType)
+	assert.Equal(t, manifestDigest, resolved.Digest)
+	assert.Equal(t, MediaTypeImageManifest, resolved.MediaType)
 }
 
-func TestFetchManifest_OversizedManifest(t *testing.T) {
-	t.Parallel()
+// --- Integration tests using in-memory target ---
 
-	ctx := t.Context()
-	memStore := memory.New()
-
-	// Build valid JSON that exceeds MaxManifestSize.
-	// We use a generic media type to avoid memory.Store trying to parse it
-	// as an OCI manifest (which would fail for large synthetic payloads).
-	padding := make([]byte, MaxManifestSize)
-	for i := range padding {
-		padding[i] = 'x'
-	}
-	oversized := []byte(`{"padding":"` + string(padding) + `"}`)
-	oversizedDigest := digest.FromBytes(oversized)
-	desc := ocispec.Descriptor{
-		MediaType: "application/octet-stream",
-		Digest:    oversizedDigest,
-		Size:      int64(len(oversized)),
-	}
-	err := memStore.Push(ctx, desc, bytes.NewReader(oversized))
-	require.NoError(t, err)
-
-	reg := &Registry{}
-	_, _, err = reg.fetchManifest(ctx, memStore, desc)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "exceeds maximum size")
-}
-
-func TestStoreBlobFromMemory_ValidBlob(t *testing.T) {
-	t.Parallel()
-
-	ctx := t.Context()
-
-	localStore, err := NewStore(t.TempDir())
-	require.NoError(t, err)
-
-	memStore := memory.New()
-
-	blobContent := []byte("test blob data")
-	blobDigest := digest.FromBytes(blobContent)
-	desc := ocispec.Descriptor{
-		MediaType: "application/octet-stream",
-		Digest:    blobDigest,
-		Size:      int64(len(blobContent)),
-	}
-	err = memStore.Push(ctx, desc, bytes.NewReader(blobContent))
-	require.NoError(t, err)
-
-	err = storeBlobFromMemory(ctx, localStore, memStore, desc)
-	require.NoError(t, err)
-
-	// Verify it was stored locally
-	got, err := localStore.GetBlob(ctx, blobDigest)
-	require.NoError(t, err)
-	assert.Equal(t, blobContent, got)
-}
-
-func TestStoreBlobFromMemory_OversizedBlob(t *testing.T) {
-	t.Parallel()
-
-	ctx := t.Context()
-
-	localStore, err := NewStore(t.TempDir())
-	require.NoError(t, err)
-
-	memStore := memory.New()
-
-	oversized := make([]byte, MaxBlobSize+1)
-	oversizedDigest := digest.FromBytes(oversized)
-	desc := ocispec.Descriptor{
-		MediaType: "application/octet-stream",
-		Digest:    oversizedDigest,
-		Size:      int64(len(oversized)),
-	}
-	err = memStore.Push(ctx, desc, bytes.NewReader(oversized))
-	require.NoError(t, err)
-
-	err = storeBlobFromMemory(ctx, localStore, memStore, desc)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "exceeds maximum size")
-}
-
-// newTestRegistry creates a Registry with an in-memory target for integration testing.
-// The returned memory.Store is used as both push destination and pull source.
 func newTestRegistry(t *testing.T, remoteStore *memory.Store) *Registry {
 	t.Helper()
 	return &Registry{
-		newTarget: func(_ registry.Reference) (registryTarget, error) {
+		newTarget: func(_ registry.Reference) (oras.Target, error) {
 			return remoteStore, nil
 		},
 	}
 }
 
-// buildTestManifest creates a valid OCI manifest with config and layer in the local store.
-// Returns the manifest digest and the raw manifest bytes.
-func buildTestManifest(
-	t *testing.T, store *Store,
-) (digest.Digest, []byte) {
+func buildTestManifest(t *testing.T, store *Store) (digest.Digest, []byte) {
 	t.Helper()
 	ctx := t.Context()
 
@@ -433,7 +309,6 @@ func buildTestManifest(
 
 	configDigest, err := store.PutBlob(ctx, configContent)
 	require.NoError(t, err)
-
 	layerDigest, err := store.PutBlob(ctx, layerContent)
 	require.NoError(t, err)
 
@@ -469,7 +344,6 @@ func TestPushPull_ManifestRoundTrip(t *testing.T) {
 	ctx := t.Context()
 	remoteStore := memory.New()
 
-	// Push: local store → remote (memory)
 	localStore, err := NewStore(t.TempDir())
 	require.NoError(t, err)
 
@@ -481,7 +355,7 @@ func TestPushPull_ManifestRoundTrip(t *testing.T) {
 	err = reg.Push(ctx, localStore, manifestDigest, ref)
 	require.NoError(t, err)
 
-	// Pull: remote (memory) → new local store
+	// Pull into a fresh store
 	pullStore, err := NewStore(t.TempDir())
 	require.NoError(t, err)
 
@@ -489,12 +363,12 @@ func TestPushPull_ManifestRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, manifestDigest, pulledDigest)
 
-	// Verify manifest was stored locally
+	// Verify manifest was stored
 	got, err := pullStore.GetManifest(ctx, pulledDigest)
 	require.NoError(t, err)
 	assert.NotEmpty(t, got)
 
-	// Verify we can resolve the tag
+	// Verify tag resolution
 	resolved, err := pullStore.Resolve(ctx, ref)
 	require.NoError(t, err)
 	assert.Equal(t, pulledDigest, resolved)
@@ -511,7 +385,6 @@ func TestPushPull_IndexRoundTrip(t *testing.T) {
 
 	manifestDigest, manifestBytes := buildTestManifest(t, localStore)
 
-	// Build an image index referencing the manifest
 	index := ImageIndex{
 		SchemaVersion: 2,
 		MediaType:     MediaTypeImageIndex,
@@ -528,7 +401,6 @@ func TestPushPull_IndexRoundTrip(t *testing.T) {
 
 	indexBytes, err := json.Marshal(index)
 	require.NoError(t, err)
-
 	indexDigest, err := localStore.PutManifest(ctx, indexBytes)
 	require.NoError(t, err)
 
@@ -548,20 +420,20 @@ func TestPushPull_IndexRoundTrip(t *testing.T) {
 	// Verify it's an index
 	isIdx, err := pullStore.IsIndex(ctx, pulledDigest)
 	require.NoError(t, err)
-	assert.True(t, isIdx, "pulled artifact should be an index")
+	assert.True(t, isIdx)
 
-	// Verify the index contents
+	// Verify index contents
 	pulledIndex, err := pullStore.GetIndex(ctx, pulledDigest)
 	require.NoError(t, err)
 	require.Len(t, pulledIndex.Manifests, 1)
 	assert.Equal(t, manifestDigest.String(), pulledIndex.Manifests[0].Digest)
 
-	// Verify the manifest is also present
+	// Verify manifest is also present
 	pulledManifest, err := pullStore.GetManifest(ctx, manifestDigest)
 	require.NoError(t, err)
 	assert.NotEmpty(t, pulledManifest)
 
-	// Verify tag resolution
+	// Verify tag
 	resolved, err := pullStore.Resolve(ctx, ref)
 	require.NoError(t, err)
 	assert.Equal(t, pulledDigest, resolved)
@@ -575,7 +447,6 @@ func TestPush_InvalidReference(t *testing.T) {
 	require.NoError(t, err)
 
 	reg := newTestRegistry(t, memory.New())
-
 	err = reg.Push(ctx, localStore, digest.FromString("test"), ":::invalid")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parsing reference")
@@ -589,7 +460,6 @@ func TestPull_InvalidReference(t *testing.T) {
 	require.NoError(t, err)
 
 	reg := newTestRegistry(t, memory.New())
-
 	_, err = reg.Pull(ctx, localStore, ":::invalid")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parsing reference")
