@@ -10,6 +10,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	go.uber.org/mock v0.6.0
 	golang.org/x/net v0.49.0
+	gopkg.in/yaml.v3 v3.0.1
 	oras.land/oras-go/v2 v2.6.0
 )
 
@@ -25,5 +26,4 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20240826202546-f6391c0de4c7 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240826202546-f6391c0de4c7 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
