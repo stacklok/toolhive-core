@@ -6,5 +6,15 @@
     ":semanticCommitsDisabled"
   ],
   "labels": ["dependencies"],
-  "postUpdateOptions": ["gomodTidy"]
+  "postUpdateOptions": ["gomodTidy"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "fileMatch": ["(^|/)go\\.mod$"],
+      "matchStrings": ["go (?<currentValue>\\d+\\.\\d+(\\.\\d+)?)"],
+      "depNameTemplate": "golang",
+      "datasourceTemplate": "golang-version",
+      "versioningTemplate": "loose"
+    }
+  ]
 }
