@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -207,18 +208,18 @@ func TestStore_GetIndex(t *testing.T) {
 
 	ctx := context.Background()
 
-	idx := &ImageIndex{
-		SchemaVersion: 2,
-		MediaType:     MediaTypeImageIndex,
-		Manifests: []IndexDescriptor{
+	idx := &ocispec.Index{
+		MediaType: ocispec.MediaTypeImageIndex,
+		Manifests: []ocispec.Descriptor{
 			{
-				MediaType: MediaTypeImageManifest,
-				Digest:    "sha256:abc123",
+				MediaType: ocispec.MediaTypeImageManifest,
+				Digest:    digest.FromString("test"),
 				Size:      100,
-				Platform:  &Platform{OS: "linux", Architecture: "amd64"},
+				Platform:  &ocispec.Platform{OS: "linux", Architecture: "amd64"},
 			},
 		},
 	}
+	idx.SchemaVersion = 2
 
 	data, err := json.Marshal(idx)
 	require.NoError(t, err)
@@ -229,7 +230,7 @@ func TestStore_GetIndex(t *testing.T) {
 	got, err := store.GetIndex(ctx, d)
 	require.NoError(t, err)
 	assert.Equal(t, 2, got.SchemaVersion)
-	assert.Equal(t, MediaTypeImageIndex, got.MediaType)
+	assert.Equal(t, ocispec.MediaTypeImageIndex, got.MediaType)
 	require.Len(t, got.Manifests, 1)
 	assert.Equal(t, "linux", got.Manifests[0].Platform.OS)
 	assert.Equal(t, "amd64", got.Manifests[0].Platform.Architecture)
@@ -244,10 +245,11 @@ func TestStore_IsIndex(t *testing.T) {
 	ctx := context.Background()
 
 	// Store an image index
-	indexData, err := json.Marshal(ImageIndex{
-		SchemaVersion: 2,
-		MediaType:     MediaTypeImageIndex,
-	})
+	idx := ocispec.Index{
+		MediaType: ocispec.MediaTypeImageIndex,
+	}
+	idx.SchemaVersion = 2
+	indexData, err := json.Marshal(idx)
 	require.NoError(t, err)
 
 	indexDigest, err := store.PutManifest(ctx, indexData)

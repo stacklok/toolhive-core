@@ -72,8 +72,8 @@ func TestIsManifestMediaType(t *testing.T) {
 		mediaType string
 		want      bool
 	}{
-		{"OCI manifest", MediaTypeImageManifest, true},
-		{"OCI index", MediaTypeImageIndex, true},
+		{"OCI manifest", ocispec.MediaTypeImageManifest, true},
+		{"OCI index", ocispec.MediaTypeImageIndex, true},
 		{"Docker manifest", "application/vnd.docker.distribution.manifest.v2+json", true},
 		{"Docker manifest list", "application/vnd.docker.distribution.manifest.list.v2+json", true},
 		{"OCI config", "application/vnd.oci.image.config.v1+json", false},
@@ -99,7 +99,7 @@ func TestValidatingTarget_RejectOversizedContent(t *testing.T) {
 
 	oversized := make([]byte, MaxManifestSize+1)
 	desc := ocispec.Descriptor{
-		MediaType: MediaTypeImageManifest,
+		MediaType: ocispec.MediaTypeImageManifest,
 		Digest:    digest.FromBytes(oversized),
 		Size:      int64(len(oversized)),
 	}
@@ -117,7 +117,7 @@ func TestValidatingTarget_RejectLyingDescriptor(t *testing.T) {
 
 	oversized := make([]byte, MaxManifestSize+1)
 	desc := ocispec.Descriptor{
-		MediaType: MediaTypeImageManifest,
+		MediaType: ocispec.MediaTypeImageManifest,
 		Digest:    digest.FromBytes(oversized),
 		Size:      10, // lying
 	}
@@ -134,7 +134,7 @@ func TestValidatingTarget_RejectNegativeSize(t *testing.T) {
 	vt := newValidatingTarget(memory.New())
 
 	desc := ocispec.Descriptor{
-		MediaType: MediaTypeImageManifest,
+		MediaType: ocispec.MediaTypeImageManifest,
 		Digest:    digest.FromString("test"),
 		Size:      -1,
 	}
@@ -153,7 +153,7 @@ func TestValidatingTarget_AcceptValidContent(t *testing.T) {
 
 	content := []byte(`{"schemaVersion": 2}`)
 	desc := ocispec.Descriptor{
-		MediaType: MediaTypeImageManifest,
+		MediaType: ocispec.MediaTypeImageManifest,
 		Digest:    digest.FromBytes(content),
 		Size:      int64(len(content)),
 	}
@@ -171,15 +171,15 @@ func TestValidateManifestCounts(t *testing.T) {
 
 	t.Run("too many manifests in index", func(t *testing.T) {
 		t.Parallel()
-		index := ImageIndex{
-			SchemaVersion: 2,
-			MediaType:     MediaTypeImageIndex,
-			Manifests:     make([]IndexDescriptor, maxIndexManifests+1),
+		index := ocispec.Index{
+			MediaType: ocispec.MediaTypeImageIndex,
+			Manifests: make([]ocispec.Descriptor, maxIndexManifests+1),
 		}
+		index.SchemaVersion = 2
 		data, err := json.Marshal(index)
 		require.NoError(t, err)
 
-		err = validateManifestCounts(MediaTypeImageIndex, data)
+		err = validateManifestCounts(ocispec.MediaTypeImageIndex, data)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "exceeds maximum")
 	})
@@ -187,13 +187,13 @@ func TestValidateManifestCounts(t *testing.T) {
 	t.Run("too many layers in manifest", func(t *testing.T) {
 		t.Parallel()
 		manifest := ocispec.Manifest{
-			MediaType: MediaTypeImageManifest,
+			MediaType: ocispec.MediaTypeImageManifest,
 			Layers:    make([]ocispec.Descriptor, maxManifestLayers+1),
 		}
 		data, err := json.Marshal(manifest)
 		require.NoError(t, err)
 
-		err = validateManifestCounts(MediaTypeImageManifest, data)
+		err = validateManifestCounts(ocispec.MediaTypeImageManifest, data)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "exceeds maximum")
 	})
@@ -201,13 +201,13 @@ func TestValidateManifestCounts(t *testing.T) {
 	t.Run("valid counts", func(t *testing.T) {
 		t.Parallel()
 		manifest := ocispec.Manifest{
-			MediaType: MediaTypeImageManifest,
+			MediaType: ocispec.MediaTypeImageManifest,
 			Layers:    make([]ocispec.Descriptor, 2),
 		}
 		data, err := json.Marshal(manifest)
 		require.NoError(t, err)
 
-		err = validateManifestCounts(MediaTypeImageManifest, data)
+		err = validateManifestCounts(ocispec.MediaTypeImageManifest, data)
 		require.NoError(t, err)
 	})
 }
@@ -266,7 +266,7 @@ func TestStoreAdapter_ResolveAndTag(t *testing.T) {
 	adapter := newStoreAdapter(store)
 
 	// Build and store a manifest
-	manifest := ocispec.Manifest{MediaType: MediaTypeImageManifest}
+	manifest := ocispec.Manifest{MediaType: ocispec.MediaTypeImageManifest}
 	manifestBytes, err := json.Marshal(manifest)
 	require.NoError(t, err)
 
@@ -275,7 +275,7 @@ func TestStoreAdapter_ResolveAndTag(t *testing.T) {
 
 	// Tag via adapter
 	desc := ocispec.Descriptor{
-		MediaType: MediaTypeImageManifest,
+		MediaType: ocispec.MediaTypeImageManifest,
 		Digest:    manifestDigest,
 		Size:      int64(len(manifestBytes)),
 	}
@@ -286,7 +286,7 @@ func TestStoreAdapter_ResolveAndTag(t *testing.T) {
 	resolved, err := adapter.Resolve(ctx, "my-tag")
 	require.NoError(t, err)
 	assert.Equal(t, manifestDigest, resolved.Digest)
-	assert.Equal(t, MediaTypeImageManifest, resolved.MediaType)
+	assert.Equal(t, ocispec.MediaTypeImageManifest, resolved.MediaType)
 }
 
 // --- Integration tests using in-memory target ---
@@ -313,16 +313,16 @@ func buildTestManifest(t *testing.T, store *Store) (digest.Digest, []byte) {
 	require.NoError(t, err)
 
 	manifest := ocispec.Manifest{
-		MediaType:    MediaTypeImageManifest,
+		MediaType:    ocispec.MediaTypeImageManifest,
 		ArtifactType: ArtifactTypeSkill,
 		Config: ocispec.Descriptor{
-			MediaType: MediaTypeImageConfig,
+			MediaType: ocispec.MediaTypeImageConfig,
 			Digest:    configDigest,
 			Size:      int64(len(configContent)),
 		},
 		Layers: []ocispec.Descriptor{
 			{
-				MediaType: MediaTypeImageLayer,
+				MediaType: ocispec.MediaTypeImageLayerGzip,
 				Digest:    layerDigest,
 				Size:      int64(len(layerContent)),
 			},
@@ -385,19 +385,19 @@ func TestPushPull_IndexRoundTrip(t *testing.T) {
 
 	manifestDigest, manifestBytes := buildTestManifest(t, localStore)
 
-	index := ImageIndex{
-		SchemaVersion: 2,
-		MediaType:     MediaTypeImageIndex,
-		ArtifactType:  ArtifactTypeSkill,
-		Manifests: []IndexDescriptor{
+	index := ocispec.Index{
+		MediaType:    ocispec.MediaTypeImageIndex,
+		ArtifactType: ArtifactTypeSkill,
+		Manifests: []ocispec.Descriptor{
 			{
-				MediaType: MediaTypeImageManifest,
-				Digest:    manifestDigest.String(),
+				MediaType: ocispec.MediaTypeImageManifest,
+				Digest:    manifestDigest,
 				Size:      int64(len(manifestBytes)),
-				Platform:  &Platform{OS: "linux", Architecture: "amd64"},
+				Platform:  &ocispec.Platform{OS: "linux", Architecture: "amd64"},
 			},
 		},
 	}
+	index.SchemaVersion = 2
 
 	indexBytes, err := json.Marshal(index)
 	require.NoError(t, err)
@@ -426,7 +426,7 @@ func TestPushPull_IndexRoundTrip(t *testing.T) {
 	pulledIndex, err := pullStore.GetIndex(ctx, pulledDigest)
 	require.NoError(t, err)
 	require.Len(t, pulledIndex.Manifests, 1)
-	assert.Equal(t, manifestDigest.String(), pulledIndex.Manifests[0].Digest)
+	assert.Equal(t, manifestDigest, pulledIndex.Manifests[0].Digest)
 
 	// Verify manifest is also present
 	pulledManifest, err := pullStore.GetManifest(ctx, manifestDigest)

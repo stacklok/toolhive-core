@@ -208,7 +208,7 @@ func TestPackager_Package_MultiPlatformConfigMatch(t *testing.T) {
 	require.NoError(t, err)
 
 	packager := NewPackager(store)
-	platforms := []Platform{
+	platforms := []ocispec.Platform{
 		{OS: "linux", Architecture: "amd64"},
 		{OS: "linux", Architecture: "arm64"},
 	}

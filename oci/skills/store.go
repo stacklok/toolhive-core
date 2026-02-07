@@ -13,6 +13,7 @@ import (
 
 	"github.com/adrg/xdg"
 	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // Store provides local OCI artifact storage.
@@ -179,7 +180,7 @@ func (s *Store) ListTags(_ context.Context) ([]string, error) {
 }
 
 // GetIndex retrieves and parses an image index by digest.
-func (s *Store) GetIndex(_ context.Context, d digest.Digest) (*ImageIndex, error) {
+func (s *Store) GetIndex(_ context.Context, d digest.Digest) (*ocispec.Index, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -188,7 +189,7 @@ func (s *Store) GetIndex(_ context.Context, d digest.Digest) (*ImageIndex, error
 		return nil, fmt.Errorf("getting index: %w", err)
 	}
 
-	var index ImageIndex
+	var index ocispec.Index
 	if err := json.Unmarshal(data, &index); err != nil {
 		return nil, fmt.Errorf("parsing index: %w", err)
 	}
@@ -214,7 +215,7 @@ func (s *Store) IsIndex(_ context.Context, d digest.Digest) (bool, error) {
 		return false, fmt.Errorf("parsing media type: %w", err)
 	}
 
-	return header.MediaType == MediaTypeImageIndex, nil
+	return header.MediaType == ocispec.MediaTypeImageIndex, nil
 }
 
 // Root returns the store root directory.

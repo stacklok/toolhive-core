@@ -6,6 +6,7 @@ package skills
 import (
 	"testing"
 
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -15,7 +16,7 @@ func TestSkillConfigFromImageConfig(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		config    *ImageConfig
+		config    *ocispec.Image
 		wantName  string
 		wantErr   bool
 		wantTools []string
@@ -23,8 +24,8 @@ func TestSkillConfigFromImageConfig(t *testing.T) {
 	}{
 		{
 			name: "all fields populated",
-			config: &ImageConfig{
-				Config: ImageConfigData{
+			config: &ocispec.Image{
+				Config: ocispec.ImageConfig{
 					Labels: map[string]string{
 						LabelSkillName:         "my-skill",
 						LabelSkillDescription:  "A test skill",
@@ -41,8 +42,8 @@ func TestSkillConfigFromImageConfig(t *testing.T) {
 		},
 		{
 			name: "minimal config",
-			config: &ImageConfig{
-				Config: ImageConfigData{
+			config: &ocispec.Image{
+				Config: ocispec.ImageConfig{
 					Labels: map[string]string{
 						LabelSkillName: "minimal-skill",
 					},
@@ -57,15 +58,15 @@ func TestSkillConfigFromImageConfig(t *testing.T) {
 		},
 		{
 			name: "nil labels",
-			config: &ImageConfig{
-				Config: ImageConfigData{Labels: nil},
+			config: &ocispec.Image{
+				Config: ocispec.ImageConfig{Labels: nil},
 			},
 			wantErr: true,
 		},
 		{
 			name: "missing name",
-			config: &ImageConfig{
-				Config: ImageConfigData{
+			config: &ocispec.Image{
+				Config: ocispec.ImageConfig{
 					Labels: map[string]string{
 						LabelSkillDescription: "no name",
 					},
@@ -75,8 +76,8 @@ func TestSkillConfigFromImageConfig(t *testing.T) {
 		},
 		{
 			name: "invalid allowed tools JSON",
-			config: &ImageConfig{
-				Config: ImageConfigData{
+			config: &ocispec.Image{
+				Config: ocispec.ImageConfig{
 					Labels: map[string]string{
 						LabelSkillName:         "bad-tools",
 						LabelSkillAllowedTools: "not-json",
@@ -87,8 +88,8 @@ func TestSkillConfigFromImageConfig(t *testing.T) {
 		},
 		{
 			name: "invalid files JSON",
-			config: &ImageConfig{
-				Config: ImageConfigData{
+			config: &ocispec.Image{
+				Config: ocispec.ImageConfig{
 					Labels: map[string]string{
 						LabelSkillName:  "bad-files",
 						LabelSkillFiles: "not-json",
@@ -126,18 +127,23 @@ func TestParsePlatform(t *testing.T) {
 	tests := []struct {
 		name    string
 		input   string
-		want    Platform
+		want    ocispec.Platform
 		wantErr bool
 	}{
 		{
 			name:  "linux/amd64",
 			input: "linux/amd64",
-			want:  Platform{OS: "linux", Architecture: "amd64"},
+			want:  ocispec.Platform{OS: "linux", Architecture: "amd64"},
 		},
 		{
 			name:  "linux/arm64",
 			input: "linux/arm64",
-			want:  Platform{OS: "linux", Architecture: "arm64"},
+			want:  ocispec.Platform{OS: "linux", Architecture: "arm64"},
+		},
+		{
+			name:  "linux/arm/v7",
+			input: "linux/arm/v7",
+			want:  ocispec.Platform{OS: "linux", Architecture: "arm", Variant: "v7"},
 		},
 		{
 			name:    "no slash",
@@ -146,7 +152,7 @@ func TestParsePlatform(t *testing.T) {
 		},
 		{
 			name:    "too many parts",
-			input:   "linux/amd64/v8",
+			input:   "linux/amd64/v8/extra",
 			wantErr: true,
 		},
 		{
@@ -157,6 +163,11 @@ func TestParsePlatform(t *testing.T) {
 		{
 			name:    "empty arch",
 			input:   "linux/",
+			wantErr: true,
+		},
+		{
+			name:    "empty variant",
+			input:   "linux/arm/",
 			wantErr: true,
 		},
 	}
@@ -179,8 +190,45 @@ func TestParsePlatform(t *testing.T) {
 func TestPlatformString(t *testing.T) {
 	t.Parallel()
 
-	p := Platform{OS: "linux", Architecture: "amd64"}
-	assert.Equal(t, "linux/amd64", p.String())
+	tests := []struct {
+		name     string
+		platform ocispec.Platform
+		want     string
+	}{
+		{
+			name:     "os/arch",
+			platform: ocispec.Platform{OS: "linux", Architecture: "amd64"},
+			want:     "linux/amd64",
+		},
+		{
+			name:     "os/arch/variant",
+			platform: ocispec.Platform{OS: "linux", Architecture: "arm", Variant: "v7"},
+			want:     "linux/arm/v7",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, PlatformString(tt.platform))
+		})
+	}
+}
+
+func TestParsePlatform_PlatformString_Roundtrip(t *testing.T) {
+	t.Parallel()
+
+	platforms := []ocispec.Platform{
+		{OS: "linux", Architecture: "amd64"},
+		{OS: "linux", Architecture: "arm64"},
+		{OS: "linux", Architecture: "arm", Variant: "v7"},
+	}
+
+	for _, p := range platforms {
+		parsed, err := ParsePlatform(PlatformString(p))
+		require.NoError(t, err)
+		assert.Equal(t, p, parsed)
+	}
 }
 
 func TestParseRequiresAnnotation(t *testing.T) {
@@ -238,6 +286,6 @@ func TestDefaultPlatforms(t *testing.T) {
 	t.Parallel()
 
 	require.Len(t, DefaultPlatforms, 2)
-	assert.Equal(t, Platform{OS: "linux", Architecture: "amd64"}, DefaultPlatforms[0])
-	assert.Equal(t, Platform{OS: "linux", Architecture: "arm64"}, DefaultPlatforms[1])
+	assert.Equal(t, ocispec.Platform{OS: "linux", Architecture: "amd64"}, DefaultPlatforms[0])
+	assert.Equal(t, ocispec.Platform{OS: "linux", Architecture: "arm64"}, DefaultPlatforms[1])
 }

@@ -155,7 +155,7 @@ func (p *Packager) Package(ctx context.Context, skillDir string, opts PackageOpt
 	var manifestAnnotations map[string]string
 
 	for i, platform := range opts.Platforms {
-		platformStr := platform.String()
+		platformStr := PlatformString(platform)
 
 		ociConfig, cfg := createOCIConfig(content, uncompressedTar, platform, opts)
 		configBytes, err := json.Marshal(ociConfig)
@@ -414,7 +414,7 @@ func createContentLayer(content *skillDirContent, opts PackageOptions) (compress
 func createOCIConfig(
 	content *skillDirContent,
 	uncompressedTar []byte,
-	platform Platform,
+	platform ocispec.Platform,
 	opts PackageOptions,
 ) (*ocispec.Image, *SkillConfig) {
 	// Collect all file paths
@@ -441,11 +441,8 @@ func createOCIConfig(
 
 	epoch := opts.Epoch
 	ociConfig := &ocispec.Image{
-		Created: &epoch,
-		Platform: ocispec.Platform{
-			Architecture: platform.Architecture,
-			OS:           platform.OS,
-		},
+		Created:  &epoch,
+		Platform: platform,
 		Config: ocispec.ImageConfig{
 			Labels: map[string]string{
 				LabelSkillName:         skillConfig.Name,
@@ -534,20 +531,18 @@ func (p *Packager) createIndex(
 ) (digest.Digest, error) {
 	manifests := make([]ocispec.Descriptor, 0, len(opts.Platforms))
 	for _, platform := range opts.Platforms {
-		platformStr := platform.String()
+		platformStr := PlatformString(platform)
 		info, ok := platformManifests[platformStr]
 		if !ok {
 			return "", fmt.Errorf("missing manifest for platform %s", platformStr)
 		}
 
+		p := platform // copy for pointer
 		manifests = append(manifests, ocispec.Descriptor{
 			MediaType: ocispec.MediaTypeImageManifest,
 			Digest:    info.digest,
 			Size:      info.size,
-			Platform: &ocispec.Platform{
-				Architecture: platform.Architecture,
-				OS:           platform.OS,
-			},
+			Platform:  &p,
 		})
 	}
 

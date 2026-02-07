@@ -3,7 +3,7 @@
 
 package env
 
-//go:generate mockgen -source=env.go -destination=mocks/mock_reader.go -package=mocks Reader
+//go:generate mockgen -copyright_file=../.github/license-header.txt -source=env.go -destination=mocks/mock_reader.go -package=mocks Reader
 
 import "os"
 
