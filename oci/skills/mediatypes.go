@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // Artifact type for skill identification.
@@ -15,29 +17,8 @@ const (
 	ArtifactTypeSkill = "dev.toolhive.skills.v1"
 )
 
-// OCI Image Index media type.
-const (
-	// MediaTypeImageIndex is the OCI image index media type.
-	MediaTypeImageIndex = "application/vnd.oci.image.index.v1+json"
-)
-
-// Standard OCI media types for Kubernetes image volume compatibility.
-const (
-	// MediaTypeImageManifest is the OCI image manifest media type.
-	MediaTypeImageManifest = "application/vnd.oci.image.manifest.v1+json"
-
-	// MediaTypeImageConfig is the standard OCI image config media type.
-	MediaTypeImageConfig = "application/vnd.oci.image.config.v1+json"
-
-	// MediaTypeImageLayer is the standard OCI image layer media type.
-	MediaTypeImageLayer = "application/vnd.oci.image.layer.v1.tar+gzip"
-)
-
 // Annotation keys for skill metadata in manifests.
 const (
-	// AnnotationCreated is the OCI standard annotation for creation time.
-	AnnotationCreated = "org.opencontainers.image.created"
-
 	// AnnotationSkillName is the annotation key for skill name.
 	AnnotationSkillName = "dev.toolhive.skills.name"
 
@@ -84,35 +65,8 @@ type SkillConfig struct {
 	Files         []string          `json:"files"`
 }
 
-// ImageConfig represents a standard OCI image configuration.
-// This structure is required for Kubernetes image volume compatibility.
-type ImageConfig struct {
-	Architecture string          `json:"architecture"`
-	OS           string          `json:"os"`
-	Config       ImageConfigData `json:"config,omitempty"`
-	RootFS       RootFS          `json:"rootfs"`
-	History      []HistoryEntry  `json:"history,omitempty"`
-}
-
-// ImageConfigData contains container configuration including labels.
-type ImageConfigData struct {
-	Labels map[string]string `json:"Labels,omitempty"`
-}
-
-// RootFS describes the rootfs of the image.
-type RootFS struct {
-	Type    string   `json:"type"`
-	DiffIDs []string `json:"diff_ids"`
-}
-
-// HistoryEntry describes a layer in the image history.
-type HistoryEntry struct {
-	Created   string `json:"created,omitempty"`
-	CreatedBy string `json:"created_by,omitempty"`
-}
-
 // SkillConfigFromImageConfig extracts SkillConfig from OCI image config labels.
-func SkillConfigFromImageConfig(imgConfig *ImageConfig) (*SkillConfig, error) {
+func SkillConfigFromImageConfig(imgConfig *ocispec.Image) (*SkillConfig, error) {
 	if imgConfig == nil {
 		return nil, fmt.Errorf("image config is nil")
 	}
@@ -149,54 +103,42 @@ func SkillConfigFromImageConfig(imgConfig *ImageConfig) (*SkillConfig, error) {
 	return config, nil
 }
 
-// Platform represents a target platform for OCI artifacts.
-type Platform struct {
-	Architecture string `json:"architecture"`
-	OS           string `json:"os"`
+// PlatformString returns the platform in "os/arch" or "os/arch/variant" format.
+func PlatformString(p ocispec.Platform) string {
+	s := p.OS + "/" + p.Architecture
+	if p.Variant != "" {
+		s += "/" + p.Variant
+	}
+	return s
 }
 
-// String returns the platform in "os/arch" format.
-func (p Platform) String() string {
-	return p.OS + "/" + p.Architecture
-}
-
-// ParsePlatform parses a platform string in "os/arch" format.
-func ParsePlatform(s string) (Platform, error) {
+// ParsePlatform parses a platform string in "os/arch" or "os/arch/variant" format.
+func ParsePlatform(s string) (ocispec.Platform, error) {
 	parts := strings.Split(s, "/")
-	if len(parts) != 2 {
-		return Platform{}, fmt.Errorf("invalid platform format: %q (expected os/arch)", s)
+	if len(parts) < 2 || len(parts) > 3 {
+		return ocispec.Platform{}, fmt.Errorf("invalid platform format: %q (expected os/arch or os/arch/variant)", s)
 	}
 	osName := strings.TrimSpace(parts[0])
 	arch := strings.TrimSpace(parts[1])
 	if osName == "" || arch == "" {
-		return Platform{}, fmt.Errorf("invalid platform format: %q (os and arch cannot be empty)", s)
+		return ocispec.Platform{}, fmt.Errorf("invalid platform format: %q (os and arch cannot be empty)", s)
 	}
-	return Platform{OS: osName, Architecture: arch}, nil
+	p := ocispec.Platform{OS: osName, Architecture: arch}
+	if len(parts) == 3 {
+		variant := strings.TrimSpace(parts[2])
+		if variant == "" {
+			return ocispec.Platform{}, fmt.Errorf("invalid platform format: %q (variant cannot be empty)", s)
+		}
+		p.Variant = variant
+	}
+	return p, nil
 }
 
 // DefaultPlatforms are the default platforms for skill artifacts.
 // These cover most Kubernetes clusters.
-var DefaultPlatforms = []Platform{
+var DefaultPlatforms = []ocispec.Platform{
 	{OS: "linux", Architecture: "amd64"},
 	{OS: "linux", Architecture: "arm64"},
-}
-
-// ImageIndex represents an OCI image index (multi-platform manifest list).
-type ImageIndex struct {
-	SchemaVersion int               `json:"schemaVersion"`
-	MediaType     string            `json:"mediaType"`
-	ArtifactType  string            `json:"artifactType,omitempty"`
-	Manifests     []IndexDescriptor `json:"manifests"`
-	Annotations   map[string]string `json:"annotations,omitempty"`
-}
-
-// IndexDescriptor describes a manifest in an image index.
-type IndexDescriptor struct {
-	MediaType   string            `json:"mediaType"`
-	Digest      string            `json:"digest"`
-	Size        int64             `json:"size"`
-	Platform    *Platform         `json:"platform,omitempty"`
-	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // ParseRequiresAnnotation parses skill dependency references from manifest annotations.

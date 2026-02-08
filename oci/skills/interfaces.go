@@ -3,13 +3,14 @@
 
 package skills
 
-//go:generate mockgen -source=interfaces.go -destination=mocks/mock_interfaces.go -package=mocks
+//go:generate mockgen -copyright_file=../../.github/license-header.txt -source=interfaces.go -destination=mocks/mock_interfaces.go -package=mocks
 
 import (
 	"context"
 	"time"
 
 	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // RegistryClient provides remote OCI registry operations for skills.
@@ -34,7 +35,7 @@ type PackageOptions struct {
 
 	// Platforms specifies target platforms for the image index.
 	// If empty, defaults to DefaultPlatforms.
-	Platforms []Platform
+	Platforms []ocispec.Platform
 }
 
 // PackageResult contains the result of packaging a skill.
@@ -44,5 +45,5 @@ type PackageResult struct {
 	ConfigDigest   digest.Digest
 	LayerDigest    digest.Digest
 	Config         *SkillConfig
-	Platforms      []Platform
+	Platforms      []ocispec.Platform
 }

@@ -346,8 +346,8 @@ func (v *validatingTarget) Push(ctx context.Context, desc ocispec.Descriptor, co
 // validateManifestCounts checks layer/manifest counts for resource exhaustion prevention.
 func validateManifestCounts(mediaType string, data []byte) error {
 	switch mediaType {
-	case MediaTypeImageIndex:
-		var index ImageIndex
+	case ocispec.MediaTypeImageIndex:
+		var index ocispec.Index
 		if err := json.Unmarshal(data, &index); err != nil {
 			return fmt.Errorf("parsing index: %w", err)
 		}
@@ -357,7 +357,7 @@ func validateManifestCounts(mediaType string, data []byte) error {
 				len(index.Manifests), maxIndexManifests,
 			)
 		}
-	case MediaTypeImageManifest:
+	case ocispec.MediaTypeImageManifest:
 		var manifest ocispec.Manifest
 		if err := json.Unmarshal(data, &manifest); err != nil {
 			return fmt.Errorf("parsing manifest: %w", err)
@@ -375,7 +375,7 @@ func validateManifestCounts(mediaType string, data []byte) error {
 // isManifestMediaType returns true if the media type is a manifest or index type.
 func isManifestMediaType(mediaType string) bool {
 	switch mediaType {
-	case MediaTypeImageManifest, MediaTypeImageIndex,
+	case ocispec.MediaTypeImageManifest, ocispec.MediaTypeImageIndex,
 		"application/vnd.docker.distribution.manifest.v2+json",
 		"application/vnd.docker.distribution.manifest.list.v2+json":
 		return true
