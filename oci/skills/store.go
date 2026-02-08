@@ -4,43 +4,37 @@
 package skills
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
+	"io"
 	"path/filepath"
-	"sync"
 
 	"github.com/adrg/xdg"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/content/oci"
+	"oras.land/oras-go/v2/errdef"
 )
 
-// Store provides local OCI artifact storage.
+// Store provides local OCI artifact storage backed by an OCI Image Layout.
 type Store struct {
-	root string
-	mu   sync.RWMutex
-}
-
-// Index tracks tags to digests mapping.
-type Index struct {
-	Tags map[string]string `json:"tags"` // tag -> digest string
+	root  string
+	inner *oci.Store
 }
 
 // NewStore creates a new local OCI store at the given root directory.
+// The directory is initialized as an OCI Image Layout with blobs/, oci-layout, and index.json.
 func NewStore(root string) (*Store, error) {
-	// Create directory structure
-	dirs := []string{
-		filepath.Join(root, "blobs", "sha256"),
-		filepath.Join(root, "manifests"),
-	}
-	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0750); err != nil {
-			return nil, fmt.Errorf("creating store directory %s: %w", dir, err)
-		}
+	inner, err := oci.New(root)
+	if err != nil {
+		return nil, fmt.Errorf("creating OCI store at %s: %w", root, err)
 	}
 
-	return &Store{root: root}, nil
+	return &Store{root: root, inner: inner}, nil
 }
 
 // StoreRoot returns the skills store root within the given data home directory.
@@ -55,19 +49,18 @@ func DefaultStoreRoot() string {
 }
 
 // PutBlob stores a blob and returns its digest.
-func (s *Store) PutBlob(_ context.Context, content []byte) (digest.Digest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *Store) PutBlob(ctx context.Context, content []byte) (digest.Digest, error) {
 	d := digest.FromBytes(content)
-	blobPath := s.blobPath(d)
-
-	// Check if blob already exists
-	if _, err := os.Stat(blobPath); err == nil {
-		return d, nil
+	desc := ocispec.Descriptor{
+		MediaType: "application/octet-stream",
+		Digest:    d,
+		Size:      int64(len(content)),
 	}
 
-	if err := os.WriteFile(blobPath, content, 0600); err != nil {
+	if err := s.inner.Push(ctx, desc, bytes.NewReader(content)); err != nil {
+		if errors.Is(err, errdef.ErrAlreadyExists) {
+			return d, nil
+		}
 		return "", fmt.Errorf("writing blob: %w", err)
 	}
 
@@ -75,31 +68,37 @@ func (s *Store) PutBlob(_ context.Context, content []byte) (digest.Digest, error
 }
 
 // GetBlob retrieves a blob by digest.
-func (s *Store) GetBlob(_ context.Context, d digest.Digest) ([]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	blobPath := s.blobPath(d)
-	content, err := os.ReadFile(blobPath) //#nosec G304 -- path is constructed from validated digest
+func (s *Store) GetBlob(ctx context.Context, d digest.Digest) ([]byte, error) {
+	data, err := s.fetchContent(ctx, d)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("blob not found: %s", d)
-		}
-		return nil, fmt.Errorf("reading blob: %w", err)
+		return nil, fmt.Errorf("blob not found: %s: %w", d, err)
 	}
-
-	return content, nil
+	return data, nil
 }
 
 // PutManifest stores a manifest and returns its digest.
-func (s *Store) PutManifest(_ context.Context, content []byte) (digest.Digest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+func (s *Store) PutManifest(ctx context.Context, content []byte) (digest.Digest, error) {
 	d := digest.FromBytes(content)
-	manifestPath := s.manifestPath(d)
 
-	if err := os.WriteFile(manifestPath, content, 0600); err != nil {
+	// Parse media type from content so oci.Store indexes it correctly.
+	var header struct {
+		MediaType string `json:"mediaType"`
+	}
+	mediaType := "application/octet-stream"
+	if err := json.Unmarshal(content, &header); err == nil && header.MediaType != "" {
+		mediaType = header.MediaType
+	}
+
+	desc := ocispec.Descriptor{
+		MediaType: mediaType,
+		Digest:    d,
+		Size:      int64(len(content)),
+	}
+
+	if err := s.inner.Push(ctx, desc, bytes.NewReader(content)); err != nil {
+		if errors.Is(err, errdef.ErrAlreadyExists) {
+			return d, nil
+		}
 		return "", fmt.Errorf("writing manifest: %w", err)
 	}
 
@@ -107,84 +106,53 @@ func (s *Store) PutManifest(_ context.Context, content []byte) (digest.Digest, e
 }
 
 // GetManifest retrieves a manifest by digest.
-func (s *Store) GetManifest(_ context.Context, d digest.Digest) ([]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	return s.getManifest(d)
-}
-
-// getManifest reads a manifest without locking. Caller must hold mu.
-func (s *Store) getManifest(d digest.Digest) ([]byte, error) {
-	manifestPath := s.manifestPath(d)
-	content, err := os.ReadFile(manifestPath) //#nosec G304 -- path is constructed from validated digest
+func (s *Store) GetManifest(ctx context.Context, d digest.Digest) ([]byte, error) {
+	data, err := s.fetchContent(ctx, d)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("manifest not found: %s", d)
-		}
-		return nil, fmt.Errorf("reading manifest: %w", err)
+		return nil, fmt.Errorf("manifest not found: %s: %w", d, err)
 	}
-
-	return content, nil
+	return data, nil
 }
 
 // Tag associates a tag with a manifest digest.
-func (s *Store) Tag(_ context.Context, d digest.Digest, tag string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	index, err := s.loadIndex()
+func (s *Store) Tag(ctx context.Context, d digest.Digest, tag string) error {
+	// Resolve the digest to get the full descriptor (manifests are auto-tagged by digest on Push).
+	desc, err := s.inner.Resolve(ctx, d.String())
 	if err != nil {
-		return err
+		return fmt.Errorf("resolving digest for tag: %w", err)
 	}
 
-	index.Tags[tag] = d.String()
+	if err := s.inner.Tag(ctx, desc, tag); err != nil {
+		return fmt.Errorf("tagging: %w", err)
+	}
 
-	return s.saveIndex(index)
+	return nil
 }
 
 // Resolve resolves a tag to a manifest digest.
-func (s *Store) Resolve(_ context.Context, tag string) (digest.Digest, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	index, err := s.loadIndex()
+func (s *Store) Resolve(ctx context.Context, tag string) (digest.Digest, error) {
+	desc, err := s.inner.Resolve(ctx, tag)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("tag not found: %s: %w", tag, err)
 	}
-
-	digestStr, ok := index.Tags[tag]
-	if !ok {
-		return "", fmt.Errorf("tag not found: %s", tag)
-	}
-
-	return digest.Parse(digestStr)
+	return desc.Digest, nil
 }
 
 // ListTags returns all tags in the store.
-func (s *Store) ListTags(_ context.Context) ([]string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	index, err := s.loadIndex()
-	if err != nil {
-		return nil, err
+func (s *Store) ListTags(ctx context.Context) ([]string, error) {
+	var tags []string
+	if err := s.inner.Tags(ctx, "", func(t []string) error {
+		tags = append(tags, t...)
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("listing tags: %w", err)
 	}
-
-	tags := make([]string, 0, len(index.Tags))
-	for tag := range index.Tags {
-		tags = append(tags, tag)
-	}
-
 	return tags, nil
 }
 
 // GetIndex retrieves and parses an image index by digest.
-func (s *Store) GetIndex(_ context.Context, d digest.Digest) (*ocispec.Index, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	data, err := s.getManifest(d)
+func (s *Store) GetIndex(ctx context.Context, d digest.Digest) (*ocispec.Index, error) {
+	data, err := s.fetchContent(ctx, d)
 	if err != nil {
 		return nil, fmt.Errorf("getting index: %w", err)
 	}
@@ -198,16 +166,12 @@ func (s *Store) GetIndex(_ context.Context, d digest.Digest) (*ocispec.Index, er
 }
 
 // IsIndex checks if the content at the given digest is an image index.
-func (s *Store) IsIndex(_ context.Context, d digest.Digest) (bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	data, err := s.getManifest(d)
+func (s *Store) IsIndex(ctx context.Context, d digest.Digest) (bool, error) {
+	data, err := s.fetchContent(ctx, d)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("manifest not found: %s: %w", d, err)
 	}
 
-	// Check media type field
 	var header struct {
 		MediaType string `json:"mediaType"`
 	}
@@ -223,57 +187,24 @@ func (s *Store) Root() string {
 	return s.root
 }
 
-// blobPath returns the path for a blob with the given digest.
-func (s *Store) blobPath(d digest.Digest) string {
-	return filepath.Join(s.root, "blobs", d.Algorithm().String(), d.Encoded())
+// Target returns the underlying oras.Target for direct use by registry operations.
+func (s *Store) Target() oras.Target {
+	return s.inner
 }
 
-// manifestPath returns the path for a manifest with the given digest.
-func (s *Store) manifestPath(d digest.Digest) string {
-	return filepath.Join(s.root, "manifests", d.Encoded())
-}
-
-// indexPath returns the path to the index file.
-func (s *Store) indexPath() string {
-	return filepath.Join(s.root, "index.json")
-}
-
-// loadIndex loads the tag index from disk.
-func (s *Store) loadIndex() (*Index, error) {
-	indexPath := s.indexPath()
-
-	data, err := os.ReadFile(indexPath) //#nosec G304 -- path is constructed from store root
+// fetchContent retrieves raw content by digest from the underlying store.
+func (s *Store) fetchContent(ctx context.Context, d digest.Digest) ([]byte, error) {
+	// oci.Store's Fetch only uses the Digest field to locate blobs in blobs/<algo>/<hex>.
+	rc, err := s.inner.Fetch(ctx, ocispec.Descriptor{Digest: d})
 	if err != nil {
-		if os.IsNotExist(err) {
-			return &Index{Tags: make(map[string]string)}, nil
-		}
-		return nil, fmt.Errorf("reading index: %w", err)
+		return nil, err
 	}
+	defer func() { _ = rc.Close() }()
 
-	var index Index
-	if err := json.Unmarshal(data, &index); err != nil {
-		return nil, fmt.Errorf("parsing index: %w", err)
-	}
-
-	if index.Tags == nil {
-		index.Tags = make(map[string]string)
-	}
-
-	return &index, nil
-}
-
-// saveIndex saves the tag index to disk.
-func (s *Store) saveIndex(index *Index) error {
-	indexPath := s.indexPath()
-
-	data, err := json.MarshalIndent(index, "", "  ")
+	data, err := io.ReadAll(rc)
 	if err != nil {
-		return fmt.Errorf("marshaling index: %w", err)
+		return nil, err
 	}
 
-	if err := os.WriteFile(indexPath, data, 0600); err != nil {
-		return fmt.Errorf("writing index: %w", err)
-	}
-
-	return nil
+	return data, nil
 }

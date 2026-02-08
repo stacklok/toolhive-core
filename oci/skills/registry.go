@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -35,7 +34,6 @@ const maxManifestLayers = 64
 // Compile-time interface checks.
 var (
 	_ RegistryClient = (*Registry)(nil)
-	_ oras.Target    = (*storeAdapter)(nil)
 	_ oras.Target    = (*validatingTarget)(nil)
 )
 
@@ -100,10 +98,8 @@ func (r *Registry) Push(ctx context.Context, store *Store, artifactDigest digest
 		return err
 	}
 
-	adapter := newStoreAdapter(store)
-
-	// Resolve the artifact to get its descriptor for oras.CopyGraph
-	desc, err := adapter.descriptorFromDigest(ctx, artifactDigest)
+	// Resolve the artifact to get its full descriptor from the OCI store.
+	desc, err := store.Target().Resolve(ctx, artifactDigest.String())
 	if err != nil {
 		return fmt.Errorf("resolving artifact descriptor: %w", err)
 	}
@@ -114,7 +110,7 @@ func (r *Registry) Push(ctx context.Context, store *Store, artifactDigest digest
 	}
 
 	// Copy the content graph (blobs → manifests → index) to the remote
-	if err := oras.CopyGraph(ctx, adapter, target, desc, oras.DefaultCopyGraphOptions); err != nil {
+	if err := oras.CopyGraph(ctx, store.Target(), target, desc, oras.DefaultCopyGraphOptions); err != nil {
 		return fmt.Errorf("pushing to registry: %w", err)
 	}
 
@@ -139,8 +135,7 @@ func (r *Registry) Pull(ctx context.Context, store *Store, ref string) (digest.D
 		return "", fmt.Errorf("getting repository: %w", err)
 	}
 
-	adapter := newStoreAdapter(store)
-	validated := newValidatingTarget(adapter)
+	validated := newValidatingTarget(store.Target())
 
 	// Copy from remote to the validated local store
 	desc, err := oras.Copy(
@@ -157,114 +152,6 @@ func (r *Registry) Pull(ctx context.Context, store *Store, ref string) (digest.D
 	}
 
 	return desc.Digest, nil
-}
-
-// storeAdapter wraps a Store to satisfy ORAS content interfaces,
-// routing content by media type to the appropriate Store methods.
-type storeAdapter struct {
-	store *Store
-}
-
-func newStoreAdapter(store *Store) *storeAdapter {
-	return &storeAdapter{store: store}
-}
-
-// Push routes content to PutManifest or PutBlob based on media type.
-// Verifies the content digest matches the expected descriptor.
-func (a *storeAdapter) Push(ctx context.Context, expected ocispec.Descriptor, content io.Reader) error {
-	data, err := io.ReadAll(io.LimitReader(content, MaxBlobSize+1))
-	if err != nil {
-		return fmt.Errorf("reading content: %w", err)
-	}
-	if int64(len(data)) > MaxBlobSize {
-		return fmt.Errorf("content exceeds maximum size of %d bytes", MaxBlobSize)
-	}
-
-	// Verify digest integrity
-	actual := digest.FromBytes(data)
-	if actual != expected.Digest {
-		return fmt.Errorf("digest mismatch: expected %s, got %s", expected.Digest, actual)
-	}
-
-	if isManifestMediaType(expected.MediaType) {
-		_, err = a.store.PutManifest(ctx, data)
-	} else {
-		_, err = a.store.PutBlob(ctx, data)
-	}
-	return err
-}
-
-// Fetch retrieves content from the store by descriptor.
-func (a *storeAdapter) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {
-	var data []byte
-	var err error
-
-	if isManifestMediaType(target.MediaType) {
-		data, err = a.store.GetManifest(ctx, target.Digest)
-	} else {
-		data, err = a.store.GetBlob(ctx, target.Digest)
-	}
-	if err != nil {
-		return nil, err
-	}
-	return io.NopCloser(bytes.NewReader(data)), nil
-}
-
-// Exists checks whether content exists in the store.
-func (a *storeAdapter) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
-	if isManifestMediaType(target.MediaType) {
-		_, err := a.store.GetManifest(ctx, target.Digest)
-		if err != nil {
-			if strings.Contains(err.Error(), "not found") {
-				return false, nil
-			}
-			return false, err
-		}
-		return true, nil
-	}
-	_, err := a.store.GetBlob(ctx, target.Digest)
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
-
-// Resolve resolves a reference (tag or digest) to a full descriptor.
-func (a *storeAdapter) Resolve(ctx context.Context, reference string) (ocispec.Descriptor, error) {
-	d, err := a.store.Resolve(ctx, reference)
-	if err != nil {
-		return ocispec.Descriptor{}, err
-	}
-	return a.descriptorFromDigest(ctx, d)
-}
-
-// Tag associates a reference with a descriptor in the store.
-func (a *storeAdapter) Tag(ctx context.Context, desc ocispec.Descriptor, reference string) error {
-	return a.store.Tag(ctx, desc.Digest, reference)
-}
-
-// descriptorFromDigest reads content to build a full OCI descriptor.
-func (a *storeAdapter) descriptorFromDigest(ctx context.Context, d digest.Digest) (ocispec.Descriptor, error) {
-	data, err := a.store.GetManifest(ctx, d)
-	if err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("reading content for descriptor: %w", err)
-	}
-
-	var header struct {
-		MediaType string `json:"mediaType"`
-	}
-	if err := json.Unmarshal(data, &header); err != nil {
-		return ocispec.Descriptor{}, fmt.Errorf("parsing media type: %w", err)
-	}
-
-	return ocispec.Descriptor{
-		MediaType: header.MediaType,
-		Digest:    d,
-		Size:      int64(len(data)),
-	}, nil
 }
 
 // validatingTarget wraps an oras.Target to enforce size and count limits

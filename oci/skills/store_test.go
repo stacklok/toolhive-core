@@ -27,14 +27,18 @@ func TestNewStore(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, storePath, store.Root())
 
-	// Check directories were created
-	blobsDir := filepath.Join(storePath, "blobs", "sha256")
+	// Check OCI Image Layout structure was created
+	blobsDir := filepath.Join(storePath, "blobs")
 	_, err = os.Stat(blobsDir)
 	assert.NoError(t, err, "blobs directory should exist")
 
-	manifestsDir := filepath.Join(storePath, "manifests")
-	_, err = os.Stat(manifestsDir)
-	assert.NoError(t, err, "manifests directory should exist")
+	ociLayoutFile := filepath.Join(storePath, "oci-layout")
+	_, err = os.Stat(ociLayoutFile)
+	assert.NoError(t, err, "oci-layout file should exist")
+
+	indexFile := filepath.Join(storePath, "index.json")
+	_, err = os.Stat(indexFile)
+	assert.NoError(t, err, "index.json file should exist")
 }
 
 func TestStore_PutGetBlob(t *testing.T) {
@@ -94,7 +98,7 @@ func TestStore_PutGetManifest(t *testing.T) {
 	require.NoError(t, err)
 
 	ctx := context.Background()
-	manifest := []byte(`{"schemaVersion": 2}`)
+	manifest := []byte(`{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}`)
 
 	d, err := store.PutManifest(ctx, manifest)
 	require.NoError(t, err)
@@ -111,7 +115,7 @@ func TestStore_TagResolve(t *testing.T) {
 	require.NoError(t, err)
 
 	ctx := context.Background()
-	manifest := []byte(`{"schemaVersion": 2}`)
+	manifest := []byte(`{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}`)
 
 	d, err := store.PutManifest(ctx, manifest)
 	require.NoError(t, err)
@@ -152,7 +156,7 @@ func TestStore_ListTags(t *testing.T) {
 	assert.Empty(t, tags)
 
 	// Add some tags
-	manifest := []byte(`{"schemaVersion": 2}`)
+	manifest := []byte(`{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}`)
 	d, err := store.PutManifest(ctx, manifest)
 	require.NoError(t, err)
 
@@ -178,8 +182,8 @@ func TestStore_TagOverwrite(t *testing.T) {
 
 	ctx := context.Background()
 
-	manifest1 := []byte(`{"schemaVersion": 2, "version": 1}`)
-	manifest2 := []byte(`{"schemaVersion": 2, "version": 2}`)
+	manifest1 := []byte(`{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json", "version": 1}`)
+	manifest2 := []byte(`{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json", "version": 2}`)
 
 	d1, err := store.PutManifest(ctx, manifest1)
 	require.NoError(t, err)
