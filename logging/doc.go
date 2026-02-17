@@ -49,6 +49,14 @@ Inject a buffer to capture log output in tests:
 	logger.Info("test message")
 	// inspect buf.String()
 
+# Handler Access
+
+Use [NewHandler] when you need to wrap the handler with middleware:
+
+	base := logging.NewHandler(logging.WithLevel(slog.LevelDebug))
+	wrapped := &myMiddleware{Handler: base}
+	logger := slog.New(wrapped)
+
 # Stability
 
 This package is Alpha stability. The API may change without notice.
