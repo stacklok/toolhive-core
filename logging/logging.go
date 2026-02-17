@@ -30,7 +30,7 @@ type config struct {
 	output io.Writer
 }
 
-// Option configures the logger created by [New].
+// Option configures [New] and [NewHandler].
 type Option func(*config)
 
 // WithFormat sets the output format (JSON or Text).
@@ -64,15 +64,17 @@ func WithOutput(w io.Writer) Option {
 	}
 }
 
-// New creates a pre-configured [*log/slog.Logger] with consistent defaults
-// used across the ToolHive ecosystem.
+// NewHandler creates a pre-configured [log/slog.Handler] with consistent
+// defaults used across the ToolHive ecosystem. Use this when you need to wrap
+// the handler with middleware (e.g., trace injection) before creating the
+// final logger.
 //
 // Defaults:
 //   - Format: JSON ([FormatJSON])
 //   - Level: INFO ([log/slog.LevelInfo])
 //   - Output: [os.Stderr]
 //   - Timestamps: [time.RFC3339]
-func New(opts ...Option) *slog.Logger {
+func NewHandler(opts ...Option) slog.Handler {
 	cfg := &config{
 		format: FormatJSON,
 		level:  slog.LevelInfo,
@@ -88,15 +90,27 @@ func New(opts ...Option) *slog.Logger {
 		ReplaceAttr: replaceAttr,
 	}
 
-	var handler slog.Handler
 	switch cfg.format {
 	case FormatText:
-		handler = slog.NewTextHandler(cfg.output, handlerOpts)
+		return slog.NewTextHandler(cfg.output, handlerOpts)
 	case FormatJSON:
-		handler = slog.NewJSONHandler(cfg.output, handlerOpts)
+		return slog.NewJSONHandler(cfg.output, handlerOpts)
 	}
 
-	return slog.New(handler)
+	// Unreachable for known Format values; default to JSON for safety.
+	return slog.NewJSONHandler(cfg.output, handlerOpts)
+}
+
+// New creates a pre-configured [*log/slog.Logger] with consistent defaults
+// used across the ToolHive ecosystem.
+//
+// Defaults:
+//   - Format: JSON ([FormatJSON])
+//   - Level: INFO ([log/slog.LevelInfo])
+//   - Output: [os.Stderr]
+//   - Timestamps: [time.RFC3339]
+func New(opts ...Option) *slog.Logger {
+	return slog.New(NewHandler(opts...))
 }
 
 // replaceAttr formats the time attribute to RFC3339.

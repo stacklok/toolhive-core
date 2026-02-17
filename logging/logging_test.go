@@ -223,6 +223,136 @@ func TestNew_MultipleOptions(t *testing.T) {
 	assert.Contains(t, output, "msg=\"debug message\"")
 }
 
+func TestNewHandler(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns a non-nil handler with no options", func(t *testing.T) {
+		t.Parallel()
+		handler := NewHandler()
+		assert.NotNil(t, handler)
+	})
+
+	t.Run("default format is JSON with RFC3339 timestamps", func(t *testing.T) {
+		t.Parallel()
+		var buf bytes.Buffer
+		handler := NewHandler(WithOutput(&buf))
+		logger := slog.New(handler)
+
+		logger.Info("test message", "key", "value")
+
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &entry))
+
+		assert.Equal(t, "INFO", entry["level"])
+		assert.Equal(t, "test message", entry["msg"])
+		assert.Equal(t, "value", entry["key"])
+
+		ts, ok := entry["time"].(string)
+		require.True(t, ok, "time field should be a string")
+		_, err := time.Parse(time.RFC3339, ts)
+		assert.NoError(t, err, "timestamp should be valid RFC3339")
+	})
+}
+
+func TestNewHandler_WithFormat(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		format Format
+		check  func(t *testing.T, output string)
+	}{
+		{
+			name:   "JSON format produces valid JSON",
+			format: FormatJSON,
+			check: func(t *testing.T, output string) {
+				t.Helper()
+				var entry map[string]any
+				require.NoError(t, json.Unmarshal([]byte(output), &entry))
+				assert.Equal(t, "INFO", entry["level"])
+				assert.Equal(t, "hello", entry["msg"])
+			},
+		},
+		{
+			name:   "text format produces key=value output",
+			format: FormatText,
+			check: func(t *testing.T, output string) {
+				t.Helper()
+				assert.Contains(t, output, "level=INFO")
+				assert.Contains(t, output, "msg=hello")
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			handler := NewHandler(WithFormat(tc.format), WithOutput(&buf))
+			logger := slog.New(handler)
+
+			logger.Info("hello")
+
+			tc.check(t, buf.String())
+		})
+	}
+}
+
+func TestNewHandler_WithLevel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		level       slog.Level
+		logLevel    slog.Level
+		shouldWrite bool
+	}{
+		{"debug logger writes debug", slog.LevelDebug, slog.LevelDebug, true},
+		{"info logger filters debug", slog.LevelInfo, slog.LevelDebug, false},
+		{"info logger writes info", slog.LevelInfo, slog.LevelInfo, true},
+		{"warn logger filters info", slog.LevelWarn, slog.LevelInfo, false},
+		{"warn logger writes warn", slog.LevelWarn, slog.LevelWarn, true},
+		{"error logger filters warn", slog.LevelError, slog.LevelWarn, false},
+		{"error logger writes error", slog.LevelError, slog.LevelError, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			handler := NewHandler(WithLevel(tc.level), WithOutput(&buf))
+			logger := slog.New(handler)
+
+			logger.Log(context.TODO(), tc.logLevel, "test")
+
+			if tc.shouldWrite {
+				assert.NotEmpty(t, buf.String())
+			} else {
+				assert.Empty(t, buf.String())
+			}
+		})
+	}
+}
+
+func TestNewHandler_ProducesSameOutputAsNew(t *testing.T) {
+	t.Parallel()
+
+	var buf1, buf2 bytes.Buffer
+	loggerFromNew := New(WithOutput(&buf1))
+	loggerFromHandler := slog.New(NewHandler(WithOutput(&buf2)))
+
+	loggerFromNew.Info("same message", "key", "value")
+	loggerFromHandler.Info("same message", "key", "value")
+
+	var entry1, entry2 map[string]any
+	require.NoError(t, json.Unmarshal(buf1.Bytes(), &entry1))
+	require.NoError(t, json.Unmarshal(buf2.Bytes(), &entry2))
+
+	assert.Equal(t, entry1["level"], entry2["level"])
+	assert.Equal(t, entry1["msg"], entry2["msg"])
+	assert.Equal(t, entry1["key"], entry2["key"])
+}
+
 func TestReplaceAttr(t *testing.T) {
 	t.Parallel()
 
