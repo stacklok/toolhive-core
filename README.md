@@ -13,6 +13,19 @@ The ToolHive ecosystem spans multiple Go repositories, and several of these proj
 - **Tested and documented**: All packages meet minimum quality standards before inclusion
 - **Independent versioning**: Evolves on its own release cadence, decoupled from `toolhive` releases
 
+## Available Packages
+
+| Package | Stability | Description |
+|---------|-----------|-------------|
+| `cel` | Alpha | Generic CEL expression compilation and evaluation |
+| `env` | Stable | Environment variable abstraction with `Reader` interface |
+| `httperr` | Stable | Wrap errors with HTTP status codes |
+| `logging` | Alpha | Pre-configured `*slog.Logger` factory with consistent ToolHive defaults |
+| `oci/skills` | Alpha | OCI artifact types, media types, and registry operations for skills |
+| `recovery` | Beta | HTTP panic recovery middleware |
+| `validation/http` | Stable | RFC 7230/8707 compliant HTTP header and URI validation |
+| `validation/group` | Stable | Group name validation |
+
 ## Package Stability Levels
 
 Each package is marked with a stability level:
