@@ -14,6 +14,14 @@
 //	wrappedMux := recovery.Middleware(mux)
 //	http.ListenAndServe(":8080", wrappedMux)
 //
+// # Logging
+//
+// By default panics are recovered silently. Use [WithLogger] to log
+// panic details (value, stack trace, request method and path) at ERROR level:
+//
+//	logger := logging.New()
+//	wrappedMux := recovery.Middleware(mux, recovery.WithLogger(logger))
+//
 // # Stability
 //
 // This package is Beta stability. The API may have minor changes before
