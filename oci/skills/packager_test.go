@@ -6,6 +6,7 @@ package skills
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -545,6 +546,30 @@ allowed-tools: Read, Grep, Glob
 			assert.Equal(t, tt.want.License, fm.License)
 		})
 	}
+}
+
+func TestCollectSkillFiles_ExceedsMaxFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	skillMD := `---
+name: too-many-files
+description: A skill with too many files
+version: 1.0.0
+---
+# Too Many Files Skill
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillMD), 0600))
+
+	// Create maxSkillFiles + 1 extra files (SKILL.md is excluded from the count)
+	for i := range maxSkillFiles + 1 {
+		name := filepath.Join(dir, fmt.Sprintf("file_%05d.txt", i))
+		require.NoError(t, os.WriteFile(name, []byte("x"), 0600))
+	}
+
+	_, err := collectSkillFiles(dir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds maximum")
 }
 
 // Helper functions

@@ -96,6 +96,15 @@ type skillDirContent struct {
 // maxFrontmatterSize limits frontmatter to prevent YAML parsing attacks.
 const maxFrontmatterSize = 64 * 1024
 
+// maxSkillFiles limits the number of files in a skill directory to prevent
+// memory exhaustion during packaging. This matches the extraction-side limit
+// (MaxExtractFileCount in toolhive/pkg/skills/installer.go).
+const maxSkillFiles = 1_000
+
+// maxSkillTotalSize limits the total aggregate size of all files in a skill
+// directory to prevent memory exhaustion during packaging (100 MB).
+const maxSkillTotalSize int64 = 100 * 1024 * 1024
+
 // Compile-time assertion that Packager implements SkillPackager.
 var _ SkillPackager = (*Packager)(nil)
 
@@ -266,8 +275,11 @@ func validateSkillDir(dir string) error {
 }
 
 // collectSkillFiles walks a skill directory and returns all regular files (excluding SKILL.md and hidden files).
+// It enforces limits on file count (maxSkillFiles) and total aggregate size (maxSkillTotalSize)
+// to prevent memory exhaustion.
 func collectSkillFiles(dir string) (map[string][]byte, error) {
 	files := make(map[string][]byte)
+	var totalSize int64
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -309,9 +321,18 @@ func collectSkillFiles(dir string) (map[string][]byte, error) {
 			return nil
 		}
 
+		if len(files) >= maxSkillFiles {
+			return fmt.Errorf("skill directory exceeds maximum of %d files", maxSkillFiles)
+		}
+
 		content, err := os.ReadFile(path) //#nosec G304 -- path from WalkDir, symlink-checked
 		if err != nil {
 			return fmt.Errorf("reading %s: %w", relPath, err)
+		}
+
+		totalSize += int64(len(content))
+		if totalSize > maxSkillTotalSize {
+			return fmt.Errorf("skill directory exceeds maximum total size of %d bytes", maxSkillTotalSize)
 		}
 
 		files[relPath] = content
