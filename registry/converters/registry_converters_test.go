@@ -8,7 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	types "github.com/stacklok/toolhive-core/registry/types"
+	registry "github.com/stacklok/toolhive-core/registry/types"
 )
 
 func TestNewUpstreamRegistryFromToolhiveRegistry(t *testing.T) {
@@ -16,18 +16,18 @@ func TestNewUpstreamRegistryFromToolhiveRegistry(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		toolhiveReg *types.Registry
+		toolhiveReg *registry.Registry
 		expectError bool
-		validate    func(*testing.T, *types.UpstreamRegistry)
+		validate    func(*testing.T, *registry.UpstreamRegistry)
 	}{
 		{
 			name: "successful conversion with container servers",
-			toolhiveReg: &types.Registry{
+			toolhiveReg: &registry.Registry{
 				Version:     "1.0.0",
 				LastUpdated: "2024-01-01T00:00:00Z",
-				Servers: map[string]*types.ImageMetadata{
+				Servers: map[string]*registry.ImageMetadata{
 					"test-server": {
-						BaseServerMetadata: types.BaseServerMetadata{
+						BaseServerMetadata: registry.BaseServerMetadata{
 							Name:        "test-server",
 							Description: "A test server",
 							Tier:        "Community",
@@ -38,10 +38,10 @@ func TestNewUpstreamRegistryFromToolhiveRegistry(t *testing.T) {
 						Image: "test/image:latest",
 					},
 				},
-				RemoteServers: make(map[string]*types.RemoteServerMetadata),
+				RemoteServers: make(map[string]*registry.RemoteServerMetadata),
 			},
 			expectError: false,
-			validate: func(t *testing.T, sr *types.UpstreamRegistry) {
+			validate: func(t *testing.T, sr *registry.UpstreamRegistry) {
 				t.Helper()
 				assert.Equal(t, "1.0.0", sr.Version)
 				assert.Equal(t, "2024-01-01T00:00:00Z", sr.Meta.LastUpdated)
@@ -52,13 +52,13 @@ func TestNewUpstreamRegistryFromToolhiveRegistry(t *testing.T) {
 		},
 		{
 			name: "successful conversion with remote servers",
-			toolhiveReg: &types.Registry{
+			toolhiveReg: &registry.Registry{
 				Version:     "1.0.0",
 				LastUpdated: "2024-01-01T00:00:00Z",
-				Servers:     make(map[string]*types.ImageMetadata),
-				RemoteServers: map[string]*types.RemoteServerMetadata{
+				Servers:     make(map[string]*registry.ImageMetadata),
+				RemoteServers: map[string]*registry.RemoteServerMetadata{
 					"remote-server": {
-						BaseServerMetadata: types.BaseServerMetadata{
+						BaseServerMetadata: registry.BaseServerMetadata{
 							Name:        "remote-server",
 							Description: "A remote server",
 							Tier:        "Community",
@@ -71,7 +71,7 @@ func TestNewUpstreamRegistryFromToolhiveRegistry(t *testing.T) {
 				},
 			},
 			expectError: false,
-			validate: func(t *testing.T, sr *types.UpstreamRegistry) {
+			validate: func(t *testing.T, sr *registry.UpstreamRegistry) {
 				t.Helper()
 				assert.Len(t, sr.Data.Servers, 1)
 				assert.Contains(t, sr.Data.Servers[0].Name, "remote-server")
@@ -79,14 +79,14 @@ func TestNewUpstreamRegistryFromToolhiveRegistry(t *testing.T) {
 		},
 		{
 			name: "empty registry",
-			toolhiveReg: &types.Registry{
+			toolhiveReg: &registry.Registry{
 				Version:       "1.0.0",
 				LastUpdated:   "2024-01-01T00:00:00Z",
-				Servers:       make(map[string]*types.ImageMetadata),
-				RemoteServers: make(map[string]*types.RemoteServerMetadata),
+				Servers:       make(map[string]*registry.ImageMetadata),
+				RemoteServers: make(map[string]*registry.RemoteServerMetadata),
 			},
 			expectError: false,
-			validate: func(t *testing.T, sr *types.UpstreamRegistry) {
+			validate: func(t *testing.T, sr *registry.UpstreamRegistry) {
 				t.Helper()
 				assert.Empty(t, sr.Data.Servers)
 			},

@@ -6,6 +6,7 @@ package registry
 import (
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -119,16 +120,23 @@ func validateAgainstSchema(data []byte, schemaFile, errPrefix string) error {
 	for _, desc := range result.Errors() {
 		msgs = append(msgs, desc.String())
 	}
+	return formatNumberedErrors(errPrefix, msgs)
+}
 
+// formatNumberedErrors formats a list of messages as a single error with a numbered list.
+func formatNumberedErrors(prefix string, msgs []string) error {
+	if len(msgs) == 0 {
+		return nil
+	}
 	if len(msgs) == 1 {
-		return fmt.Errorf("%s: %s", errPrefix, msgs[0])
+		return fmt.Errorf("%s: %s", prefix, msgs[0])
 	}
-
-	resultStr := fmt.Sprintf("%s with %d errors:\n", errPrefix, len(msgs))
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s with %d errors:\n", prefix, len(msgs))
 	for i, msg := range msgs {
-		resultStr += fmt.Sprintf("  %d. %s\n", i+1, msg)
+		fmt.Fprintf(&b, "  %d. %s\n", i+1, msg)
 	}
-	return fmt.Errorf("%s", strings.TrimSuffix(resultStr, "\n"))
+	return errors.New(strings.TrimSuffix(b.String(), "\n"))
 }
 
 // validateRegistryExtensions parses the registry and validates publisher-provided extensions in all servers.
@@ -188,17 +196,7 @@ func validateServerList(servers []any, groupName string) []string {
 }
 
 func formatExtensionErrors(errs []string) error {
-	if len(errs) == 0 {
-		return nil
-	}
-	if len(errs) == 1 {
-		return fmt.Errorf("publisher-provided extensions validation failed: %s", errs[0])
-	}
-	resultStr := fmt.Sprintf("publisher-provided extensions validation failed with %d errors:\n", len(errs))
-	for i, msg := range errs {
-		resultStr += fmt.Sprintf("  %d. %s\n", i+1, msg)
-	}
-	return fmt.Errorf("%s", strings.TrimSuffix(resultStr, "\n"))
+	return formatNumberedErrors("publisher-provided extensions validation failed", errs)
 }
 
 func validateServerExtensions(server map[string]any, serverName string) error {

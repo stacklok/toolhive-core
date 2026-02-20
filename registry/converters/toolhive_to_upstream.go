@@ -20,7 +20,7 @@ import (
 	upstream "github.com/modelcontextprotocol/registry/pkg/api/v0"
 	"github.com/modelcontextprotocol/registry/pkg/model"
 
-	"github.com/stacklok/toolhive-core/registry/types"
+	registry "github.com/stacklok/toolhive-core/registry/types"
 )
 
 // ImageMetadataToServerJSON converts toolhive ImageMetadata to an upstream ServerJSON
@@ -187,6 +187,19 @@ func createRemotesFromRemoteMetadata(remoteMetadata *registry.RemoteServerMetada
 	}}
 }
 
+// buildPublisherExtensionsMap wraps a ServerExtensions value in the publisher-provided
+// map structure, defaulting Status to "active" if empty.
+func buildPublisherExtensionsMap(ext registry.ServerExtensions, innerKey string) map[string]interface{} {
+	if ext.Status == "" {
+		ext.Status = "active"
+	}
+	return map[string]interface{}{
+		registry.ToolHivePublisherNamespace: map[string]interface{}{
+			innerKey: serverExtensionsToMap(ext),
+		},
+	}
+}
+
 // createImageExtensions creates publisher extensions map from ImageMetadata
 // using the ServerExtensions type to ensure field names stay in sync with the type definition.
 func createImageExtensions(imageMetadata *registry.ImageMetadata) map[string]interface{} {
@@ -205,19 +218,7 @@ func createImageExtensions(imageMetadata *registry.ImageMetadata) map[string]int
 		DockerTags:      imageMetadata.DockerTags,
 		ProxyPort:       imageMetadata.ProxyPort,
 	}
-
-	// Default status to "active" if empty
-	if ext.Status == "" {
-		ext.Status = "active"
-	}
-
-	extensionsMap := serverExtensionsToMap(ext)
-
-	return map[string]interface{}{
-		registry.ToolHivePublisherNamespace: map[string]interface{}{
-			imageMetadata.Image: extensionsMap,
-		},
-	}
+	return buildPublisherExtensionsMap(ext, imageMetadata.Image)
 }
 
 // createRemoteExtensions creates publisher extensions map from RemoteServerMetadata
@@ -235,19 +236,7 @@ func createRemoteExtensions(remoteMetadata *registry.RemoteServerMetadata) map[s
 		OAuthConfig:     remoteMetadata.OAuthConfig,
 		EnvVars:         remoteMetadata.EnvVars,
 	}
-
-	// Default status to "active" if empty
-	if ext.Status == "" {
-		ext.Status = "active"
-	}
-
-	extensionsMap := serverExtensionsToMap(ext)
-
-	return map[string]interface{}{
-		registry.ToolHivePublisherNamespace: map[string]interface{}{
-			remoteMetadata.URL: extensionsMap,
-		},
-	}
+	return buildPublisherExtensionsMap(ext, remoteMetadata.URL)
 }
 
 // serverExtensionsToMap converts a ServerExtensions struct to a map[string]interface{}

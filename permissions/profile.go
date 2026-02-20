@@ -81,22 +81,7 @@ type InboundNetworkPermissions struct {
 
 // NewProfile creates a new permission profile
 func NewProfile() *Profile {
-	return &Profile{
-		Name:  ProfileNone,
-		Read:  []MountDeclaration{},
-		Write: []MountDeclaration{},
-		Network: &NetworkPermissions{
-			Outbound: &OutboundNetworkPermissions{
-				InsecureAllowAll: false,
-				AllowHost:        []string{},
-				AllowPort:        []int{},
-			},
-			Inbound: &InboundNetworkPermissions{
-				AllowHost: []string{},
-			},
-		},
-		Privileged: false,
-	}
+	return BuiltinNoneProfile()
 }
 
 // FromFile loads a permission profile from a file
@@ -173,6 +158,9 @@ var (
 
 	// commandInjectionPattern matches common command injection patterns
 	commandInjectionPattern = regexp.MustCompile(`[$&;|]|\$\(|\` + "`")
+
+	// resourceSchemeRegex validates resource URI schemes
+	resourceSchemeRegex = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]*$`)
 )
 
 // validatePath checks if a path contains potentially dangerous patterns
@@ -204,7 +192,7 @@ func isWindowsPath(path string) bool {
 
 // validateResourceScheme checks if a resource URI scheme is valid
 func validateResourceScheme(scheme string) bool {
-	return regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]*$`).MatchString(scheme)
+	return resourceSchemeRegex.MatchString(scheme)
 }
 
 // isValidContainerPath checks if a path looks like a valid container path
@@ -461,37 +449,16 @@ func (m MountDeclaration) IsValid() bool {
 // IsResourceURI checks if the mount declaration is a resource URI format
 // This only checks the format, not the security of the paths
 func (m MountDeclaration) IsResourceURI() bool {
-	declaration := string(m)
-
-	// Check if it contains ://
-	if !strings.Contains(declaration, "://") {
+	_, remainder, valid := splitResourceURI(string(m))
+	if !valid {
 		return false
 	}
-
-	// Split on :// to get scheme and remainder
-	schemeParts := strings.SplitN(declaration, "://", 2)
-	if len(schemeParts) != 2 {
+	separatorIdx := findResourceURISeparator(remainder)
+	if separatorIdx == -1 {
 		return false
 	}
-
-	scheme := schemeParts[0]
-	remainder := schemeParts[1]
-
-	// Validate scheme format
-	if !regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_-]*$`).MatchString(scheme) {
-		return false
-	}
-
-	// Find the last colon in the remainder
-	lastColonIdx := strings.LastIndex(remainder, ":")
-	if lastColonIdx == -1 {
-		return false
-	}
-
-	resourceName := remainder[:lastColonIdx]
-	containerPath := remainder[lastColonIdx+1:]
-
-	// Both parts should be non-empty
+	resourceName := remainder[:separatorIdx]
+	containerPath := remainder[separatorIdx+1:]
 	return resourceName != "" && containerPath != ""
 }
 
@@ -515,13 +482,9 @@ func ParseMountDeclarations(declarations []string) ([]MountDeclaration, error) {
 
 	for _, declaration := range declarations {
 		mount := MountDeclaration(declaration)
-
-		// Check if the declaration is valid
-		if !mount.IsValid() {
-			_, _, err := mount.Parse()
+		if _, _, err := mount.Parse(); err != nil {
 			return nil, fmt.Errorf("invalid mount declaration: %s (%w)", declaration, err)
 		}
-
 		result = append(result, mount)
 	}
 

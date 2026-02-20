@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	types "github.com/stacklok/toolhive-core/registry/types"
+	registry "github.com/stacklok/toolhive-core/registry/types"
 )
 
 // Test Helpers
@@ -66,9 +66,9 @@ func createTestServerJSON() *upstream.ServerJSON {
 }
 
 // createTestImageMetadata creates a valid ImageMetadata for testing
-func createTestImageMetadata() *types.ImageMetadata {
-	return &types.ImageMetadata{
-		BaseServerMetadata: types.BaseServerMetadata{
+func createTestImageMetadata() *registry.ImageMetadata {
+	return &registry.ImageMetadata{
+		BaseServerMetadata: registry.BaseServerMetadata{
 			Title:         "Test Server",
 			Description:   "Test MCP server",
 			Transport:     model.TransportTypeStdio,
@@ -81,7 +81,7 @@ func createTestImageMetadata() *types.ImageMetadata {
 			ToolDefinitions: []mcp.Tool{
 				{Name: "tool1", Description: "First tool"},
 			},
-			Metadata: &types.Metadata{
+			Metadata: &registry.Metadata{
 				Stars:       100,
 				LastUpdated: "2025-01-01",
 			},
@@ -91,9 +91,9 @@ func createTestImageMetadata() *types.ImageMetadata {
 }
 
 // createTestRemoteServerMetadata creates a valid RemoteServerMetadata for testing
-func createTestRemoteServerMetadata() *types.RemoteServerMetadata {
-	return &types.RemoteServerMetadata{
-		BaseServerMetadata: types.BaseServerMetadata{
+func createTestRemoteServerMetadata() *registry.RemoteServerMetadata {
+	return &registry.RemoteServerMetadata{
+		BaseServerMetadata: registry.BaseServerMetadata{
 			Title:         "Test Remote",
 			Description:   "Test remote server",
 			Transport:     "sse",
@@ -354,7 +354,7 @@ func TestImageMetadataToServerJSON_WithEnvVars(t *testing.T) {
 	t.Parallel()
 
 	imageMetadata := createTestImageMetadata()
-	imageMetadata.EnvVars = []*types.EnvVar{
+	imageMetadata.EnvVars = []*registry.EnvVar{
 		{
 			Name:        "API_KEY",
 			Description: "API Key",
@@ -704,7 +704,7 @@ func TestRemoteServerMetadataToServerJSON_WithHeaders(t *testing.T) {
 	t.Parallel()
 
 	remoteMetadata := createTestRemoteServerMetadata()
-	remoteMetadata.Headers = []*types.Header{
+	remoteMetadata.Headers = []*registry.Header{
 		{
 			Name:        "Authorization",
 			Description: "Auth header",
@@ -886,8 +886,8 @@ func TestRoundTrip_ImageMetadataWithAllFields(t *testing.T) {
 	t.Parallel()
 
 	// Create ImageMetadata with maximum field population
-	original := &types.ImageMetadata{
-		BaseServerMetadata: types.BaseServerMetadata{
+	original := &registry.ImageMetadata{
+		BaseServerMetadata: registry.BaseServerMetadata{
 			Description:   "Full featured server",
 			Transport:     model.TransportTypeStreamableHTTP,
 			RepositoryURL: "https://github.com/test/full",
@@ -895,14 +895,14 @@ func TestRoundTrip_ImageMetadataWithAllFields(t *testing.T) {
 			Tier:          "Official",
 			Tools:         []string{"tool1", "tool2", "tool3"},
 			Tags:          []string{"tag1", "tag2"},
-			Metadata: &types.Metadata{
+			Metadata: &registry.Metadata{
 				Stars:       500,
 				LastUpdated: "2025-10-23",
 			},
 		},
 		Image:      "ghcr.io/test/full:v1.0.0",
 		TargetPort: 8080,
-		EnvVars: []*types.EnvVar{
+		EnvVars: []*registry.EnvVar{
 			{
 				Name:        "API_KEY",
 				Description: "API Key for authentication",
@@ -1231,7 +1231,7 @@ func TestRealWorld_GitHubServer_ExactData(t *testing.T) {
 }`
 
 	// Parse ImageMetadata JSON
-	var imageMetadata types.ImageMetadata
+	var imageMetadata registry.ImageMetadata
 	err := json.Unmarshal([]byte(imageMetadataJSON), &imageMetadata)
 	require.NoError(t, err, "Should parse ImageMetadata JSON")
 

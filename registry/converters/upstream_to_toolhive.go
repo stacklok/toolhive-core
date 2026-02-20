@@ -14,12 +14,12 @@ import (
 	upstream "github.com/modelcontextprotocol/registry/pkg/api/v0"
 	"github.com/modelcontextprotocol/registry/pkg/model"
 
-	types "github.com/stacklok/toolhive-core/registry/types"
+	registry "github.com/stacklok/toolhive-core/registry/types"
 )
 
 // ServerJSONToImageMetadata converts an upstream ServerJSON (with OCI packages) to toolhive ImageMetadata
 // This function only handles OCI packages and will error if there are multiple OCI packages
-func ServerJSONToImageMetadata(serverJSON *upstream.ServerJSON) (*types.ImageMetadata, error) {
+func ServerJSONToImageMetadata(serverJSON *upstream.ServerJSON) (*registry.ImageMetadata, error) {
 	if serverJSON == nil {
 		return nil, fmt.Errorf("serverJSON cannot be nil")
 	}
@@ -29,8 +29,8 @@ func ServerJSONToImageMetadata(serverJSON *upstream.ServerJSON) (*types.ImageMet
 		return nil, err
 	}
 
-	imageMetadata := &types.ImageMetadata{
-		BaseServerMetadata: types.BaseServerMetadata{
+	imageMetadata := &registry.ImageMetadata{
+		BaseServerMetadata: registry.BaseServerMetadata{
 			Name:        serverJSON.Name,
 			Title:       serverJSON.Title,
 			Description: serverJSON.Description,
@@ -48,7 +48,11 @@ func ServerJSONToImageMetadata(serverJSON *upstream.ServerJSON) (*types.ImageMet
 	imageMetadata.EnvVars = extractEnvironmentVariables(pkg)
 
 	// Extract target port from transport URL if present
-	imageMetadata.TargetPort = extractTargetPort(pkg.Transport.URL, serverJSON.Name)
+	port, err := extractTargetPort(pkg.Transport.URL, serverJSON.Name)
+	if err != nil {
+		return nil, err
+	}
+	imageMetadata.TargetPort = port
 
 	// Convert PackageArguments to simple Args (priority: structured arguments first)
 	if len(pkg.PackageArguments) > 0 {
@@ -91,8 +95,8 @@ func extractSingleOCIPackage(serverJSON *upstream.ServerJSON) (model.Package, er
 // extractEnvironmentVariables extracts environment variables from both sources:
 // 1. The direct environmentVariables field (preferred)
 // 2. The -e/--env flags in runtimeArguments (Docker CLI pattern)
-func extractEnvironmentVariables(pkg model.Package) []*types.EnvVar {
-	var envVars []*types.EnvVar
+func extractEnvironmentVariables(pkg model.Package) []*registry.EnvVar {
+	var envVars []*registry.EnvVar
 
 	// First, extract from the dedicated environmentVariables field
 	envVars = append(envVars, convertEnvironmentVariables(pkg.EnvironmentVariables)...)
@@ -103,15 +107,15 @@ func extractEnvironmentVariables(pkg model.Package) []*types.EnvVar {
 	return envVars
 }
 
-// convertEnvironmentVariables converts model.KeyValueInput to types.EnvVar
-func convertEnvironmentVariables(envVars []model.KeyValueInput) []*types.EnvVar {
+// convertEnvironmentVariables converts model.KeyValueInput to registry.EnvVar
+func convertEnvironmentVariables(envVars []model.KeyValueInput) []*registry.EnvVar {
 	if len(envVars) == 0 {
 		return nil
 	}
 
-	result := make([]*types.EnvVar, 0, len(envVars))
+	result := make([]*registry.EnvVar, 0, len(envVars))
 	for _, envVar := range envVars {
-		result = append(result, &types.EnvVar{
+		result = append(result, &registry.EnvVar{
 			Name:        envVar.Name,
 			Description: envVar.Description,
 			Required:    envVar.IsRequired,
@@ -124,8 +128,8 @@ func convertEnvironmentVariables(envVars []model.KeyValueInput) []*types.EnvVar 
 
 // extractEnvFromRuntimeArgs extracts environment variables from -e/--env flags in runtime arguments
 // This handles the Docker CLI pattern where env vars are specified as: -e KEY=value or --env KEY=value
-func extractEnvFromRuntimeArgs(args []model.Argument) []*types.EnvVar {
-	var result []*types.EnvVar
+func extractEnvFromRuntimeArgs(args []model.Argument) []*registry.EnvVar {
+	var result []*registry.EnvVar
 
 	for _, arg := range args {
 		// Skip if not a named argument with -e or --env
@@ -150,7 +154,7 @@ func extractEnvFromRuntimeArgs(args []model.Argument) []*types.EnvVar {
 
 // parseEnvVarFromValue parses an environment variable definition from a value string
 // Handles formats like: KEY=value, KEY={varName}, etc.
-func parseEnvVarFromValue(value, description string, variables map[string]model.Input) *types.EnvVar {
+func parseEnvVarFromValue(value, description string, variables map[string]model.Input) *registry.EnvVar {
 	if value == "" {
 		return nil
 	}
@@ -171,7 +175,7 @@ func parseEnvVarFromValue(value, description string, variables map[string]model.
 	name := value[:eqIdx]
 	valuePart := value[eqIdx+1:]
 
-	envVar := &types.EnvVar{
+	envVar := &registry.EnvVar{
 		Name:        name,
 		Description: description,
 	}
@@ -194,36 +198,33 @@ func parseEnvVarFromValue(value, description string, variables map[string]model.
 	return envVar
 }
 
-// extractTargetPort extracts the port number from a transport URL
-func extractTargetPort(transportURL, serverName string) int {
+// extractTargetPort extracts the port number from a transport URL.
+// Returns an error if the URL or port cannot be parsed.
+func extractTargetPort(transportURL, serverName string) (int, error) {
 	if transportURL == "" {
-		return 0
+		return 0, nil
 	}
 
 	parsedURL, err := url.Parse(transportURL)
 	if err != nil {
-		fmt.Printf("⚠️  Failed to parse transport URL '%s' for server '%s': %v\n",
-			transportURL, serverName, err)
-		return 0
+		return 0, fmt.Errorf("server '%s': failed to parse transport URL '%s': %w", serverName, transportURL, err)
 	}
 
 	if parsedURL.Port() == "" {
-		return 0
+		return 0, nil
 	}
 
 	port, err := strconv.Atoi(parsedURL.Port())
 	if err != nil {
-		fmt.Printf("⚠️  Failed to parse port from URL '%s' for server '%s': %v\n",
-			transportURL, serverName, err)
-		return 0
+		return 0, fmt.Errorf("server '%s': failed to parse port from URL '%s': %w", serverName, transportURL, err)
 	}
 
-	return port
+	return port, nil
 }
 
 // ServerJSONToRemoteServerMetadata converts an upstream ServerJSON (with remotes) to toolhive RemoteServerMetadata
 // This function extracts remote server data and reconstructs RemoteServerMetadata format
-func ServerJSONToRemoteServerMetadata(serverJSON *upstream.ServerJSON) (*types.RemoteServerMetadata, error) {
+func ServerJSONToRemoteServerMetadata(serverJSON *upstream.ServerJSON) (*registry.RemoteServerMetadata, error) {
 	if serverJSON == nil {
 		return nil, fmt.Errorf("serverJSON cannot be nil")
 	}
@@ -234,8 +235,8 @@ func ServerJSONToRemoteServerMetadata(serverJSON *upstream.ServerJSON) (*types.R
 
 	remote := serverJSON.Remotes[0] // Use first remote
 
-	remoteMetadata := &types.RemoteServerMetadata{
-		BaseServerMetadata: types.BaseServerMetadata{
+	remoteMetadata := &registry.RemoteServerMetadata{
+		BaseServerMetadata: registry.BaseServerMetadata{
 			Name:        serverJSON.Name,
 			Title:       serverJSON.Title,
 			Description: serverJSON.Description,
@@ -251,9 +252,9 @@ func ServerJSONToRemoteServerMetadata(serverJSON *upstream.ServerJSON) (*types.R
 
 	// Convert headers
 	if len(remote.Headers) > 0 {
-		remoteMetadata.Headers = make([]*types.Header, 0, len(remote.Headers))
+		remoteMetadata.Headers = make([]*registry.Header, 0, len(remote.Headers))
 		for _, header := range remote.Headers {
-			remoteMetadata.Headers = append(remoteMetadata.Headers, &types.Header{
+			remoteMetadata.Headers = append(remoteMetadata.Headers, &registry.Header{
 				Name:        header.Name,
 				Description: header.Description,
 				Required:    header.IsRequired,
@@ -270,22 +271,27 @@ func ServerJSONToRemoteServerMetadata(serverJSON *upstream.ServerJSON) (*types.R
 	return remoteMetadata, nil
 }
 
+// applyBaseExtensions copies the shared fields from ServerExtensions into a BaseServerMetadata.
+func applyBaseExtensions(ext *registry.ServerExtensions, base *registry.BaseServerMetadata) {
+	base.Status = ext.Status
+	base.Tier = ext.Tier
+	base.Tools = ext.Tools
+	base.Tags = ext.Tags
+	base.Overview = ext.Overview
+	base.ToolDefinitions = ext.ToolDefinitions
+	base.Metadata = ext.Metadata
+	base.CustomMetadata = ext.CustomMetadata
+}
+
 // extractImageExtensions extracts publisher-provided extensions into ImageMetadata
 // using the ServerExtensions type to ensure field names stay in sync with the type definition.
-func extractImageExtensions(serverJSON *upstream.ServerJSON, imageMetadata *types.ImageMetadata) {
+func extractImageExtensions(serverJSON *upstream.ServerJSON, imageMetadata *registry.ImageMetadata) {
 	ext := getStacklokServerExtensions(serverJSON)
 	if ext == nil {
 		return
 	}
 
-	imageMetadata.Status = ext.Status
-	imageMetadata.Tier = ext.Tier
-	imageMetadata.Tools = ext.Tools
-	imageMetadata.Tags = ext.Tags
-	imageMetadata.Overview = ext.Overview
-	imageMetadata.ToolDefinitions = ext.ToolDefinitions
-	imageMetadata.Metadata = ext.Metadata
-	imageMetadata.CustomMetadata = ext.CustomMetadata
+	applyBaseExtensions(ext, &imageMetadata.BaseServerMetadata)
 	imageMetadata.Permissions = ext.Permissions
 	imageMetadata.Provenance = ext.Provenance
 	imageMetadata.DockerTags = ext.DockerTags
@@ -299,33 +305,26 @@ func extractImageExtensions(serverJSON *upstream.ServerJSON, imageMetadata *type
 
 // extractRemoteExtensions extracts publisher-provided extensions into RemoteServerMetadata
 // using the ServerExtensions type to ensure field names stay in sync with the type definition.
-func extractRemoteExtensions(serverJSON *upstream.ServerJSON, remoteMetadata *types.RemoteServerMetadata) {
+func extractRemoteExtensions(serverJSON *upstream.ServerJSON, remoteMetadata *registry.RemoteServerMetadata) {
 	ext := getStacklokServerExtensions(serverJSON)
 	if ext == nil {
 		return
 	}
 
-	remoteMetadata.Status = ext.Status
-	remoteMetadata.Tier = ext.Tier
-	remoteMetadata.Tools = ext.Tools
-	remoteMetadata.Tags = ext.Tags
-	remoteMetadata.Overview = ext.Overview
-	remoteMetadata.ToolDefinitions = ext.ToolDefinitions
-	remoteMetadata.Metadata = ext.Metadata
-	remoteMetadata.CustomMetadata = ext.CustomMetadata
+	applyBaseExtensions(ext, &remoteMetadata.BaseServerMetadata)
 	remoteMetadata.OAuthConfig = ext.OAuthConfig
 	remoteMetadata.EnvVars = ext.EnvVars
 }
 
 // getStacklokServerExtensions retrieves and deserializes the first stacklok extension data
 // from ServerJSON into a ServerExtensions struct.
-func getStacklokServerExtensions(serverJSON *upstream.ServerJSON) *types.ServerExtensions {
+func getStacklokServerExtensions(serverJSON *upstream.ServerJSON) *registry.ServerExtensions {
 	extensions := getStacklokExtensionsMap(serverJSON)
 	if extensions == nil {
 		return nil
 	}
 
-	return remarshalToType[*types.ServerExtensions](extensions)
+	return remarshalToType[*registry.ServerExtensions](extensions)
 }
 
 // getStacklokExtensionsMap retrieves the first stacklok extension data from ServerJSON as a raw map.
@@ -334,7 +333,7 @@ func getStacklokExtensionsMap(serverJSON *upstream.ServerJSON) map[string]interf
 		return nil
 	}
 
-	stacklokData, ok := serverJSON.Meta.PublisherProvided[types.ToolHivePublisherNamespace].(map[string]interface{})
+	stacklokData, ok := serverJSON.Meta.PublisherProvided[registry.ToolHivePublisherNamespace].(map[string]interface{})
 	if !ok {
 		return nil
 	}

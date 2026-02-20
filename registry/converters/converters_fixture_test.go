@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	types "github.com/stacklok/toolhive-core/registry/types"
+	registry "github.com/stacklok/toolhive-core/registry/types"
 )
 
 // TestConverters_Fixtures validates converter functions using JSON fixture files
@@ -117,7 +117,7 @@ func TestConverters_Fixtures(t *testing.T) {
 
 func convertImageToServer(t *testing.T, inputData []byte, serverName string) []byte {
 	t.Helper()
-	var imageMetadata types.ImageMetadata
+	var imageMetadata registry.ImageMetadata
 	require.NoError(t, json.Unmarshal(inputData, &imageMetadata))
 
 	serverJSON, err := ImageMetadataToServerJSON(serverName, &imageMetadata)
@@ -143,7 +143,7 @@ func convertServerToImage(t *testing.T, inputData []byte) []byte {
 
 func convertRemoteToServer(t *testing.T, inputData []byte, serverName string) []byte {
 	t.Helper()
-	var remoteMetadata types.RemoteServerMetadata
+	var remoteMetadata registry.RemoteServerMetadata
 	require.NoError(t, json.Unmarshal(inputData, &remoteMetadata))
 
 	serverJSON, err := RemoteServerMetadataToServerJSON(serverName, &remoteMetadata)
@@ -192,7 +192,7 @@ func getServerJSONExtensions(t *testing.T, serverJSON *upstream.ServerJSON, key 
 
 func validateImageToServerConversion(t *testing.T, inputData, outputData []byte) {
 	t.Helper()
-	var input types.ImageMetadata
+	var input registry.ImageMetadata
 	var output upstream.ServerJSON
 
 	require.NoError(t, json.Unmarshal(inputData, &input))
@@ -246,7 +246,7 @@ func validateImageToServerConversion(t *testing.T, inputData, outputData []byte)
 func validateServerToImageConversion(t *testing.T, inputData, outputData []byte) {
 	t.Helper()
 	var input upstream.ServerJSON
-	var output types.ImageMetadata
+	var output registry.ImageMetadata
 
 	require.NoError(t, json.Unmarshal(inputData, &input))
 	require.NoError(t, json.Unmarshal(outputData, &output))
@@ -288,7 +288,7 @@ func validateServerToImageConversion(t *testing.T, inputData, outputData []byte)
 
 func validateRemoteToServerConversion(t *testing.T, inputData, outputData []byte) {
 	t.Helper()
-	var input types.RemoteServerMetadata
+	var input registry.RemoteServerMetadata
 	var output upstream.ServerJSON
 
 	require.NoError(t, json.Unmarshal(inputData, &input))
@@ -340,7 +340,7 @@ func validateRemoteToServerConversion(t *testing.T, inputData, outputData []byte
 func validateServerToRemoteConversion(t *testing.T, inputData, outputData []byte) {
 	t.Helper()
 	var input upstream.ServerJSON
-	var output types.RemoteServerMetadata
+	var output registry.RemoteServerMetadata
 
 	require.NoError(t, json.Unmarshal(inputData, &input))
 	require.NoError(t, json.Unmarshal(outputData, &output))

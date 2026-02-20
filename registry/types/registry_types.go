@@ -5,7 +5,7 @@
 package registry
 
 import (
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -308,110 +308,111 @@ type ServerMetadata interface {
 	GetEnvVars() []*EnvVar
 }
 
-// Implement ServerMetadata interface for ImageMetadata
+// Implement shared ServerMetadata accessors on BaseServerMetadata.
+// These are promoted automatically to ImageMetadata and RemoteServerMetadata via embedding.
 
 // GetName returns the server name
-func (i *ImageMetadata) GetName() string {
-	if i == nil {
+func (b *BaseServerMetadata) GetName() string {
+	if b == nil {
 		return ""
 	}
-	return i.Name
+	return b.Name
 }
 
 // GetTitle returns the optional human-readable display name
-func (i *ImageMetadata) GetTitle() string {
-	if i == nil {
+func (b *BaseServerMetadata) GetTitle() string {
+	if b == nil {
 		return ""
 	}
-	return i.Title
+	return b.Title
 }
 
 // GetDescription returns the server description
-func (i *ImageMetadata) GetDescription() string {
-	if i == nil {
+func (b *BaseServerMetadata) GetDescription() string {
+	if b == nil {
 		return ""
 	}
-	return i.Description
+	return b.Description
 }
 
 // GetTier returns the server tier
-func (i *ImageMetadata) GetTier() string {
-	if i == nil {
+func (b *BaseServerMetadata) GetTier() string {
+	if b == nil {
 		return ""
 	}
-	return i.Tier
+	return b.Tier
 }
 
 // GetStatus returns the server status
-func (i *ImageMetadata) GetStatus() string {
-	if i == nil {
+func (b *BaseServerMetadata) GetStatus() string {
+	if b == nil {
 		return ""
 	}
-	return i.Status
+	return b.Status
 }
 
 // GetTransport returns the server transport
-func (i *ImageMetadata) GetTransport() string {
-	if i == nil {
+func (b *BaseServerMetadata) GetTransport() string {
+	if b == nil {
 		return ""
 	}
-	return i.Transport
+	return b.Transport
 }
 
 // GetTools returns the list of tools provided by the server
-func (i *ImageMetadata) GetTools() []string {
-	if i == nil {
+func (b *BaseServerMetadata) GetTools() []string {
+	if b == nil {
 		return nil
 	}
-	return i.Tools
+	return b.Tools
 }
 
 // GetMetadata returns the server metadata
-func (i *ImageMetadata) GetMetadata() *Metadata {
-	if i == nil {
+func (b *BaseServerMetadata) GetMetadata() *Metadata {
+	if b == nil {
 		return nil
 	}
-	return i.Metadata
+	return b.Metadata
 }
 
 // GetRepositoryURL returns the repository URL
-func (i *ImageMetadata) GetRepositoryURL() string {
-	if i == nil {
+func (b *BaseServerMetadata) GetRepositoryURL() string {
+	if b == nil {
 		return ""
 	}
-	return i.RepositoryURL
+	return b.RepositoryURL
 }
 
 // GetTags returns the server tags
-func (i *ImageMetadata) GetTags() []string {
-	if i == nil {
+func (b *BaseServerMetadata) GetTags() []string {
+	if b == nil {
 		return nil
 	}
-	return i.Tags
+	return b.Tags
 }
 
 // GetOverview returns the longer Markdown-formatted description
-func (i *ImageMetadata) GetOverview() string {
-	if i == nil {
+func (b *BaseServerMetadata) GetOverview() string {
+	if b == nil {
 		return ""
 	}
-	return i.Overview
+	return b.Overview
 }
 
 // GetToolDefinitions returns the full MCP Tool definitions
-func (i *ImageMetadata) GetToolDefinitions() []mcp.Tool {
-	if i == nil {
+func (b *BaseServerMetadata) GetToolDefinitions() []mcp.Tool {
+	if b == nil {
 		return nil
 	}
-	return i.ToolDefinitions
+	return b.ToolDefinitions
 }
 
 // GetCustomMetadata returns custom metadata
-func (i *ImageMetadata) GetCustomMetadata() map[string]any {
-	if i == nil {
+func (b *BaseServerMetadata) GetCustomMetadata() map[string]any {
+	if b == nil {
 		return nil
 	}
-	return i.CustomMetadata
+	return b.CustomMetadata
 }
 
 // IsRemote returns false for container servers
@@ -425,112 +426,6 @@ func (i *ImageMetadata) GetEnvVars() []*EnvVar {
 		return nil
 	}
 	return i.EnvVars
-}
-
-// Implement ServerMetadata interface for RemoteServerMetadata
-
-// GetName returns the server name
-func (r *RemoteServerMetadata) GetName() string {
-	if r == nil {
-		return ""
-	}
-	return r.Name
-}
-
-// GetTitle returns the optional human-readable display name
-func (r *RemoteServerMetadata) GetTitle() string {
-	if r == nil {
-		return ""
-	}
-	return r.Title
-}
-
-// GetDescription returns the server description
-func (r *RemoteServerMetadata) GetDescription() string {
-	if r == nil {
-		return ""
-	}
-	return r.Description
-}
-
-// GetTier returns the server tier
-func (r *RemoteServerMetadata) GetTier() string {
-	if r == nil {
-		return ""
-	}
-	return r.Tier
-}
-
-// GetStatus returns the server status
-func (r *RemoteServerMetadata) GetStatus() string {
-	if r == nil {
-		return ""
-	}
-	return r.Status
-}
-
-// GetTransport returns the server transport
-func (r *RemoteServerMetadata) GetTransport() string {
-	if r == nil {
-		return ""
-	}
-	return r.Transport
-}
-
-// GetTools returns the list of tools provided by the server
-func (r *RemoteServerMetadata) GetTools() []string {
-	if r == nil {
-		return nil
-	}
-	return r.Tools
-}
-
-// GetMetadata returns the server metadata
-func (r *RemoteServerMetadata) GetMetadata() *Metadata {
-	if r == nil {
-		return nil
-	}
-	return r.Metadata
-}
-
-// GetRepositoryURL returns the repository URL
-func (r *RemoteServerMetadata) GetRepositoryURL() string {
-	if r == nil {
-		return ""
-	}
-	return r.RepositoryURL
-}
-
-// GetTags returns the server tags
-func (r *RemoteServerMetadata) GetTags() []string {
-	if r == nil {
-		return nil
-	}
-	return r.Tags
-}
-
-// GetOverview returns the longer Markdown-formatted description
-func (r *RemoteServerMetadata) GetOverview() string {
-	if r == nil {
-		return ""
-	}
-	return r.Overview
-}
-
-// GetToolDefinitions returns the full MCP Tool definitions
-func (r *RemoteServerMetadata) GetToolDefinitions() []mcp.Tool {
-	if r == nil {
-		return nil
-	}
-	return r.ToolDefinitions
-}
-
-// GetCustomMetadata returns custom metadata
-func (r *RemoteServerMetadata) GetCustomMetadata() map[string]any {
-	if r == nil {
-		return nil
-	}
-	return r.CustomMetadata
 }
 
 // IsRemote returns true for remote servers
@@ -633,7 +528,13 @@ func (g *Group) GetAllGroupServers() []ServerMetadata {
 
 // SortServersByName sorts a slice of ServerMetadata by name
 func SortServersByName(servers []ServerMetadata) {
-	sort.Slice(servers, func(i, j int) bool {
-		return servers[i].GetName() < servers[j].GetName()
+	slices.SortFunc(servers, func(a, b ServerMetadata) int {
+		if a.GetName() < b.GetName() {
+			return -1
+		}
+		if a.GetName() > b.GetName() {
+			return 1
+		}
+		return 0
 	})
 }
