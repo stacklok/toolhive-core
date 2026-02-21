@@ -133,24 +133,24 @@ func getVerifiedResults(
 }
 
 // VerifyServer verifies the server information for the given image reference
-func (s *Sigstore) VerifyServer(imageRef string, provenance *registry.Provenance) (bool, error) {
+func (s *Sigstore) VerifyServer(imageRef string, provenance *registry.Provenance) error {
 	// Get the verification results for the image reference
 	results, err := s.GetVerificationResults(imageRef)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	if len(results) == 0 {
-		return false, ErrImageNotSigned
+		return ErrImageNotSigned
 	}
 
-	// Return true if any result matches the provenance
+	// Return nil if any result matches the provenance
 	for _, res := range results {
 		if isVerificationResultMatchingServerProvenance(res, provenance) {
-			return true, nil
+			return nil
 		}
 	}
-	return false, ErrProvenanceMismatch
+	return ErrProvenanceMismatch
 }
 
 func isVerificationResultMatchingServerProvenance(r *verify.VerificationResult, p *registry.Provenance) bool {
