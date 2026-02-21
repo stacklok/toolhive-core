@@ -145,15 +145,13 @@ func (s *Sigstore) VerifyServer(imageRef string, provenance *registry.Provenance
 		return false, nil
 	}
 
-	// Compare the server information with the verification results
+	// Return true if any result matches the provenance
 	for _, res := range results {
-		if !isVerificationResultMatchingServerProvenance(res, provenance) {
-			// The server information does not match the verification result, fail the verification
-			return false, nil
+		if isVerificationResultMatchingServerProvenance(res, provenance) {
+			return true, nil
 		}
 	}
-	// The server information matches the verification result, pass the verification
-	return true, nil
+	return false, nil
 }
 
 func isVerificationResultMatchingServerProvenance(r *verify.VerificationResult, p *registry.Provenance) bool {
