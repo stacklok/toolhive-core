@@ -381,7 +381,7 @@ func TestValidateUpstreamRegistryBytes(t *testing.T) {
 		{
 			name: "valid registry with all fields",
 			data: `{
-				"$schema": "https://raw.githubusercontent.com/stacklok/toolhive/main/pkg/registry/data/upstream-registry.schema.json",
+				"$schema": "https://raw.githubusercontent.com/stacklok/toolhive-core/main/registry/types/data/upstream-registry.schema.json",
 				"version": "1.0.0",
 				"meta": {
 					"last_updated": "2024-01-15T10:30:00Z"
@@ -396,7 +396,7 @@ func TestValidateUpstreamRegistryBytes(t *testing.T) {
 		{
 			name: "valid registry without groups (optional)",
 			data: `{
-				"$schema": "https://raw.githubusercontent.com/stacklok/toolhive/main/pkg/registry/data/upstream-registry.schema.json",
+				"$schema": "https://raw.githubusercontent.com/stacklok/toolhive-core/main/registry/types/data/upstream-registry.schema.json",
 				"version": "1.0.0",
 				"meta": {
 					"last_updated": "2024-01-15T10:30:00Z"
@@ -410,7 +410,7 @@ func TestValidateUpstreamRegistryBytes(t *testing.T) {
 		{
 			name: "valid registry with group",
 			data: `{
-				"$schema": "https://raw.githubusercontent.com/stacklok/toolhive/main/pkg/registry/data/upstream-registry.schema.json",
+				"$schema": "https://raw.githubusercontent.com/stacklok/toolhive-core/main/registry/types/data/upstream-registry.schema.json",
 				"version": "1.0.0",
 				"meta": {
 					"last_updated": "2024-01-15T10:30:00Z"
@@ -545,7 +545,7 @@ func TestValidateUpstreamRegistry_RealWorld(t *testing.T) {
 
 	// Simulate a realistic upstream registry
 	realWorldRegistry := `{
-		"$schema": "https://raw.githubusercontent.com/stacklok/toolhive/main/pkg/registry/data/upstream-registry.schema.json",
+		"$schema": "https://raw.githubusercontent.com/stacklok/toolhive-core/main/registry/types/data/upstream-registry.schema.json",
 		"version": "1.0.0",
 		"meta": {
 			"last_updated": "2024-11-25T10:30:00Z"

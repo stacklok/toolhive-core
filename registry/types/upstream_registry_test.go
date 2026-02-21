@@ -17,7 +17,7 @@ import (
 func TestUpstreamRegistry_JSONSerialization(t *testing.T) {
 	t.Parallel()
 	registry := &UpstreamRegistry{
-		Schema:  "https://raw.githubusercontent.com/stacklok/toolhive/main/pkg/registry/data/upstream-registry.schema.json",
+		Schema:  UpstreamRegistrySchemaURL,
 		Version: "1.0.0",
 		Meta: UpstreamMeta{
 			LastUpdated: time.Now().Format(time.RFC3339),
@@ -47,7 +47,7 @@ func TestUpstreamRegistry_JSONSerialization(t *testing.T) {
 func TestUpstreamRegistry_YAMLSerialization(t *testing.T) {
 	t.Parallel()
 	registry := &UpstreamRegistry{
-		Schema:  "https://raw.githubusercontent.com/stacklok/toolhive/main/pkg/registry/data/upstream-registry.schema.json",
+		Schema:  UpstreamRegistrySchemaURL,
 		Version: "1.0.0",
 		Meta: UpstreamMeta{
 			LastUpdated: "2024-01-15T10:30:00Z",
@@ -75,7 +75,7 @@ func TestUpstreamRegistry_YAMLSerialization(t *testing.T) {
 func TestUpstreamRegistry_WithGroups(t *testing.T) {
 	t.Parallel()
 	registry := &UpstreamRegistry{
-		Schema:  "https://raw.githubusercontent.com/stacklok/toolhive/main/pkg/registry/data/upstream-registry.schema.json",
+		Schema:  UpstreamRegistrySchemaURL,
 		Version: "1.0.0",
 		Meta: UpstreamMeta{
 			LastUpdated: time.Now().Format(time.RFC3339),
@@ -106,7 +106,7 @@ func TestUpstreamRegistry_SchemaField(t *testing.T) {
 	t.Parallel()
 
 	registry := &UpstreamRegistry{
-		Schema:  "https://raw.githubusercontent.com/stacklok/toolhive/main/pkg/registry/data/upstream-registry.schema.json",
+		Schema:  UpstreamRegistrySchemaURL,
 		Version: "1.0.0",
 		Meta: UpstreamMeta{
 			LastUpdated: time.Now().Format(time.RFC3339),
@@ -120,7 +120,7 @@ func TestUpstreamRegistry_SchemaField(t *testing.T) {
 	// Verify schema field is correctly serialized with "$schema" key
 	jsonData, err := json.Marshal(registry)
 	require.NoError(t, err)
-	assert.Contains(t, string(jsonData), `"$schema":"https://raw.githubusercontent.com/stacklok/toolhive/main/pkg/registry/data/upstream-registry.schema.json"`)
+	assert.Contains(t, string(jsonData), `"$schema":"`+UpstreamRegistrySchemaURL+`"`)
 
 	// Verify schema field can be deserialized
 	var decoded UpstreamRegistry
@@ -181,7 +181,7 @@ func TestRegistryData_EmptyOptionalFields(t *testing.T) {
 func TestUpstreamRegistry_WithSkills(t *testing.T) {
 	t.Parallel()
 	reg := &UpstreamRegistry{
-		Schema:  "https://raw.githubusercontent.com/stacklok/toolhive/main/pkg/registry/data/upstream-registry.schema.json",
+		Schema:  UpstreamRegistrySchemaURL,
 		Version: "1.0.0",
 		Meta: UpstreamMeta{
 			LastUpdated: time.Now().Format(time.RFC3339),
