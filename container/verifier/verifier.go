@@ -140,9 +140,8 @@ func (s *Sigstore) VerifyServer(imageRef string, provenance *registry.Provenance
 		return false, err
 	}
 
-	// If we didn't manage to get any verification results, it probably means that the image is not signed.
 	if len(results) == 0 {
-		return false, nil
+		return false, ErrImageNotSigned
 	}
 
 	// Return true if any result matches the provenance
@@ -151,7 +150,7 @@ func (s *Sigstore) VerifyServer(imageRef string, provenance *registry.Provenance
 			return true, nil
 		}
 	}
-	return false, nil
+	return false, ErrProvenanceMismatch
 }
 
 func isVerificationResultMatchingServerProvenance(r *verify.VerificationResult, p *registry.Provenance) bool {
