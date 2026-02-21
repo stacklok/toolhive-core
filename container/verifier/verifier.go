@@ -41,12 +41,12 @@ type Result struct {
 }
 
 // New creates a new Sigstore verifier
-func New(serverInfo *registry.ImageMetadata, keychain authn.Keychain) (*Sigstore, error) {
+func New(provenance *registry.Provenance, keychain authn.Keychain) (*Sigstore, error) {
 	// Fail the verification early if the server information is not set
-	if serverInfo == nil || serverInfo.Provenance == nil {
+	if provenance == nil {
 		return nil, ErrProvenanceServerInformationNotSet
 	}
-	sigstoreTUFRepoURL := serverInfo.Provenance.SigstoreURL
+	sigstoreTUFRepoURL := provenance.SigstoreURL
 
 	// Default the sigstoreTUFRepoURL to the sigstore public trusted root repo if not provided.
 	// Note: Update this if we want to support more sigstore instances
@@ -133,27 +133,24 @@ func getVerifiedResults(
 }
 
 // VerifyServer verifies the server information for the given image reference
-func (s *Sigstore) VerifyServer(imageRef string, serverInfo *registry.ImageMetadata) (bool, error) {
+func (s *Sigstore) VerifyServer(imageRef string, provenance *registry.Provenance) error {
 	// Get the verification results for the image reference
 	results, err := s.GetVerificationResults(imageRef)
 	if err != nil {
-		return false, err
+		return err
 	}
 
-	// If we didn't manage to get any verification results, it probably means that the image is not signed.
 	if len(results) == 0 {
-		return false, nil
+		return ErrImageNotSigned
 	}
 
-	// Compare the server information with the verification results
+	// Return nil if any result matches the provenance
 	for _, res := range results {
-		if !isVerificationResultMatchingServerProvenance(res, serverInfo.Provenance) {
-			// The server information does not match the verification result, fail the verification
-			return false, nil
+		if isVerificationResultMatchingServerProvenance(res, provenance) {
+			return nil
 		}
 	}
-	// The server information matches the verification result, pass the verification
-	return true, nil
+	return ErrProvenanceMismatch
 }
 
 func isVerificationResultMatchingServerProvenance(r *verify.VerificationResult, p *registry.Provenance) bool {

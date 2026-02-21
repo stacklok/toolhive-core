@@ -26,6 +26,12 @@ var (
 	// ErrProvenanceServerInformationNotSet is returned when the provenance information for a server is not set
 	ErrProvenanceServerInformationNotSet = errors.New("provenance server information not set")
 
+	// ErrImageNotSigned is returned when no signatures or attestations are found for the image
+	ErrImageNotSigned = errors.New("image is not signed")
+
+	// ErrProvenanceMismatch is returned when the image is signed but no bundle matches the expected provenance
+	ErrProvenanceMismatch = errors.New("image provenance does not match")
+
 	// MaxAttestationsBytesLimit is the maximum number of bytes we're willing to read from the attestation endpoint
 	// We'll limit this to 10mb for now
 	MaxAttestationsBytesLimit int64 = 10 * 1024 * 1024
