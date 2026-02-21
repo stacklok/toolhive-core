@@ -41,12 +41,12 @@ type Result struct {
 }
 
 // New creates a new Sigstore verifier
-func New(serverInfo *registry.ImageMetadata, keychain authn.Keychain) (*Sigstore, error) {
+func New(provenance *registry.Provenance, keychain authn.Keychain) (*Sigstore, error) {
 	// Fail the verification early if the server information is not set
-	if serverInfo == nil || serverInfo.Provenance == nil {
+	if provenance == nil {
 		return nil, ErrProvenanceServerInformationNotSet
 	}
-	sigstoreTUFRepoURL := serverInfo.Provenance.SigstoreURL
+	sigstoreTUFRepoURL := provenance.SigstoreURL
 
 	// Default the sigstoreTUFRepoURL to the sigstore public trusted root repo if not provided.
 	// Note: Update this if we want to support more sigstore instances
@@ -133,7 +133,7 @@ func getVerifiedResults(
 }
 
 // VerifyServer verifies the server information for the given image reference
-func (s *Sigstore) VerifyServer(imageRef string, serverInfo *registry.ImageMetadata) (bool, error) {
+func (s *Sigstore) VerifyServer(imageRef string, provenance *registry.Provenance) (bool, error) {
 	// Get the verification results for the image reference
 	results, err := s.GetVerificationResults(imageRef)
 	if err != nil {
@@ -147,7 +147,7 @@ func (s *Sigstore) VerifyServer(imageRef string, serverInfo *registry.ImageMetad
 
 	// Compare the server information with the verification results
 	for _, res := range results {
-		if !isVerificationResultMatchingServerProvenance(res, serverInfo.Provenance) {
+		if !isVerificationResultMatchingServerProvenance(res, provenance) {
 			// The server information does not match the verification result, fail the verification
 			return false, nil
 		}
