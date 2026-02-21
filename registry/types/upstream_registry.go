@@ -8,8 +8,8 @@ import (
 )
 
 // UpstreamRegistrySchemaURL is the canonical URL for the upstream registry JSON schema.
-const UpstreamRegistrySchemaURL = "https://raw.githubusercontent.com/stacklok/toolhive/main/" +
-	"pkg/registry/data/upstream-registry.schema.json"
+const UpstreamRegistrySchemaURL = "https://raw.githubusercontent.com/stacklok/toolhive-core/main/" +
+	"registry/types/data/upstream-registry.schema.json"
 
 // UpstreamRegistry is the unified registry format that stores servers in upstream
 // ServerJSON format with proper meta/data separation and groups support.
