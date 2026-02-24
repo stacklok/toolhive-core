@@ -1,5 +1,5 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/stacklok/toolhive-core/main/registry/types/data/publisher-provided.schema.json",
   "title": "ToolHive Publisher-Provided Extensions Schema",
   "description": "Schema for ToolHive-specific metadata placed under _meta['io.modelcontextprotocol.registry/publisher-provided'] in MCP server definitions. This schema defines the structure of publisher extensions that ToolHive adds to servers in the upstream MCP registry format.",
@@ -9,7 +9,7 @@
       "type": "object",
       "description": "ToolHive publisher namespace containing server-specific extensions keyed by identifier (OCI image reference for container servers, URL for remote servers)",
       "additionalProperties": {
-        "$ref": "#/definitions/server_extensions"
+        "$ref": "#/$defs/server_extensions"
       }
     }
   },
@@ -17,7 +17,7 @@
     "type": "object",
     "description": "Other publisher namespaces may contain arbitrary extensions"
   },
-  "definitions": {
+  "$defs": {
     "server_extensions": {
       "type": "object",
       "description": "Extensions for MCP servers. Container servers (keyed by OCI image reference) may use permissions, args, provenance, docker_tags, and proxy_port. Remote servers (keyed by URL) may use oauth_config and env_vars. All servers share status, tier, tools, tags, metadata, and custom_metadata.",
@@ -60,15 +60,15 @@
           "type": "array",
           "description": "Full MCP Tool definitions describing the tools available from this server, including name, description, inputSchema, and annotations",
           "items": {
-            "$ref": "#/definitions/tool_definition"
+            "$ref": "#/$defs/tool_definition"
           }
         },
         "metadata": {
-          "$ref": "#/definitions/metadata"
+          "$ref": "#/$defs/metadata"
         },
         "permissions": {
           "description": "Security permissions for container-based servers",
-          "$ref": "#/definitions/permissions"
+          "$ref": "#/$defs/permissions"
         },
         "args": {
           "type": "array",
@@ -79,7 +79,7 @@
         },
         "provenance": {
           "description": "Supply chain provenance for container-based servers",
-          "$ref": "#/definitions/provenance"
+          "$ref": "#/$defs/provenance"
         },
         "docker_tags": {
           "type": "array",
@@ -97,13 +97,13 @@
         },
         "oauth_config": {
           "description": "OAuth/OIDC configuration for remote servers",
-          "$ref": "#/definitions/oauth_config"
+          "$ref": "#/$defs/oauth_config"
         },
         "env_vars": {
           "type": "array",
           "description": "Environment variables for remote server client configuration",
           "items": {
-            "$ref": "#/definitions/environment_variable"
+            "$ref": "#/$defs/environment_variable"
           }
         },
         "custom_metadata": {
@@ -129,7 +129,7 @@
           "format": "date-time"
         },
         "kubernetes": {
-          "$ref": "#/definitions/kubernetes_metadata"
+          "$ref": "#/$defs/kubernetes_metadata"
         }
       },
       "additionalProperties": false
@@ -179,7 +179,7 @@
           "description": "Name of the permission profile"
         },
         "network": {
-          "$ref": "#/definitions/network_permissions"
+          "$ref": "#/$defs/network_permissions"
         },
         "read": {
           "type": "array",
@@ -212,7 +212,7 @@
       "description": "Network access permissions for the MCP server",
       "properties": {
         "outbound": {
-          "$ref": "#/definitions/outbound_permissions"
+          "$ref": "#/$defs/outbound_permissions"
         }
       },
       "additionalProperties": false
@@ -290,7 +290,7 @@
           "examples": ["https://token.actions.githubusercontent.com"]
         },
         "attestation": {
-          "$ref": "#/definitions/verified_attestation"
+          "$ref": "#/$defs/verified_attestation"
         }
       },
       "additionalProperties": false

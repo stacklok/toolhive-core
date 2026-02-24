@@ -1,5 +1,5 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/stacklok/toolhive-core/main/registry/types/data/toolhive-legacy-registry.schema.json",
   "title": "ToolHive MCP Server Registry Schema",
   "description": "JSON Schema for the ToolHive MCP server registry. This schema validates the structure and content of registry.json entries for MCP servers. See docs/registry/management.md and docs/registry/heuristics.md for inclusion criteria and management processes.",
@@ -16,7 +16,7 @@
       "description": "Collection of MCP server entries indexed by server name",
       "patternProperties": {
         "^[a-z0-9][a-z0-9-]+[a-z0-9]$": {
-          "$ref": "#/definitions/server"
+          "$ref": "#/$defs/server"
         }
       },
       "additionalProperties": false
@@ -26,7 +26,7 @@
       "description": "Collection of remote MCP server entries indexed by server name",
       "patternProperties": {
         "^[a-z0-9][a-z0-9-]+[a-z0-9]$": {
-          "$ref": "#/definitions/remote_server"
+          "$ref": "#/$defs/remote_server"
         }
       },
       "additionalProperties": false
@@ -35,7 +35,7 @@
       "type": "array",
       "description": "Collection of group definitions containing related MCP servers",
       "items": {
-        "$ref": "#/definitions/group"
+        "$ref": "#/$defs/group"
       }
     },
     "version": {
@@ -44,7 +44,7 @@
       "pattern": "^\\d+\\.\\d+\\.\\d+$"
     }
   },
-  "definitions": {
+  "$defs": {
     "server": {
       "type": "object",
       "description": "MCP server entry definition",
@@ -88,7 +88,7 @@
           "type": "array",
           "description": "Environment variables that can be passed to the server",
           "items": {
-            "$ref": "#/definitions/environment_variable"
+            "$ref": "#/$defs/environment_variable"
           }
         },
         "image": {
@@ -104,7 +104,7 @@
         },
         "metadata": {
           "description": "Additional information about the server such as popularity metrics",
-          "$ref": "#/definitions/metadata"
+          "$ref": "#/$defs/metadata"
         },
         "name": {
           "type": "string",
@@ -120,11 +120,11 @@
         },
         "permissions": {
           "description": "Security profile and access permissions for the server",
-          "$ref": "#/definitions/permissions"
+          "$ref": "#/$defs/permissions"
         },
         "provenance": {
           "description": "Verification and signing metadata",
-          "$ref": "#/definitions/provenance"
+          "$ref": "#/$defs/provenance"
         },
         "repository_url": {
           "type": "string",
@@ -228,7 +228,7 @@
       "required": [],
       "properties": {
         "network": {
-          "$ref": "#/definitions/network_permissions"
+          "$ref": "#/$defs/network_permissions"
         },
         "read": {
           "type": "array",
@@ -264,7 +264,7 @@
       "required": [],
       "properties": {
         "outbound": {
-          "$ref": "#/definitions/outbound_permissions"
+          "$ref": "#/$defs/outbound_permissions"
         }
       },
       "additionalProperties": false
@@ -369,7 +369,7 @@
         },
         "attestation": {
           "description": "Verified attestation information",
-          "$ref": "#/definitions/verified_attestation"
+          "$ref": "#/$defs/verified_attestation"
         }
       },
       "additionalProperties": false
@@ -566,23 +566,23 @@
           "type": "array",
           "description": "HTTP headers for authentication to the remote server",
           "items": {
-            "$ref": "#/definitions/header"
+            "$ref": "#/$defs/header"
           }
         },
         "oauth_config": {
           "description": "OAuth/OIDC configuration for authentication",
-          "$ref": "#/definitions/oauth_config"
+          "$ref": "#/$defs/oauth_config"
         },
         "env_vars": {
           "type": "array",
           "description": "Environment variables for client-side configuration",
           "items": {
-            "$ref": "#/definitions/environment_variable"
+            "$ref": "#/$defs/environment_variable"
           }
         },
         "metadata": {
           "description": "Additional information about the server",
-          "$ref": "#/definitions/metadata"
+          "$ref": "#/$defs/metadata"
         },
         "repository_url": {
           "type": "string",
@@ -630,7 +630,7 @@
           "description": "Collection of MCP server entries within this group indexed by server name",
           "patternProperties": {
             "^[a-z0-9][a-z0-9-]+[a-z0-9]$": {
-              "$ref": "#/definitions/server"
+              "$ref": "#/$defs/server"
             }
           },
           "additionalProperties": false
@@ -640,7 +640,7 @@
           "description": "Collection of remote MCP server entries within this group indexed by server name",
           "patternProperties": {
             "^[a-z0-9][a-z0-9-]+[a-z0-9]$": {
-              "$ref": "#/definitions/remote_server"
+              "$ref": "#/$defs/remote_server"
             }
           },
           "additionalProperties": false

@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish Release Artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Upload schema artifacts to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            registry/types/data/skill.schema.json \
+            registry/types/data/upstream-registry.schema.json \
+            registry/types/data/publisher-provided.schema.json \
+            registry/types/data/toolhive-legacy-registry.schema.json \
+            --clobber
