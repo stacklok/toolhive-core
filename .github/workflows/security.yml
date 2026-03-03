@@ -26,6 +26,7 @@ jobs:
         with:
           go-version-file: go.mod
           go-package: ./...
+          repo-checkout: false
 
   trivy:
     name: Trivy Vulnerability Scan
