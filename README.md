@@ -1,5 +1,10 @@
 # toolhive-core
 
+[![Release][release-img]][release] [![Build Status][ci-img]][ci]
+[![Coverage Status][coveralls-img]][coveralls]
+[![License: Apache 2.0][license-img]][license]
+[![Star on GitHub][stars-img]][stars]
+
 The ToolHive Platform common libraries and specifications.
 
 `toolhive-core` provides stable, well-tested Go utilities with explicit API guarantees for the ToolHive ecosystem. Projects like [toolhive](https://github.com/stacklok/toolhive), [dockyard](https://github.com/stacklok/dockyard), [toolhive-registry](https://github.com/stacklok/toolhive-registry), and [toolhive-registry-server](https://github.com/stacklok/toolhive-registry-server) depend on this library for shared functionality.
@@ -99,3 +104,19 @@ For packages with external dependencies, multiple types, or broader API surface:
 ## License
 
 Apache-2.0 - See [LICENSE](LICENSE) for details.
+
+<!-- Badge links -->
+<!-- prettier-ignore-start -->
+[release]: https://github.com/stacklok/toolhive-core/releases/latest
+[release-img]: https://img.shields.io/github/v/release/stacklok/toolhive-core
+[ci]: https://github.com/stacklok/toolhive-core/actions/workflows/ci.yml
+[ci-img]: https://github.com/stacklok/toolhive-core/actions/workflows/ci.yml/badge.svg
+[coveralls]: https://coveralls.io/github/stacklok/toolhive-core
+[coveralls-img]: https://coveralls.io/repos/github/stacklok/toolhive-core/badge.svg
+[license]: https://opensource.org/licenses/Apache-2.0
+[license-img]: https://img.shields.io/badge/License-Apache%202.0-blue.svg
+[stars]: https://github.com/stacklok/toolhive-core/stargazers
+[stars-img]: https://img.shields.io/github/stars/stacklok/toolhive-core?style=social
+<!-- prettier-ignore-end -->
+
+<!-- markdownlint-disable-file first-line-heading no-inline-html no-emphasis-as-heading -->

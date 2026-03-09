@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"testing"
 
+	upstreamv0 "github.com/modelcontextprotocol/registry/pkg/api/v0"
 	"github.com/modelcontextprotocol/registry/pkg/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1497,6 +1498,171 @@ func TestValidateSkillBytes(t *testing.T) {
 				if tt.errorContains != "" {
 					assert.Contains(t, err.Error(), tt.errorContains)
 				}
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestRegistry_Validate tests the Validate method on the Registry struct.
+func TestRegistry_Validate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		registry    *Registry
+		expectError bool
+	}{
+		{
+			name: "valid minimal registry",
+			registry: &Registry{
+				Version:     "1.0.0",
+				LastUpdated: "2025-01-01T00:00:00Z",
+				Servers:     map[string]*ImageMetadata{},
+			},
+			expectError: false,
+		},
+		{
+			name:        "invalid registry - empty struct",
+			registry:    &Registry{},
+			expectError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := tc.registry.Validate()
+			if tc.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestUpstreamRegistry_Validate tests the Validate method on the UpstreamRegistry struct.
+func TestUpstreamRegistry_Validate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		registry    *UpstreamRegistry
+		expectError bool
+	}{
+		{
+			name: "valid minimal upstream registry",
+			registry: &UpstreamRegistry{
+				Schema:  UpstreamRegistrySchemaURL,
+				Version: "1.0.0",
+				Meta: UpstreamMeta{
+					LastUpdated: "2025-01-01T00:00:00Z",
+				},
+				Data: UpstreamData{
+					Servers: []upstreamv0.ServerJSON{},
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:        "invalid upstream registry - empty struct",
+			registry:    &UpstreamRegistry{},
+			expectError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := tc.registry.Validate()
+			if tc.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestServerExtensions_Validate tests the Validate method on the ServerExtensions struct.
+func TestServerExtensions_Validate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		extensions  *ServerExtensions
+		expectError bool
+	}{
+		{
+			name:        "invalid extensions - empty struct fails schema structure",
+			extensions:  &ServerExtensions{},
+			expectError: true,
+		},
+		{
+			name:        "invalid extensions - non-empty struct fails schema structure",
+			extensions:  &ServerExtensions{Status: "active", Tier: "Official"},
+			expectError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := tc.extensions.Validate()
+			if tc.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestSkill_Validate tests the Validate method on the Skill struct.
+func TestSkill_Validate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		skill       *Skill
+		expectError bool
+	}{
+		{
+			name: "valid skill",
+			skill: &Skill{
+				Namespace:   "io.github.example",
+				Name:        "my-skill",
+				Description: "A test skill for validation",
+				Version:     "1.0.0",
+			},
+			expectError: false,
+		},
+		{
+			name:        "invalid skill - empty struct",
+			skill:       &Skill{},
+			expectError: true,
+		},
+		{
+			name: "invalid skill - invalid status enum",
+			skill: &Skill{
+				Namespace:   "io.github.example",
+				Name:        "my-skill",
+				Description: "A test skill for validation",
+				Version:     "1.0.0",
+				Status:      "invalid-status",
+			},
+			expectError: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := tc.skill.Validate()
+			if tc.expectError {
+				assert.Error(t, err)
 			} else {
 				assert.NoError(t, err)
 			}

@@ -414,6 +414,79 @@ func TestCheckError_Details(t *testing.T) {
 	assert.NotEmpty(t, checkErr.Errors)
 }
 
+func TestEngine_WithMaxExpressionLength(t *testing.T) {
+	t.Parallel()
+
+	t.Run("rejects expression exceeding custom limit", func(t *testing.T) {
+		t.Parallel()
+
+		engine := newTestClaimsEngine().WithMaxExpressionLength(10)
+
+		_, err := engine.Compile(`claims["sub"] == "user123"`)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, cel.ErrExpressionCheck)
+	})
+
+	t.Run("accepts expression within custom limit", func(t *testing.T) {
+		t.Parallel()
+
+		engine := newTestClaimsEngine().WithMaxExpressionLength(100)
+
+		expr, err := engine.Compile(`true`)
+		require.NoError(t, err)
+		require.NotNil(t, expr)
+	})
+
+	t.Run("rejects expression at default limit via Check", func(t *testing.T) {
+		t.Parallel()
+
+		engine := newTestClaimsEngine().WithMaxExpressionLength(5)
+
+		err := engine.Check(`claims["sub"] == "user123"`)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, cel.ErrExpressionCheck)
+	})
+}
+
+func TestEngine_WithCostLimit(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns engine for chaining", func(t *testing.T) {
+		t.Parallel()
+
+		engine := newTestClaimsEngine().WithCostLimit(500000)
+		require.NotNil(t, engine)
+	})
+
+	t.Run("compiles and evaluates within cost limit", func(t *testing.T) {
+		t.Parallel()
+
+		engine := newTestClaimsEngine().WithCostLimit(cel.DefaultCostLimit)
+
+		expr, err := engine.Compile(`claims["sub"] == "user123"`)
+		require.NoError(t, err)
+
+		ctx := map[string]any{"claims": map[string]any{"sub": "user123"}}
+		result, err := expr.EvaluateBool(ctx)
+		require.NoError(t, err)
+		assert.True(t, result)
+	})
+
+	t.Run("zero cost limit rejects evaluation", func(t *testing.T) {
+		t.Parallel()
+
+		engine := newTestClaimsEngine().WithCostLimit(0)
+
+		expr, err := engine.Compile(`claims["sub"] == "user123"`)
+		require.NoError(t, err)
+
+		ctx := map[string]any{"claims": map[string]any{"sub": "user123"}}
+		_, err = expr.EvaluateBool(ctx)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, cel.ErrEvaluation)
+	})
+}
+
 func TestEngine_Concurrency(t *testing.T) {
 	t.Parallel()
 
