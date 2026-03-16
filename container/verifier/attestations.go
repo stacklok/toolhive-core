@@ -85,29 +85,9 @@ func bundleFromAttestation(imageRef string, keychain authn.Keychain) ([]sigstore
 			continue
 		}
 
-		layers, err := refImg.Layers()
+		b, err := extractBundleFromImage(refImg)
 		if err != nil {
-			slog.Debug("error getting referrer layers", "error", err)
-			continue
-		}
-		if len(layers) == 0 {
-			slog.Debug("referrer has no layers, skipping")
-			continue
-		}
-		layer0, err := layers[0].Uncompressed()
-		if err != nil {
-			slog.Debug("error uncompressing referrer layer", "error", err)
-			continue
-		}
-		bundleBytes, err := io.ReadAll(layer0)
-		if err != nil {
-			slog.Debug("error reading referrer layer", "error", err)
-			continue
-		}
-		b := &bundle.Bundle{}
-		err = b.UnmarshalJSON(bundleBytes)
-		if err != nil {
-			slog.Debug("error unmarshalling bundle", "error", err)
+			slog.Debug("error extracting bundle from referrer", "error", err)
 			continue
 		}
 
@@ -121,6 +101,30 @@ func bundleFromAttestation(imageRef string, keychain authn.Keychain) ([]sigstore
 		return nil, ErrProvenanceNotFoundOrIncomplete
 	}
 	return bundles, nil
+}
+
+// extractBundleFromImage reads and parses a sigstore bundle from the first layer of an OCI image.
+func extractBundleFromImage(img v1.Image) (*bundle.Bundle, error) {
+	layers, err := img.Layers()
+	if err != nil {
+		return nil, fmt.Errorf("error getting referrer layers: %w", err)
+	}
+	if len(layers) == 0 {
+		return nil, fmt.Errorf("referrer has no layers")
+	}
+	layer0, err := layers[0].Uncompressed()
+	if err != nil {
+		return nil, fmt.Errorf("error uncompressing referrer layer: %w", err)
+	}
+	bundleBytes, err := io.ReadAll(layer0)
+	if err != nil {
+		return nil, fmt.Errorf("error reading referrer layer: %w", err)
+	}
+	b := &bundle.Bundle{}
+	if err = b.UnmarshalJSON(bundleBytes); err != nil {
+		return nil, fmt.Errorf("error unmarshalling bundle: %w", err)
+	}
+	return b, nil
 }
 
 // isSigstoreBundle inspects the actual manifest of a referrer image to
