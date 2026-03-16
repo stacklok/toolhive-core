@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	containerdigest "github.com/opencontainers/go-digest"
 	"github.com/sigstore/sigstore-go/pkg/bundle"
@@ -60,17 +61,37 @@ func bundleFromAttestation(imageRef string, keychain authn.Keychain) ([]sigstore
 
 	// Loop through all available attestations and extract the bundle
 	for _, refDesc := range refManifest.Manifests {
-		if !strings.HasPrefix(refDesc.ArtifactType, "application/vnd.dev.sigstore.bundle") {
+		// Fast path: skip referrers that are clearly not sigstore bundles without
+		// fetching the manifest. Only do a deep inspection when the artifact type
+		// is ambiguous (empty or "application/vnd.oci.empty.v1+json"), which
+		// happens due to a go-containerregistry bug (google/go-containerregistry#1997)
+		// where the referrers fallback tag doesn't propagate the inner manifest's
+		// artifactType.
+		if !hasSigstoreBundlePrefix(refDesc.ArtifactType) &&
+			refDesc.ArtifactType != "application/vnd.oci.empty.v1+json" &&
+			refDesc.ArtifactType != "" {
 			continue
 		}
+
 		refImg, err := remote.Image(ref.Context().Digest(refDesc.Digest.String()), opts...)
 		if err != nil {
 			slog.Debug("error getting referrer image", "error", err)
 			continue
 		}
+
+		// When the index descriptor's artifactType is ambiguous, inspect the
+		// actual manifest to determine whether this is a sigstore bundle.
+		if !hasSigstoreBundlePrefix(refDesc.ArtifactType) && !isSigstoreBundle(refImg) {
+			continue
+		}
+
 		layers, err := refImg.Layers()
 		if err != nil {
 			slog.Debug("error getting referrer layers", "error", err)
+			continue
+		}
+		if len(layers) == 0 {
+			slog.Debug("referrer has no layers, skipping")
 			continue
 		}
 		layer0, err := layers[0].Uncompressed()
@@ -100,4 +121,35 @@ func bundleFromAttestation(imageRef string, keychain authn.Keychain) ([]sigstore
 		return nil, ErrProvenanceNotFoundOrIncomplete
 	}
 	return bundles, nil
+}
+
+// isSigstoreBundle inspects the actual manifest of a referrer image to
+// determine whether it is a sigstore bundle. This is used as a fallback when
+// the referrer index descriptor's artifactType is ambiguous (e.g. GHCR sets it
+// to "application/vnd.oci.empty.v1+json" due to google/go-containerregistry#1997).
+func isSigstoreBundle(img v1.Image) bool {
+	mf, err := img.Manifest()
+	if err != nil {
+		slog.Debug("error fetching manifest for sigstore bundle check", "error", err)
+		return false
+	}
+
+	// Check the config descriptor's artifactType (set by cosign v2+ when using OCI 1.1 referrers)
+	if hasSigstoreBundlePrefix(mf.Config.ArtifactType) {
+		return true
+	}
+
+	// Check layer media types as a final fallback
+	for _, layer := range mf.Layers {
+		if hasSigstoreBundlePrefix(string(layer.MediaType)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hasSigstoreBundlePrefix checks if a media/artifact type string indicates a sigstore bundle.
+func hasSigstoreBundlePrefix(s string) bool {
+	return strings.HasPrefix(s, "application/vnd.dev.sigstore.bundle")
 }
