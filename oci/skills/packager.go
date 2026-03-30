@@ -537,6 +537,9 @@ func createManifest(
 				MediaType: ocispec.MediaTypeImageLayerGzip,
 				Digest:    layerDigest,
 				Size:      int64(len(layerBytes)),
+				Annotations: map[string]string{
+					ocispec.AnnotationTitle: "skill.tar.gz",
+				},
 			},
 		},
 		Annotations: annotations,
