@@ -19,3 +19,8 @@ type OSReader struct{}
 func (*OSReader) Getenv(key string) string {
 	return os.Getenv(key)
 }
+
+// LookupEnv returns the value of the environment variable named by the key
+func (r *OSReader) LookupEnv(key string) (string, bool) {
+	return os.LookupEnv(key)
+}
