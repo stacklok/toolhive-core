@@ -22,6 +22,6 @@ func (*OSReader) Getenv(key string) string {
 }
 
 // LookupEnv returns the value of the environment variable named by the key
-func (r *OSReader) LookupEnv(key string) (string, bool) {
+func (*OSReader) LookupEnv(key string) (string, bool) {
 	return os.LookupEnv(key)
 }
