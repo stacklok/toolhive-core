@@ -95,6 +95,7 @@ func TestPackager_Package_VerifyManifest(t *testing.T) {
 	assert.Equal(t, ocispec.MediaTypeImageConfig, manifest.Config.MediaType)
 	require.Len(t, manifest.Layers, 1)
 	assert.Equal(t, ocispec.MediaTypeImageLayerGzip, manifest.Layers[0].MediaType)
+	assert.Equal(t, "skill.tar.gz", manifest.Layers[0].Annotations[ocispec.AnnotationTitle])
 	assert.Equal(t, testSkillName, manifest.Annotations[AnnotationSkillName])
 }
 
