@@ -18,7 +18,7 @@ func (m mapReader) Getenv(key string) string {
 	return m[key]
 }
 
-func (m mapReader) Lookupenv(key string) (string, bool) {
+func (m mapReader) LookupEnv(key string) (string, bool) {
 	v, ok := m[key]
 	return v, ok
 }

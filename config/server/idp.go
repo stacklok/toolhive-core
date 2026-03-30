@@ -33,7 +33,7 @@ type IDPConfig struct {
 // the two-value map lookup; production code should use OSLookupReader.
 type lookupEnvReader interface {
 	env.Reader
-	Lookupenv(key string) (string, bool)
+	LookupEnv(key string) (string, bool)
 }
 
 // LoadIDPConfig reads OIDC settings from environment variables via r.
@@ -66,7 +66,7 @@ func LoadIDPConfig(r env.Reader) (IDPConfig, error) {
 // resolveRequiredScope applies absent-vs-empty semantics for CONFIG_SERVER_REQUIRED_SCOPE.
 func resolveRequiredScope(r env.Reader) string {
 	if lr, ok := r.(lookupEnvReader); ok {
-		val, present := lr.Lookupenv(EnvRequiredScope)
+		val, present := lr.LookupEnv(EnvRequiredScope)
 		if !present {
 			return DefaultRequiredScope
 		}
