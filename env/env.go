@@ -10,6 +10,7 @@ import "os"
 // Reader defines an interface for environment variable access
 type Reader interface {
 	Getenv(key string) string
+	LookupEnv(key string) (string, bool)
 }
 
 // OSReader implements Reader using the standard os package
