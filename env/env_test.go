@@ -59,6 +59,65 @@ func TestOSReader_Getenv(t *testing.T) { //nolint:paralleltest // Modifies envir
 	}
 }
 
+func TestOSReader_LookupEnv(t *testing.T) { //nolint:paralleltest // Modifies environment variables
+	testKey := "TEST_LOOKUP_ENV_VARIABLE_FOR_TESTING"
+	testValue := "lookup_test_value_123"
+
+	originalValue, wasSet := os.LookupEnv(testKey)
+	t.Cleanup(func() {
+		if wasSet {
+			os.Setenv(testKey, originalValue)
+		} else {
+			os.Unsetenv(testKey)
+		}
+	})
+
+	reader := &OSReader{}
+
+	tests := []struct {
+		name      string
+		setup     func()
+		key       string
+		wantVal   string
+		wantFound bool
+	}{
+		{
+			name:      "existing variable returns value and true",
+			setup:     func() { os.Setenv(testKey, testValue) },
+			key:       testKey,
+			wantVal:   testValue,
+			wantFound: true,
+		},
+		{
+			name:      "variable set to empty string returns empty and true",
+			setup:     func() { os.Setenv(testKey, "") },
+			key:       testKey,
+			wantVal:   "",
+			wantFound: true,
+		},
+		{
+			name:      "absent variable returns empty and false",
+			setup:     func() { os.Unsetenv(testKey) },
+			key:       testKey,
+			wantVal:   "",
+			wantFound: false,
+		},
+	}
+
+	for _, tt := range tests { //nolint:paralleltest // Test modifies environment variables
+		t.Run(tt.name, func(t *testing.T) {
+			tt.setup()
+			gotVal, gotFound := reader.LookupEnv(tt.key)
+			if gotVal != tt.wantVal {
+				t.Errorf("OSReader.LookupEnv() val = %q, want %q", gotVal, tt.wantVal)
+			}
+			if gotFound != tt.wantFound {
+				t.Errorf("OSReader.LookupEnv() found = %v, want %v", gotFound, tt.wantFound)
+			}
+		})
+	}
+}
+
 // TestReader_InterfaceCompliance ensures OSReader implements the Reader interface
 func TestReader_InterfaceCompliance(t *testing.T) {
 	t.Parallel()

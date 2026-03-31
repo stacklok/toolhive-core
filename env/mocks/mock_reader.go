@@ -56,3 +56,18 @@ func (mr *MockReaderMockRecorder) Getenv(key any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Getenv", reflect.TypeOf((*MockReader)(nil).Getenv), key)
 }
+
+// LookupEnv mocks base method.
+func (m *MockReader) LookupEnv(key string) (string, bool) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "LookupEnv", key)
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].(bool)
+	return ret0, ret1
+}
+
+// LookupEnv indicates an expected call of LookupEnv.
+func (mr *MockReaderMockRecorder) LookupEnv(key any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LookupEnv", reflect.TypeOf((*MockReader)(nil).LookupEnv), key)
+}
