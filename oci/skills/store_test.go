@@ -6,6 +6,7 @@ package skills
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,8 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/stacklok/toolhive-core/httperr"
 )
 
 func TestNewStore(t *testing.T) {
@@ -271,6 +274,105 @@ func TestStore_IsIndex(t *testing.T) {
 	isIdx, err = store.IsIndex(ctx, manifestDigest)
 	require.NoError(t, err)
 	assert.False(t, isIdx, "should not detect regular manifest as index")
+}
+
+func TestStore_DeleteTag(t *testing.T) {
+	t.Parallel()
+
+	manifest := []byte(`{"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json"}`)
+
+	tests := []struct {
+		name      string
+		setup     func(t *testing.T, s *Store, ctx context.Context) digest.Digest
+		tag       string
+		wantErr   bool
+		wantCode  int
+		postCheck func(t *testing.T, s *Store, ctx context.Context, d digest.Digest)
+	}{
+		{
+			name: "tag exists and is removed",
+			setup: func(t *testing.T, s *Store, ctx context.Context) digest.Digest {
+				t.Helper()
+				d, err := s.PutManifest(ctx, manifest)
+				require.NoError(t, err)
+				require.NoError(t, s.Tag(ctx, d, "v1"))
+				return d
+			},
+			tag: "v1",
+			postCheck: func(t *testing.T, s *Store, ctx context.Context, _ digest.Digest) {
+				t.Helper()
+				_, err := s.Resolve(ctx, "v1")
+				assert.Error(t, err, "resolve should fail after tag removal")
+
+				tags, err := s.ListTags(ctx)
+				require.NoError(t, err)
+				assert.NotContains(t, tags, "v1")
+			},
+		},
+		{
+			name: "tag does not exist returns 404",
+			setup: func(_ *testing.T, _ *Store, _ context.Context) digest.Digest {
+				return ""
+			},
+			tag:      "nonexistent",
+			wantErr:  true,
+			wantCode: http.StatusNotFound,
+		},
+		{
+			name: "removing one tag does not affect other tags on same digest",
+			setup: func(t *testing.T, s *Store, ctx context.Context) digest.Digest {
+				t.Helper()
+				d, err := s.PutManifest(ctx, manifest)
+				require.NoError(t, err)
+				require.NoError(t, s.Tag(ctx, d, "v1"))
+				require.NoError(t, s.Tag(ctx, d, "v2"))
+				return d
+			},
+			tag: "v1",
+			postCheck: func(t *testing.T, s *Store, ctx context.Context, d digest.Digest) {
+				t.Helper()
+				resolved, err := s.Resolve(ctx, "v2")
+				require.NoError(t, err)
+				assert.Equal(t, d, resolved, "v2 should still resolve to the original digest")
+
+				data, err := s.GetManifest(ctx, d)
+				require.NoError(t, err)
+				assert.NotEmpty(t, data, "manifest blob should still be accessible")
+
+				tags, err := s.ListTags(ctx)
+				require.NoError(t, err)
+				assert.Contains(t, tags, "v2")
+				assert.NotContains(t, tags, "v1")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store, err := NewStore(t.TempDir())
+			require.NoError(t, err)
+
+			ctx := context.Background()
+			d := tt.setup(t, store, ctx)
+
+			err = store.DeleteTag(ctx, tt.tag)
+
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.wantCode != 0 {
+					assert.Equal(t, tt.wantCode, httperr.Code(err))
+				}
+				return
+			}
+
+			require.NoError(t, err)
+			if tt.postCheck != nil {
+				tt.postCheck(t, store, ctx, d)
+			}
+		})
+	}
 }
 
 func TestStoreRoot(t *testing.T) {
