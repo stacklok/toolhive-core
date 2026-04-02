@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"path/filepath"
 
 	"github.com/adrg/xdg"
@@ -18,6 +19,8 @@ import (
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
 	"oras.land/oras-go/v2/errdef"
+
+	"github.com/stacklok/toolhive-core/httperr"
 )
 
 // Store provides local OCI artifact storage backed by an OCI Image Layout.
@@ -126,6 +129,20 @@ func (s *Store) Tag(ctx context.Context, d digest.Digest, tag string) error {
 		return fmt.Errorf("tagging: %w", err)
 	}
 
+	return nil
+}
+
+// DeleteTag removes a tag from the store index without deleting the underlying blobs.
+func (s *Store) DeleteTag(ctx context.Context, tag string) error {
+	if err := s.inner.Untag(ctx, tag); err != nil {
+		if errors.Is(err, errdef.ErrNotFound) {
+			return httperr.WithCode(
+				fmt.Errorf("tag not found: %s: %w", tag, err),
+				http.StatusNotFound,
+			)
+		}
+		return fmt.Errorf("removing tag: %w", err)
+	}
 	return nil
 }
 
