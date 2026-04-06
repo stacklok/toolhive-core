@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"os"
 	"path/filepath"
 
 	"github.com/adrg/xdg"
@@ -18,6 +20,8 @@ import (
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/oci"
 	"oras.land/oras-go/v2/errdef"
+
+	"github.com/stacklok/toolhive-core/httperr"
 )
 
 // Store provides local OCI artifact storage backed by an OCI Image Layout.
@@ -129,6 +133,47 @@ func (s *Store) Tag(ctx context.Context, d digest.Digest, tag string) error {
 	return nil
 }
 
+// DeleteTag removes a tag from the store index without deleting the underlying blobs.
+func (s *Store) DeleteTag(ctx context.Context, tag string) error {
+	if err := s.inner.Untag(ctx, tag); err != nil {
+		if errors.Is(err, errdef.ErrNotFound) {
+			return httperr.WithCode(
+				fmt.Errorf("tag not found: %s: %w", tag, err),
+				http.StatusNotFound,
+			)
+		}
+		return fmt.Errorf("removing tag: %w", err)
+	}
+	return nil
+}
+
+// DeleteBuild removes a tag and, if no other tag shares the same digest,
+// deletes all associated blobs (config, layers, manifest, and index if applicable).
+// Use DeleteTag when tag-only removal is desired and blob cleanup is not needed.
+func (s *Store) DeleteBuild(ctx context.Context, tag string) error {
+	d, err := s.Resolve(ctx, tag)
+	if err != nil {
+		return httperr.WithCode(
+			fmt.Errorf("tag not found: %s: %w", tag, err),
+			http.StatusNotFound,
+		)
+	}
+
+	if err := s.DeleteTag(ctx, tag); err != nil {
+		return err
+	}
+
+	shared, err := s.isDigestReferenced(ctx, d)
+	if err != nil {
+		return fmt.Errorf("checking remaining references: %w", err)
+	}
+	if shared {
+		return nil
+	}
+
+	return s.deleteOrphanedBlobs(ctx, d)
+}
+
 // Resolve resolves a tag to a manifest digest.
 func (s *Store) Resolve(ctx context.Context, tag string) (digest.Digest, error) {
 	desc, err := s.inner.Resolve(ctx, tag)
@@ -207,4 +252,85 @@ func (s *Store) fetchContent(ctx context.Context, d digest.Digest) ([]byte, erro
 	}
 
 	return data, nil
+}
+
+// isDigestReferenced checks whether any remaining tag still resolves to d.
+func (s *Store) isDigestReferenced(ctx context.Context, d digest.Digest) (bool, error) {
+	tags, err := s.ListTags(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, tag := range tags {
+		resolved, err := s.Resolve(ctx, tag)
+		if err != nil {
+			continue
+		}
+		if resolved == d {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// deleteOrphanedBlobs removes all blobs reachable from d (index or manifest),
+// including d itself. Callers must ensure no remaining tag references d.
+func (s *Store) deleteOrphanedBlobs(ctx context.Context, d digest.Digest) error {
+	isIdx, err := s.IsIndex(ctx, d)
+	if err != nil {
+		return fmt.Errorf("inspecting orphaned digest: %w", err)
+	}
+
+	if isIdx {
+		idx, err := s.GetIndex(ctx, d)
+		if err != nil {
+			return fmt.Errorf("fetching orphaned index: %w", err)
+		}
+		for _, m := range idx.Manifests {
+			if err := s.deleteManifestBlobs(ctx, m.Digest); err != nil {
+				return err
+			}
+		}
+	} else {
+		if err := s.deleteManifestBlobs(ctx, d); err != nil {
+			return err
+		}
+		// deleteManifestBlobs already deletes d when it's a plain manifest.
+		return nil
+	}
+
+	return s.deleteBlob(d)
+}
+
+// deleteManifestBlobs fetches the manifest at d, deletes its config and layer
+// blobs, then deletes the manifest blob itself.
+func (s *Store) deleteManifestBlobs(ctx context.Context, d digest.Digest) error {
+	data, err := s.fetchContent(ctx, d)
+	if err != nil {
+		return fmt.Errorf("fetching manifest %s: %w", d, err)
+	}
+
+	var m ocispec.Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return fmt.Errorf("parsing manifest %s: %w", d, err)
+	}
+
+	if err := s.deleteBlob(m.Config.Digest); err != nil {
+		return err
+	}
+	for _, layer := range m.Layers {
+		if err := s.deleteBlob(layer.Digest); err != nil {
+			return err
+		}
+	}
+	return s.deleteBlob(d)
+}
+
+// deleteBlob removes the blob file for d from the local OCI layout.
+// A missing file is treated as success (idempotent).
+func (s *Store) deleteBlob(d digest.Digest) error {
+	path := filepath.Join(s.root, "blobs", d.Algorithm().String(), d.Encoded())
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("deleting blob %s: %w", d, err)
+	}
+	return nil
 }
