@@ -1,6 +1,6 @@
 module github.com/stacklok/toolhive-core
 
-go 1.26
+go 1.26.2
 
 require (
 	github.com/adrg/xdg v0.5.3
