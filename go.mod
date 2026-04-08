@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	github.com/adrg/xdg v0.5.3
-	github.com/google/cel-go v0.27.0
+	github.com/google/cel-go v0.28.0
 	github.com/google/go-containerregistry v0.21.4
 	github.com/mark3labs/mcp-go v0.47.0
 	github.com/modelcontextprotocol/registry v1.5.0
