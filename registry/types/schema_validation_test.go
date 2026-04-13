@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 
 	upstreamv0 "github.com/modelcontextprotocol/registry/pkg/api/v0"
@@ -1738,6 +1739,83 @@ func TestUpstreamRegistrySchemaVersionSync(t *testing.T) {
 						groupSchemaDate, expectedDate)
 				}
 			}
+		}
+	}
+}
+
+// findExternalRefs recursively walks a parsed JSON value and collects all
+// "$ref" string values that start with "http://" or "https://".
+func findExternalRefs(v any) []string {
+	var refs []string
+	switch val := v.(type) {
+	case map[string]any:
+		for key, child := range val {
+			if key == "$ref" {
+				if s, ok := child.(string); ok {
+					if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+						refs = append(refs, s)
+					}
+				}
+				continue
+			}
+			refs = append(refs, findExternalRefs(child)...)
+		}
+	case []any:
+		for _, item := range val {
+			refs = append(refs, findExternalRefs(item)...)
+		}
+	}
+	return refs
+}
+
+// TestExternalRefsHaveEmbeddedSchemas ensures that every external $ref URL
+// found in the embedded schema files has a corresponding $id in one of the
+// other embedded schemas. This prevents silent fallback to HTTP fetching when
+// a referenced schema is not vendored locally.
+func TestExternalRefsHaveEmbeddedSchemas(t *testing.T) {
+	t.Parallel()
+
+	entries, err := embeddedSchemaFS.ReadDir("data")
+	require.NoError(t, err, "failed to read embedded schema directory")
+
+	// First pass: collect $id values from all schema files.
+	idSet := make(map[string]bool)
+	// Also store parsed schemas keyed by file name for the second pass.
+	type schemaEntry struct {
+		name   string
+		parsed any
+	}
+	var schemas []schemaEntry
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".schema.json") {
+			continue
+		}
+		filePath := "data/" + entry.Name()
+		data, readErr := embeddedSchemaFS.ReadFile(filePath)
+		require.NoError(t, readErr, "failed to read embedded schema file %s", filePath)
+
+		var parsed any
+		require.NoError(t, json.Unmarshal(data, &parsed), "failed to parse %s", filePath)
+
+		schemas = append(schemas, schemaEntry{name: filePath, parsed: parsed})
+
+		// Extract $id if present at the top level.
+		if obj, ok := parsed.(map[string]any); ok {
+			if id, ok := obj["$id"].(string); ok {
+				idSet[id] = true
+			}
+		}
+	}
+
+	// Second pass: find all external $ref URLs and verify each has a matching $id.
+	for _, s := range schemas {
+		refs := findExternalRefs(s.parsed)
+		for _, ref := range refs {
+			assert.True(t, idSet[ref],
+				"Schema file %q has external $ref %q but no embedded schema has a matching $id.\n"+
+					"To fix: vendor the referenced schema into registry/types/data/ and add it to the go:embed directive.",
+				s.name, ref)
 		}
 	}
 }

@@ -9,12 +9,46 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/xeipuuv/gojsonschema"
 )
 
-//go:embed data/toolhive-legacy-registry.schema.json data/upstream-registry.schema.json data/publisher-provided.schema.json data/skill.schema.json
+//go:embed data/toolhive-legacy-registry.schema.json data/upstream-registry.schema.json data/publisher-provided.schema.json data/skill.schema.json data/server.schema.json
 var embeddedSchemaFS embed.FS
+
+// referencedSchemas lists embedded schema files that declare an $id matching
+// a $ref in other schemas. They are preloaded into every SchemaLoader so the
+// validator never needs to fetch them over the network.
+var referencedSchemas = []string{
+	"data/server.schema.json",
+	"data/skill.schema.json",
+}
+
+// preloadedSchemaLoaders caches the raw bytes of each referenced schema,
+// keyed by its embedded file path. Built once via preloadOnce.
+var (
+	preloadOnce          sync.Once
+	preloadedSchemaBytes [][]byte
+	preloadErr           error
+)
+
+// ensurePreloaded reads the referenced schema files once and caches their
+// bytes for reuse across every call to validateAgainstSchema.
+func ensurePreloaded() error {
+	preloadOnce.Do(func() {
+		preloadedSchemaBytes = make([][]byte, 0, len(referencedSchemas))
+		for _, path := range referencedSchemas {
+			data, err := embeddedSchemaFS.ReadFile(path)
+			if err != nil {
+				preloadErr = fmt.Errorf("failed to read embedded referenced schema %s: %w", path, err)
+				return
+			}
+			preloadedSchemaBytes = append(preloadedSchemaBytes, data)
+		}
+	})
+	return preloadErr
+}
 
 // Validate validates the Registry against the legacy ToolHive registry schema.
 func (r *Registry) Validate() error {
@@ -98,16 +132,38 @@ func ValidateServerJSON(serverData []byte, validateExtensions bool) error {
 }
 
 // validateAgainstSchema validates data against a named embedded schema file.
+// Referenced schemas (server.schema.json, skill.schema.json) are preloaded
+// into the schema loader so the validator never makes HTTP requests to
+// resolve external $ref URLs.
 func validateAgainstSchema(data []byte, schemaFile, errPrefix string) error {
+	if err := ensurePreloaded(); err != nil {
+		return fmt.Errorf("%s: %w", errPrefix, err)
+	}
+
 	schemaData, err := embeddedSchemaFS.ReadFile(schemaFile)
 	if err != nil {
 		return fmt.Errorf("failed to read embedded schema %s: %w", schemaFile, err)
 	}
 
-	result, err := gojsonschema.Validate(
-		gojsonschema.NewBytesLoader(schemaData),
-		gojsonschema.NewBytesLoader(data),
-	)
+	sl := gojsonschema.NewSchemaLoader()
+	for i, refPath := range referencedSchemas {
+		// Skip preloading a schema that is the same file being compiled;
+		// Compile will register it via its $id and a duplicate would
+		// cause a "Reference already exists" error.
+		if refPath == schemaFile {
+			continue
+		}
+		if err := sl.AddSchemas(gojsonschema.NewBytesLoader(preloadedSchemaBytes[i])); err != nil {
+			return fmt.Errorf("%s: failed to preload referenced schema: %w", errPrefix, err)
+		}
+	}
+
+	compiled, err := sl.Compile(gojsonschema.NewBytesLoader(schemaData))
+	if err != nil {
+		return fmt.Errorf("%s: %w", errPrefix, err)
+	}
+
+	result, err := compiled.Validate(gojsonschema.NewBytesLoader(data))
 	if err != nil {
 		return fmt.Errorf("%s: %w", errPrefix, err)
 	}
