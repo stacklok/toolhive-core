@@ -882,6 +882,76 @@ func TestRoundTrip_RemoteServerMetadata(t *testing.T) {
 	assert.Len(t, result.ToolDefinitions, len(original.ToolDefinitions))
 }
 
+func TestRoundTrip_StatelessField(t *testing.T) {
+	t.Parallel()
+
+	t.Run("remote server with stateless=true", func(t *testing.T) {
+		t.Parallel()
+
+		original := &registry.RemoteServerMetadata{
+			BaseServerMetadata: registry.BaseServerMetadata{
+				Description: "Stateless remote server",
+				Transport:   "streamable-http",
+				Status:      "active",
+				Tier:        "Official",
+				Tools:       []string{"tool1"},
+				Tags:        []string{"stateless"},
+				Stateless:   true,
+			},
+			URL: "https://api.example.com/mcp",
+		}
+
+		serverJSON, err := RemoteServerMetadataToServerJSON("stateless-remote", original)
+		require.NoError(t, err)
+
+		result, err := ServerJSONToRemoteServerMetadata(serverJSON)
+		require.NoError(t, err)
+
+		assert.True(t, result.Stateless, "Stateless field should be preserved through round-trip")
+		assert.True(t, result.GetStateless(), "GetStateless() should return true")
+	})
+
+	t.Run("remote server with stateless=false (default)", func(t *testing.T) {
+		t.Parallel()
+
+		original := createTestRemoteServerMetadata()
+		assert.False(t, original.Stateless, "test fixture should default to false")
+
+		serverJSON, err := RemoteServerMetadataToServerJSON("stateful-remote", original)
+		require.NoError(t, err)
+
+		result, err := ServerJSONToRemoteServerMetadata(serverJSON)
+		require.NoError(t, err)
+
+		assert.False(t, result.Stateless, "Stateless field should remain false")
+	})
+
+	t.Run("image server with stateless=true", func(t *testing.T) {
+		t.Parallel()
+
+		original := &registry.ImageMetadata{
+			BaseServerMetadata: registry.BaseServerMetadata{
+				Description: "Stateless container server",
+				Transport:   "streamable-http",
+				Status:      "active",
+				Tier:        "Official",
+				Tools:       []string{"tool1"},
+				Tags:        []string{"stateless"},
+				Stateless:   true,
+			},
+			Image: "ghcr.io/test/stateless:latest",
+		}
+
+		serverJSON, err := ImageMetadataToServerJSON("stateless-image", original)
+		require.NoError(t, err)
+
+		result, err := ServerJSONToImageMetadata(serverJSON)
+		require.NoError(t, err)
+
+		assert.True(t, result.Stateless, "Stateless field should be preserved through round-trip")
+	})
+}
+
 func TestRoundTrip_ImageMetadataWithAllFields(t *testing.T) {
 	t.Parallel()
 
@@ -893,6 +963,7 @@ func TestRoundTrip_ImageMetadataWithAllFields(t *testing.T) {
 			RepositoryURL: "https://github.com/test/full",
 			Status:        "active",
 			Tier:          "Official",
+			Stateless:     true,
 			Tools:         []string{"tool1", "tool2", "tool3"},
 			Tags:          []string{"tag1", "tag2"},
 			Metadata: &registry.Metadata{
@@ -937,6 +1008,7 @@ func TestRoundTrip_ImageMetadataWithAllFields(t *testing.T) {
 	assert.Equal(t, original.Tools, result.Tools)
 	assert.Equal(t, original.Tags, result.Tags)
 	assert.Equal(t, original.TargetPort, result.TargetPort)
+	assert.Equal(t, original.Stateless, result.Stateless)
 
 	require.Len(t, result.EnvVars, len(original.EnvVars))
 	for i := range original.EnvVars {

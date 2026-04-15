@@ -4,6 +4,7 @@
 package registry
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -251,6 +252,7 @@ func TestRegistry_ServerMetadataInterface(t *testing.T) {
 	assert.Nil(t, sa.GetToolDefinitions())
 	assert.Nil(t, sa.GetCustomMetadata())
 	assert.Nil(t, sa.GetMetadata())
+	assert.False(t, sa.GetStateless()) // not set in fixture
 	assert.False(t, sa.IsRemote())
 	require.Len(t, sa.GetEnvVars(), 1)
 	assert.Equal(t, "API_KEY", sa.GetEnvVars()[0].Name)
@@ -291,4 +293,85 @@ func TestMetadata_ParsedTime(t *testing.T) {
 	m := &Metadata{LastUpdated: "not-a-date"}
 	_, err = m.ParsedTime()
 	assert.Error(t, err)
+}
+
+func TestStateless_YAMLRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	const yamlData = `
+version: "1.0.0"
+last_updated: "2024-06-01T00:00:00Z"
+servers: {}
+remote_servers:
+  stateless-remote:
+    name: stateless-remote
+    description: A stateless remote server
+    tier: Community
+    status: Active
+    transport: streamable-http
+    stateless: true
+    url: https://api.example.com/mcp
+    tools:
+      - tool1
+`
+	var reg Registry
+	require.NoError(t, yaml.Unmarshal([]byte(yamlData), &reg))
+
+	rs := reg.RemoteServers["stateless-remote"]
+	require.NotNil(t, rs)
+	assert.True(t, rs.Stateless, "Stateless should be true after YAML unmarshal")
+	assert.True(t, rs.GetStateless(), "GetStateless() should return true")
+
+	// Verify through ServerMetadata interface
+	srv, ok := reg.GetServerByName("stateless-remote")
+	require.True(t, ok)
+	assert.True(t, srv.GetStateless())
+
+	// Verify default (omitted) is false via the shared fixture
+	sharedReg := parseTestRegistry(t)
+	ra := sharedReg.RemoteServers["remote-a"]
+	require.NotNil(t, ra)
+	assert.False(t, ra.Stateless, "Stateless should default to false when omitted")
+}
+
+func TestStateless_JSONRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	original := &RemoteServerMetadata{
+		BaseServerMetadata: BaseServerMetadata{
+			Name:        "test",
+			Description: "test server",
+			Transport:   "streamable-http",
+			Stateless:   true,
+			Status:      "active",
+			Tier:        "Official",
+			Tools:       []string{"tool1"},
+		},
+		URL: "https://example.com/mcp",
+	}
+
+	data, err := json.Marshal(original)
+	require.NoError(t, err)
+
+	var decoded RemoteServerMetadata
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	assert.True(t, decoded.Stateless)
+
+	// Verify omitempty: false value should not appear in JSON
+	falseOriginal := &RemoteServerMetadata{
+		BaseServerMetadata: BaseServerMetadata{
+			Name:      "test2",
+			Stateless: false,
+		},
+	}
+	falseData, err := json.Marshal(falseOriginal)
+	require.NoError(t, err)
+	assert.NotContains(t, string(falseData), "stateless")
+}
+
+func TestStateless_NilReceiver(t *testing.T) {
+	t.Parallel()
+
+	var b *BaseServerMetadata
+	assert.False(t, b.GetStateless(), "nil receiver should return false")
 }

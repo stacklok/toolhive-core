@@ -66,6 +66,8 @@ type BaseServerMetadata struct {
 	// For containers: stdio, sse, or streamable-http
 	// For remote servers: sse or streamable-http (stdio not supported)
 	Transport string `json:"transport" yaml:"transport"`
+	// Stateless indicates the server only supports POST (no SSE/GET)
+	Stateless bool `json:"stateless,omitempty" yaml:"stateless,omitempty"`
 	// Tools is a list of tool names provided by this MCP server
 	Tools []string `json:"tools" yaml:"tools"`
 	// Metadata contains additional information about the server such as popularity metrics
@@ -291,6 +293,8 @@ type ServerMetadata interface {
 	GetStatus() string
 	// GetTransport returns the server transport
 	GetTransport() string
+	// GetStateless returns whether the server is stateless (POST-only, no SSE/GET)
+	GetStateless() bool
 	// GetTools returns the list of tools provided by the server
 	GetTools() []string
 	// GetMetadata returns the server metadata
@@ -360,6 +364,14 @@ func (b *BaseServerMetadata) GetTransport() string {
 		return ""
 	}
 	return b.Transport
+}
+
+// GetStateless returns whether the server is stateless (POST-only, no SSE/GET)
+func (b *BaseServerMetadata) GetStateless() bool {
+	if b == nil {
+		return false
+	}
+	return b.Stateless
 }
 
 // GetTools returns the list of tools provided by the server
