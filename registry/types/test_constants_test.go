@@ -7,6 +7,7 @@ const (
 	testVersion       = "1.0.0"
 	testServerName    = "server-a"
 	testRemoteName    = "remote-a"
+	testStatusActive  = "active"
 	errKeyVersion     = "version"
 	errKeyLastUpdated = "last_updated"
 	errKeyDescription = "description"

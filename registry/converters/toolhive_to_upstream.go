@@ -224,6 +224,7 @@ func createImageExtensions(imageMetadata *registry.ImageMetadata) map[string]int
 		Provenance:      imageMetadata.Provenance,
 		DockerTags:      imageMetadata.DockerTags,
 		ProxyPort:       imageMetadata.ProxyPort,
+		Stateless:       imageMetadata.Stateless,
 	}
 	return buildPublisherExtensionsMap(ext, imageMetadata.Image)
 }
@@ -243,6 +244,7 @@ func createRemoteExtensions(remoteMetadata *registry.RemoteServerMetadata) map[s
 		OAuthConfig:     remoteMetadata.OAuthConfig,
 		EnvVars:         remoteMetadata.EnvVars,
 		ProxyPort:       remoteMetadata.ProxyPort,
+		Stateless:       remoteMetadata.Stateless,
 	}
 	return buildPublisherExtensionsMap(ext, remoteMetadata.URL)
 }

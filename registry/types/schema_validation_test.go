@@ -1085,7 +1085,7 @@ func TestServerExtensions_Validate(t *testing.T) {
 		},
 		{
 			name:        "invalid extensions - non-empty struct fails schema structure",
-			extensions:  &ServerExtensions{Status: "active", Tier: "Official"},
+			extensions:  &ServerExtensions{Status: testStatusActive, Tier: "Official"},
 			expectError: true,
 		},
 	}

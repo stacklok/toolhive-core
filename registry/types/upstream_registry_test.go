@@ -158,7 +158,7 @@ func TestUpstreamRegistry_WithSkills(t *testing.T) {
 					Name:        "pdf-processor",
 					Description: "Extract text and tables from PDF files",
 					Version:     testVersion,
-					Status:      "active",
+					Status:      testStatusActive,
 					Packages: []SkillPackage{
 						{
 							RegistryType: "oci",

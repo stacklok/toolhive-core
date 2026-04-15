@@ -18,10 +18,10 @@ import (
 //   - For remote servers: keyed by URL (e.g., "https://api.example.com/mcp")
 //
 // Container servers may use: Status, Tier, Tools, Tags, Metadata, CustomMetadata,
-// Permissions, Args, Provenance, DockerTags, ProxyPort, ToolDefinitions
+// Permissions, Args, Provenance, DockerTags, ProxyPort, Stateless, ToolDefinitions
 //
 // Remote servers may use: Status, Tier, Tools, Tags, Metadata, CustomMetadata,
-// OAuthConfig, EnvVars, ProxyPort, ToolDefinitions
+// OAuthConfig, EnvVars, ProxyPort, Stateless, ToolDefinitions
 type ServerExtensions struct {
 	// Status indicates whether the server is active or deprecated (required)
 	Status string `json:"status" yaml:"status"`
@@ -57,6 +57,9 @@ type ServerExtensions struct {
 	// ProxyPort is the HTTP proxy port (1-65535). Applies to both container-based
 	// and remote servers.
 	ProxyPort int `json:"proxy_port,omitempty" yaml:"proxy_port,omitempty"`
+	// Stateless indicates the server only supports POST (no SSE/GET).
+	// Applies to both container-based and remote servers.
+	Stateless bool `json:"stateless,omitempty" yaml:"stateless,omitempty"`
 
 	// Remote server-specific fields (only for servers keyed by URL)
 
