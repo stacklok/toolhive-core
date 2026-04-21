@@ -18,6 +18,30 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Produce bundled upstream-registry schema
+        # Ships a bundled variant alongside the raw schema. The bundled
+        # version replaces the remote $refs to the MCP server schema
+        # with inline placeholder objects, letting JSON Schema viewers
+        # render the file without runtime ref resolution. Raw schema
+        # remains the canonical source.
+        run: |
+          mkdir -p build
+          jq '
+            (.. | objects | select(.["$ref"] == "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json")) |=
+              {
+                type: "object",
+                description: "MCP server object — see MCP server schema: https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json"
+              }
+          ' registry/types/data/upstream-registry.schema.json \
+            > build/upstream-registry.bundled.schema.json
+
+          # Sanity check: the MCP server URL should no longer appear as
+          # a $ref anywhere in the bundled output (only in descriptions).
+          if jq -e '[.. | objects | .["$ref"]? | select(. != null and (contains("static.modelcontextprotocol.io")))] | length > 0' build/upstream-registry.bundled.schema.json > /dev/null; then
+            echo "::error::Bundling failed: MCP server \$refs were not rewritten. The MCP server URL may have changed; update the jq filter above."
+            exit 1
+          fi
+
       - name: Upload schema artifacts to release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -25,6 +49,7 @@ jobs:
           gh release upload "${{ github.ref_name }}" \
             registry/types/data/skill.schema.json \
             registry/types/data/upstream-registry.schema.json \
+            build/upstream-registry.bundled.schema.json \
             registry/types/data/publisher-provided.schema.json \
             registry/types/data/toolhive-legacy-registry.schema.json \
             --clobber
