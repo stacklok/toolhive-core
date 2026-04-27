@@ -227,7 +227,7 @@ func readSkillDirectory(dir string) (*skillDirContent, error) {
 	skillMD, err := os.ReadFile(skillMDPath) //#nosec G304 -- path constructed from user-provided skill directory
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("SKILL.md not found in skill directory")
+			return nil, fmt.Errorf("SKILL.md not found in skill directory: %w", ErrSkillMDMissing)
 		}
 		return nil, fmt.Errorf("reading SKILL.md: %w", err)
 	}
@@ -238,7 +238,7 @@ func readSkillDirectory(dir string) (*skillDirContent, error) {
 	}
 
 	if fm.Name == "" {
-		return nil, fmt.Errorf("skill name is required in SKILL.md frontmatter")
+		return nil, fmt.Errorf("skill name is required in SKILL.md frontmatter: %w", ErrInvalidFrontmatter)
 	}
 
 	files, err := collectSkillFiles(dir)
@@ -258,17 +258,17 @@ func validateSkillDir(dir string) error {
 	info, err := os.Stat(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("skill directory not found: %s", dir)
+			return fmt.Errorf("skill directory not found: %s: %w", dir, ErrInvalidSkillDir)
 		}
-		return fmt.Errorf("accessing skill directory: %w", err)
+		return fmt.Errorf("accessing skill directory: %w: %w", err, ErrInvalidSkillDir)
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("path is not a directory: %s", dir)
+		return fmt.Errorf("path is not a directory: %s: %w", dir, ErrInvalidSkillDir)
 	}
 
 	cleanDir := filepath.Clean(dir)
 	if strings.Contains(cleanDir, "..") {
-		return fmt.Errorf("invalid path: contains path traversal")
+		return fmt.Errorf("invalid path: contains path traversal: %w", ErrInvalidSkillDir)
 	}
 
 	return nil
@@ -305,7 +305,7 @@ func collectSkillFiles(dir string) (map[string][]byte, error) {
 
 		// Security: reject symlinked directories (WalkDir follows them silently)
 		if d.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("symlinks not allowed in skill directory: %s", relPath)
+			return fmt.Errorf("symlinks not allowed in skill directory: %s: %w", relPath, ErrInvalidSkillFile)
 		}
 
 		if d.IsDir() {
@@ -322,7 +322,7 @@ func collectSkillFiles(dir string) (map[string][]byte, error) {
 		}
 
 		if len(files) >= maxSkillFiles {
-			return fmt.Errorf("skill directory exceeds maximum of %d files", maxSkillFiles)
+			return fmt.Errorf("skill directory exceeds maximum of %d files: %w", maxSkillFiles, ErrTooManyFiles)
 		}
 
 		content, err := os.ReadFile(path) //#nosec G304,G122 -- path from WalkDir, symlink-checked
@@ -332,7 +332,7 @@ func collectSkillFiles(dir string) (map[string][]byte, error) {
 
 		totalSize += int64(len(content))
 		if totalSize > maxSkillTotalSize {
-			return fmt.Errorf("skill directory exceeds maximum total size of %d bytes", maxSkillTotalSize)
+			return fmt.Errorf("skill directory exceeds maximum total size of %d bytes: %w", maxSkillTotalSize, ErrSkillTooLarge)
 		}
 
 		files[relPath] = content
@@ -351,10 +351,10 @@ func validateSkillFile(absPath, relPath string) error {
 		return fmt.Errorf("checking file type for %s: %w", relPath, err)
 	}
 	if fileInfo.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("symlinks not allowed in skill directory: %s", relPath)
+		return fmt.Errorf("symlinks not allowed in skill directory: %s: %w", relPath, ErrInvalidSkillFile)
 	}
 	if !fileInfo.Mode().IsRegular() {
-		return fmt.Errorf("non-regular file not allowed in skill directory: %s", relPath)
+		return fmt.Errorf("non-regular file not allowed in skill directory: %s: %w", relPath, ErrInvalidSkillFile)
 	}
 	return nil
 }
@@ -365,7 +365,7 @@ func parseFrontmatter(content []byte) (*frontmatter, error) {
 
 	delimiter := []byte("---")
 	if !bytes.HasPrefix(content, delimiter) {
-		return nil, fmt.Errorf("SKILL.md must start with YAML frontmatter (---)")
+		return nil, fmt.Errorf("SKILL.md must start with YAML frontmatter (---): %w", ErrInvalidFrontmatter)
 	}
 
 	rest := content[len(delimiter):]
@@ -373,18 +373,18 @@ func parseFrontmatter(content []byte) (*frontmatter, error) {
 
 	endIdx := bytes.Index(rest, delimiter)
 	if endIdx == -1 {
-		return nil, fmt.Errorf("SKILL.md frontmatter missing closing delimiter (---)")
+		return nil, fmt.Errorf("SKILL.md frontmatter missing closing delimiter (---): %w", ErrInvalidFrontmatter)
 	}
 
 	fmBytes := rest[:endIdx]
 
 	if len(fmBytes) > maxFrontmatterSize {
-		return nil, fmt.Errorf("frontmatter exceeds maximum size of %d bytes", maxFrontmatterSize)
+		return nil, fmt.Errorf("frontmatter exceeds maximum size of %d bytes: %w", maxFrontmatterSize, ErrInvalidFrontmatter)
 	}
 
 	var fm frontmatter
 	if err := yaml.Unmarshal(fmBytes, &fm); err != nil {
-		return nil, fmt.Errorf("parsing frontmatter YAML: %w", err)
+		return nil, fmt.Errorf("parsing frontmatter YAML: %w: %w", err, ErrInvalidFrontmatter)
 	}
 
 	return &fm, nil
