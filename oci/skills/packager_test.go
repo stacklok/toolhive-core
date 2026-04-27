@@ -4,6 +4,7 @@
 package skills
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -331,14 +332,7 @@ func TestPackager_Package_RejectsSymlinks(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	skillMD := `---
-name: test-skill
-description: A test skill
-version: 1.0.0
----
-# Test Skill
-`
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillMD), 0600))
+	writeValidSkillMD(t, dir)
 	require.NoError(t, os.Symlink("/etc/passwd", filepath.Join(dir, "evil_link")))
 
 	store, err := NewStore(t.TempDir())
@@ -356,14 +350,7 @@ func TestPackager_Package_RejectsSymlinkedDirectory(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	skillMD := `---
-name: test-skill
-description: A test skill
-version: 1.0.0
----
-# Test Skill
-`
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillMD), 0600))
+	writeValidSkillMD(t, dir)
 	require.NoError(t, os.Symlink("/etc", filepath.Join(dir, "evil_dir")))
 
 	store, err := NewStore(t.TempDir())
@@ -571,6 +558,187 @@ version: 1.0.0
 	_, err := collectSkillFiles(dir)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exceeds maximum")
+	assert.ErrorIs(t, err, ErrTooManyFiles)
+}
+
+func TestPackager_Package_SentinelErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		setup   func(t *testing.T) string
+		wantErr error
+	}{
+		{
+			name: "missing skill directory",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				return filepath.Join(t.TempDir(), "does-not-exist")
+			},
+			wantErr: ErrInvalidSkillDir,
+		},
+		{
+			name: "path is file not directory",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				f := filepath.Join(t.TempDir(), "not-a-dir")
+				require.NoError(t, os.WriteFile(f, []byte("x"), 0600))
+				return f
+			},
+			wantErr: ErrInvalidSkillDir,
+		},
+		{
+			name: "path contains traversal",
+			setup: func(_ *testing.T) string {
+				return "../no-such-skill-dir"
+			},
+			wantErr: ErrInvalidSkillDir,
+		},
+		{
+			name: "missing SKILL.md",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				return t.TempDir()
+			},
+			wantErr: ErrSkillMDMissing,
+		},
+		{
+			name: "frontmatter missing opening delimiter",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				dir := t.TempDir()
+				require.NoError(t, os.WriteFile(
+					filepath.Join(dir, "SKILL.md"),
+					[]byte("# no frontmatter\n"),
+					0600,
+				))
+				return dir
+			},
+			wantErr: ErrInvalidFrontmatter,
+		},
+		{
+			name: "frontmatter missing closing delimiter",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				dir := t.TempDir()
+				require.NoError(t, os.WriteFile(
+					filepath.Join(dir, "SKILL.md"),
+					[]byte("---\nname: test\n# never closed"),
+					0600,
+				))
+				return dir
+			},
+			wantErr: ErrInvalidFrontmatter,
+		},
+		{
+			name: "frontmatter exceeds size limit",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				dir := t.TempDir()
+				var buf bytes.Buffer
+				buf.WriteString("---\nname: test\nfiller: ")
+				buf.Write(bytes.Repeat([]byte("a"), maxFrontmatterSize+1))
+				buf.WriteString("\n---\n# body\n")
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), buf.Bytes(), 0600))
+				return dir
+			},
+			wantErr: ErrInvalidFrontmatter,
+		},
+		{
+			name: "frontmatter invalid YAML",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				dir := t.TempDir()
+				require.NoError(t, os.WriteFile(
+					filepath.Join(dir, "SKILL.md"),
+					[]byte("---\nname: [unclosed\n---\n# body\n"),
+					0600,
+				))
+				return dir
+			},
+			wantErr: ErrInvalidFrontmatter,
+		},
+		{
+			name: "frontmatter missing name",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				dir := t.TempDir()
+				require.NoError(t, os.WriteFile(
+					filepath.Join(dir, "SKILL.md"),
+					[]byte("---\ndescription: nameless skill\n---\n# body\n"),
+					0600,
+				))
+				return dir
+			},
+			wantErr: ErrInvalidFrontmatter,
+		},
+		{
+			name: "symlinked file in skill directory",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				dir := t.TempDir()
+				writeValidSkillMD(t, dir)
+				require.NoError(t, os.Symlink("/etc/passwd", filepath.Join(dir, "evil_link")))
+				return dir
+			},
+			wantErr: ErrInvalidSkillFile,
+		},
+		{
+			name: "symlinked directory in skill directory",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				dir := t.TempDir()
+				writeValidSkillMD(t, dir)
+				require.NoError(t, os.Symlink("/etc", filepath.Join(dir, "evil_dir")))
+				return dir
+			},
+			wantErr: ErrInvalidSkillFile,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			store, err := NewStore(t.TempDir())
+			require.NoError(t, err)
+			packager := NewPackager(store)
+			opts := PackageOptions{Epoch: time.Unix(0, 0).UTC()}
+
+			_, err = packager.Package(context.Background(), tt.setup(t), opts)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, tt.wantErr)
+		})
+	}
+}
+
+// TestCollectSkillFiles_ExceedsMaxSize verifies that the total-size limit
+// surfaces ErrSkillTooLarge. Kept separate from the table-driven test because
+// it writes >100 MiB to disk.
+func TestCollectSkillFiles_ExceedsMaxSize(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeValidSkillMD(t, dir)
+
+	// Stream-write a single file just over maxSkillTotalSize using a 1 MiB
+	// buffer so we don't hold the whole payload in memory at once.
+	f, err := os.Create(filepath.Join(dir, "big.bin")) //#nosec G304 -- t.TempDir
+	require.NoError(t, err)
+	const chunkSize = 1 << 20 // 1 MiB
+	chunk := make([]byte, chunkSize)
+	written := int64(0)
+	for written <= maxSkillTotalSize {
+		n, werr := f.Write(chunk)
+		require.NoError(t, werr)
+		written += int64(n)
+	}
+	require.NoError(t, f.Close())
+
+	_, err = collectSkillFiles(dir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds maximum total size")
+	assert.ErrorIs(t, err, ErrSkillTooLarge)
 }
 
 // Helper functions
@@ -595,6 +763,19 @@ This is a test skill.
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillMD), 0600))
 
 	return dir
+}
+
+func writeValidSkillMD(t *testing.T, dir string) {
+	t.Helper()
+
+	skillMD := `---
+name: test-skill
+description: A test skill
+version: 1.0.0
+---
+# Test Skill
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillMD), 0600))
 }
 
 func createTestSkillDirWithScripts(t *testing.T) string {
