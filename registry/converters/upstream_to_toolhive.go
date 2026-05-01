@@ -281,6 +281,7 @@ func applyBaseExtensions(ext *registry.ServerExtensions, base *registry.BaseServ
 	base.ToolDefinitions = ext.ToolDefinitions
 	base.Metadata = ext.Metadata
 	base.CustomMetadata = ext.CustomMetadata
+	base.Stateless = ext.Stateless
 }
 
 // extractImageExtensions extracts publisher-provided extensions into ImageMetadata

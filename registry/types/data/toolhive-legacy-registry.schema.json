@@ -197,6 +197,11 @@
             "streamable-http"
           ],
           "default": "stdio"
+        },
+        "stateless": {
+          "type": "boolean",
+          "description": "Whether the server only supports POST requests (no SSE/GET). When true, the proxy returns 405 for GET and uses POST-based health checks.",
+          "default": false
         }
       }
     },
@@ -572,6 +577,11 @@
             "streamable-http"
           ],
           "default": "sse"
+        },
+        "stateless": {
+          "type": "boolean",
+          "description": "Whether the server only supports POST requests (no SSE/GET). When true, the proxy returns 405 for GET and uses POST-based health checks.",
+          "default": false
         },
         "tools": {
           "type": "array",
