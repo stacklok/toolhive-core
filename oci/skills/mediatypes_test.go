@@ -27,7 +27,7 @@ func TestSkillConfigFromImageConfig(t *testing.T) {
 			config: &ocispec.Image{
 				Config: ocispec.ImageConfig{
 					Labels: map[string]string{
-						LabelSkillName:         "my-skill",
+						LabelSkillName:         testSkillMySkill,
 						LabelSkillDescription:  "A test skill",
 						LabelSkillVersion:      "1.0.0",
 						LabelSkillLicense:      "Apache-2.0",
@@ -36,7 +36,7 @@ func TestSkillConfigFromImageConfig(t *testing.T) {
 					},
 				},
 			},
-			wantName:  "my-skill",
+			wantName:  testSkillMySkill,
 			wantTools: []string{"tool1", "tool2"},
 			wantFiles: []string{"file1.txt", "file2.txt"},
 		},
@@ -80,7 +80,7 @@ func TestSkillConfigFromImageConfig(t *testing.T) {
 				Config: ocispec.ImageConfig{
 					Labels: map[string]string{
 						LabelSkillName:         "bad-tools",
-						LabelSkillAllowedTools: "not-json",
+						LabelSkillAllowedTools: testNotJSON,
 					},
 				},
 			},
@@ -92,7 +92,7 @@ func TestSkillConfigFromImageConfig(t *testing.T) {
 				Config: ocispec.ImageConfig{
 					Labels: map[string]string{
 						LabelSkillName:  "bad-files",
-						LabelSkillFiles: "not-json",
+						LabelSkillFiles: testNotJSON,
 					},
 				},
 			},
@@ -131,19 +131,19 @@ func TestParsePlatform(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name:  "linux/amd64",
-			input: "linux/amd64",
-			want:  ocispec.Platform{OS: "linux", Architecture: "amd64"},
+			name:  testPlatformAMD64,
+			input: testPlatformAMD64,
+			want:  ocispec.Platform{OS: OSLinux, Architecture: ArchAMD64},
 		},
 		{
 			name:  "linux/arm64",
 			input: "linux/arm64",
-			want:  ocispec.Platform{OS: "linux", Architecture: "arm64"},
+			want:  ocispec.Platform{OS: OSLinux, Architecture: ArchARM64},
 		},
 		{
-			name:  "linux/arm/v7",
-			input: "linux/arm/v7",
-			want:  ocispec.Platform{OS: "linux", Architecture: "arm", Variant: "v7"},
+			name:  testPlatformARMv7,
+			input: testPlatformARMv7,
+			want:  ocispec.Platform{OS: OSLinux, Architecture: testArchARM, Variant: "v7"},
 		},
 		{
 			name:    "no slash",
@@ -197,13 +197,13 @@ func TestPlatformString(t *testing.T) {
 	}{
 		{
 			name:     "os/arch",
-			platform: ocispec.Platform{OS: "linux", Architecture: "amd64"},
-			want:     "linux/amd64",
+			platform: ocispec.Platform{OS: OSLinux, Architecture: ArchAMD64},
+			want:     testPlatformAMD64,
 		},
 		{
 			name:     "os/arch/variant",
-			platform: ocispec.Platform{OS: "linux", Architecture: "arm", Variant: "v7"},
-			want:     "linux/arm/v7",
+			platform: ocispec.Platform{OS: OSLinux, Architecture: testArchARM, Variant: "v7"},
+			want:     testPlatformARMv7,
 		},
 	}
 
@@ -219,9 +219,9 @@ func TestParsePlatform_PlatformString_Roundtrip(t *testing.T) {
 	t.Parallel()
 
 	platforms := []ocispec.Platform{
-		{OS: "linux", Architecture: "amd64"},
-		{OS: "linux", Architecture: "arm64"},
-		{OS: "linux", Architecture: "arm", Variant: "v7"},
+		{OS: OSLinux, Architecture: ArchAMD64},
+		{OS: OSLinux, Architecture: ArchARM64},
+		{OS: OSLinux, Architecture: testArchARM, Variant: "v7"},
 	}
 
 	for _, p := range platforms {
@@ -261,7 +261,7 @@ func TestParseRequiresAnnotation(t *testing.T) {
 		{
 			name: "invalid JSON",
 			annotations: map[string]string{
-				AnnotationSkillRequires: "not-json",
+				AnnotationSkillRequires: testNotJSON,
 			},
 			want: nil,
 		},
@@ -286,6 +286,6 @@ func TestDefaultPlatforms(t *testing.T) {
 	t.Parallel()
 
 	require.Len(t, DefaultPlatforms, 2)
-	assert.Equal(t, ocispec.Platform{OS: "linux", Architecture: "amd64"}, DefaultPlatforms[0])
-	assert.Equal(t, ocispec.Platform{OS: "linux", Architecture: "arm64"}, DefaultPlatforms[1])
+	assert.Equal(t, ocispec.Platform{OS: OSLinux, Architecture: ArchAMD64}, DefaultPlatforms[0])
+	assert.Equal(t, ocispec.Platform{OS: OSLinux, Architecture: ArchARM64}, DefaultPlatforms[1])
 }

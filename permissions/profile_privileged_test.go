@@ -22,7 +22,7 @@ func TestProfile_Privileged(t *testing.T) {
 		{
 			name: "Default profile should not be privileged",
 			profile: &Profile{
-				Name:       "test",
+				Name:       testProfileName,
 				Privileged: false,
 			},
 			expected: false,
@@ -30,7 +30,7 @@ func TestProfile_Privileged(t *testing.T) {
 		{
 			name: "Privileged profile should be privileged",
 			profile: &Profile{
-				Name:       "test",
+				Name:       testProfileName,
 				Privileged: true,
 			},
 			expected: true,
@@ -71,7 +71,7 @@ func TestProfile_PrivilegedJSONSerialization(t *testing.T) {
 		{
 			name: "Non-privileged profile JSON",
 			profile: &Profile{
-				Name:       "test",
+				Name:       testProfileName,
 				Privileged: false,
 			},
 			expected: `{"name":"test"}`, // privileged: false should be omitted due to omitempty
@@ -79,7 +79,7 @@ func TestProfile_PrivilegedJSONSerialization(t *testing.T) {
 		{
 			name: "Privileged profile JSON",
 			profile: &Profile{
-				Name:       "test",
+				Name:       testProfileName,
 				Privileged: true,
 			},
 			expected: `{"name":"test","privileged":true}`,

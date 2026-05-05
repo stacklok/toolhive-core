@@ -25,15 +25,15 @@ func createTestServerJSON() *upstream.ServerJSON {
 		Name:        "io.github.stacklok/test-server",
 		Title:       "Test Server",
 		Description: "Test MCP server",
-		Version:     "1.0.0",
+		Version:     testVersion,
 		Repository: &model.Repository{
 			URL:    "https://github.com/test/repo",
-			Source: "github",
+			Source: repoSourceGitHub,
 		},
 		Packages: []model.Package{
 			{
 				RegistryType: model.RegistryTypeOCI,
-				Identifier:   "ghcr.io/test/server:latest",
+				Identifier:   testImageRef,
 				Transport: model.Transport{
 					Type: model.TransportTypeStdio,
 				},
@@ -41,16 +41,16 @@ func createTestServerJSON() *upstream.ServerJSON {
 		},
 		Meta: &upstream.ServerMeta{
 			PublisherProvided: map[string]interface{}{
-				"io.github.stacklok": map[string]interface{}{
-					"ghcr.io/test/server:latest": map[string]interface{}{
-						"status":   "active",
-						"tier":     "Official",
-						"tools":    []interface{}{"tool1", "tool2"},
-						"tags":     []interface{}{"test", "example"},
+				testNamespace: map[string]interface{}{
+					testImageRef: map[string]interface{}{
+						statusKey:  defaultStatus,
+						tierKey:    testTier,
+						toolsKey:   []interface{}{testToolName, testToolNameAlt},
+						"tags":     []interface{}{testName, testCategory},
 						"overview": "# Test Server\n\nA test MCP server.",
 						"tool_definitions": []interface{}{
 							map[string]interface{}{
-								"name":        "tool1",
+								"name":        testToolName,
 								"description": "First tool",
 							},
 						},
@@ -73,20 +73,20 @@ func createTestImageMetadata() *registry.ImageMetadata {
 			Description:   "Test MCP server",
 			Transport:     model.TransportTypeStdio,
 			RepositoryURL: "https://github.com/test/repo",
-			Status:        "active",
-			Tier:          "Official",
-			Tools:         []string{"tool1", "tool2"},
-			Tags:          []string{"test", "example"},
+			Status:        defaultStatus,
+			Tier:          testTier,
+			Tools:         []string{testToolName, testToolNameAlt},
+			Tags:          []string{testName, testCategory},
 			Overview:      "# Test Server\n\nA test MCP server.",
 			ToolDefinitions: []mcp.Tool{
-				{Name: "tool1", Description: "First tool"},
+				{Name: testToolName, Description: "First tool"},
 			},
 			Metadata: &registry.Metadata{
 				Stars:       100,
 				LastUpdated: "2025-01-01",
 			},
 		},
-		Image: "ghcr.io/test/server:latest",
+		Image: testImageRef,
 	}
 }
 
@@ -96,18 +96,18 @@ func createTestRemoteServerMetadata() *registry.RemoteServerMetadata {
 		BaseServerMetadata: registry.BaseServerMetadata{
 			Title:         "Test Remote",
 			Description:   "Test remote server",
-			Transport:     "sse",
+			Transport:     testTransportSSE,
 			RepositoryURL: "https://github.com/test/remote",
-			Status:        "active",
-			Tier:          "Official",
-			Tools:         []string{"tool1"},
+			Status:        defaultStatus,
+			Tier:          testTier,
+			Tools:         []string{testToolName},
 			Tags:          []string{"remote"},
 			Overview:      "# Test Remote\n\nA test remote server.",
 			ToolDefinitions: []mcp.Tool{
-				{Name: "tool1", Description: "Remote tool"},
+				{Name: testToolName, Description: "Remote tool"},
 			},
 		},
-		URL: "https://api.example.com/mcp",
+		URL: testRemoteURL,
 	}
 }
 
@@ -122,18 +122,18 @@ func TestServerJSONToImageMetadata_Success(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, imageMetadata)
 
-	assert.Equal(t, "ghcr.io/test/server:latest", imageMetadata.Image)
+	assert.Equal(t, testImageRef, imageMetadata.Image)
 	assert.Equal(t, "Test Server", imageMetadata.Title)
 	assert.Equal(t, "Test MCP server", imageMetadata.Description)
 	assert.Equal(t, model.TransportTypeStdio, imageMetadata.Transport)
 	assert.Equal(t, "https://github.com/test/repo", imageMetadata.RepositoryURL)
-	assert.Equal(t, "active", imageMetadata.Status)
-	assert.Equal(t, "Official", imageMetadata.Tier)
-	assert.Equal(t, []string{"tool1", "tool2"}, imageMetadata.Tools)
-	assert.Equal(t, []string{"test", "example"}, imageMetadata.Tags)
+	assert.Equal(t, defaultStatus, imageMetadata.Status)
+	assert.Equal(t, testTier, imageMetadata.Tier)
+	assert.Equal(t, []string{testToolName, testToolNameAlt}, imageMetadata.Tools)
+	assert.Equal(t, []string{testName, testCategory}, imageMetadata.Tags)
 	assert.Equal(t, "# Test Server\n\nA test MCP server.", imageMetadata.Overview)
 	require.Len(t, imageMetadata.ToolDefinitions, 1)
-	assert.Equal(t, "tool1", imageMetadata.ToolDefinitions[0].Name)
+	assert.Equal(t, testToolName, imageMetadata.ToolDefinitions[0].Name)
 	assert.NotNil(t, imageMetadata.Metadata)
 	assert.Equal(t, 100, imageMetadata.Metadata.Stars)
 	assert.Equal(t, "2025-01-01", imageMetadata.Metadata.LastUpdated)
@@ -153,7 +153,7 @@ func TestServerJSONToImageMetadata_NoPackages(t *testing.T) {
 	t.Parallel()
 
 	serverJSON := &upstream.ServerJSON{
-		Name:     "test",
+		Name:     testName,
 		Packages: []model.Package{},
 	}
 
@@ -168,7 +168,7 @@ func TestServerJSONToImageMetadata_NoOCIPackages(t *testing.T) {
 	t.Parallel()
 
 	serverJSON := &upstream.ServerJSON{
-		Name: "test",
+		Name: testName,
 		Packages: []model.Package{
 			{
 				RegistryType: "npm",
@@ -188,7 +188,7 @@ func TestServerJSONToImageMetadata_MultipleOCIPackages(t *testing.T) {
 	t.Parallel()
 
 	serverJSON := &upstream.ServerJSON{
-		Name: "test",
+		Name: testName,
 		Packages: []model.Package{
 			{
 				RegistryType: model.RegistryTypeOCI,
@@ -214,18 +214,18 @@ func TestServerJSONToImageMetadata_WithEnvVars(t *testing.T) {
 	serverJSON := createTestServerJSON()
 	serverJSON.Packages[0].EnvironmentVariables = []model.KeyValueInput{
 		{
-			Name: "API_KEY",
+			Name: envAPIKey,
 			InputWithVariables: model.InputWithVariables{
 				Input: model.Input{
 					Description: "API Key",
 					IsRequired:  true,
 					IsSecret:    true,
-					Default:     "default-key",
+					Default:     envValueDefault,
 				},
 			},
 		},
 		{
-			Name: "DEBUG",
+			Name: envDebug,
 			InputWithVariables: model.InputWithVariables{
 				Input: model.Input{
 					Description: "Debug mode",
@@ -243,13 +243,13 @@ func TestServerJSONToImageMetadata_WithEnvVars(t *testing.T) {
 	require.NotNil(t, imageMetadata)
 	require.Len(t, imageMetadata.EnvVars, 2)
 
-	assert.Equal(t, "API_KEY", imageMetadata.EnvVars[0].Name)
+	assert.Equal(t, envAPIKey, imageMetadata.EnvVars[0].Name)
 	assert.Equal(t, "API Key", imageMetadata.EnvVars[0].Description)
 	assert.True(t, imageMetadata.EnvVars[0].Required)
 	assert.True(t, imageMetadata.EnvVars[0].Secret)
-	assert.Equal(t, "default-key", imageMetadata.EnvVars[0].Default)
+	assert.Equal(t, envValueDefault, imageMetadata.EnvVars[0].Default)
 
-	assert.Equal(t, "DEBUG", imageMetadata.EnvVars[1].Name)
+	assert.Equal(t, envDebug, imageMetadata.EnvVars[1].Name)
 	assert.Equal(t, "Debug mode", imageMetadata.EnvVars[1].Description)
 	assert.False(t, imageMetadata.EnvVars[1].Required)
 	assert.False(t, imageMetadata.EnvVars[1].Secret)
@@ -320,11 +320,11 @@ func TestImageMetadataToServerJSON_Success(t *testing.T) {
 	assert.Equal(t, "io.github.stacklok/test-server", serverJSON.Name)
 	assert.Equal(t, "Test Server", serverJSON.Title)
 	assert.Equal(t, "Test MCP server", serverJSON.Description)
-	assert.Equal(t, "1.0.0", serverJSON.Version)
+	assert.Equal(t, testVersion, serverJSON.Version)
 	assert.Equal(t, "https://github.com/test/repo", serverJSON.Repository.URL)
 	assert.Len(t, serverJSON.Packages, 1)
 	assert.Equal(t, model.RegistryTypeOCI, serverJSON.Packages[0].RegistryType)
-	assert.Equal(t, "ghcr.io/test/server:latest", serverJSON.Packages[0].Identifier)
+	assert.Equal(t, testImageRef, serverJSON.Packages[0].Identifier)
 	assert.NotNil(t, serverJSON.Meta)
 	assert.NotNil(t, serverJSON.Meta.PublisherProvided)
 }
@@ -332,7 +332,7 @@ func TestImageMetadataToServerJSON_Success(t *testing.T) {
 func TestImageMetadataToServerJSON_NilInput(t *testing.T) {
 	t.Parallel()
 
-	serverJSON, err := ImageMetadataToServerJSON("test", nil)
+	serverJSON, err := ImageMetadataToServerJSON(testName, nil)
 
 	assert.Error(t, err)
 	assert.Nil(t, serverJSON)
@@ -356,7 +356,7 @@ func TestImageMetadataToServerJSON_WithEnvVars(t *testing.T) {
 	imageMetadata := createTestImageMetadata()
 	imageMetadata.EnvVars = []*registry.EnvVar{
 		{
-			Name:        "API_KEY",
+			Name:        envAPIKey,
 			Description: "API Key",
 			Required:    true,
 			Secret:      true,
@@ -364,7 +364,7 @@ func TestImageMetadataToServerJSON_WithEnvVars(t *testing.T) {
 		},
 	}
 
-	serverJSON, err := ImageMetadataToServerJSON("test", imageMetadata)
+	serverJSON, err := ImageMetadataToServerJSON(testName, imageMetadata)
 
 	require.NoError(t, err)
 	require.NotNil(t, serverJSON)
@@ -372,7 +372,7 @@ func TestImageMetadataToServerJSON_WithEnvVars(t *testing.T) {
 	require.Len(t, serverJSON.Packages[0].EnvironmentVariables, 1)
 
 	envVar := serverJSON.Packages[0].EnvironmentVariables[0]
-	assert.Equal(t, "API_KEY", envVar.Name)
+	assert.Equal(t, envAPIKey, envVar.Name)
 	assert.Equal(t, "API Key", envVar.Description)
 	assert.True(t, envVar.IsRequired)
 	assert.True(t, envVar.IsSecret)
@@ -386,7 +386,7 @@ func TestImageMetadataToServerJSON_WithTargetPort(t *testing.T) {
 	imageMetadata.Transport = model.TransportTypeStreamableHTTP
 	imageMetadata.TargetPort = 9090
 
-	serverJSON, err := ImageMetadataToServerJSON("test", imageMetadata)
+	serverJSON, err := ImageMetadataToServerJSON(testName, imageMetadata)
 
 	require.NoError(t, err)
 	require.NotNil(t, serverJSON)
@@ -403,7 +403,7 @@ func TestImageMetadataToServerJSON_HTTPTransportNoPort(t *testing.T) {
 	imageMetadata.Transport = model.TransportTypeStreamableHTTP
 	imageMetadata.TargetPort = 0 // No port specified
 
-	serverJSON, err := ImageMetadataToServerJSON("test", imageMetadata)
+	serverJSON, err := ImageMetadataToServerJSON(testName, imageMetadata)
 
 	require.NoError(t, err)
 	require.NotNil(t, serverJSON)
@@ -419,7 +419,7 @@ func TestImageMetadataToServerJSON_StdioTransport(t *testing.T) {
 	imageMetadata := createTestImageMetadata()
 	imageMetadata.Transport = model.TransportTypeStdio
 
-	serverJSON, err := ImageMetadataToServerJSON("test", imageMetadata)
+	serverJSON, err := ImageMetadataToServerJSON(testName, imageMetadata)
 
 	require.NoError(t, err)
 	require.NotNil(t, serverJSON)
@@ -435,7 +435,7 @@ func TestImageMetadataToServerJSON_EmptyTransportDefaultsToStdio(t *testing.T) {
 	imageMetadata := createTestImageMetadata()
 	imageMetadata.Transport = ""
 
-	serverJSON, err := ImageMetadataToServerJSON("test", imageMetadata)
+	serverJSON, err := ImageMetadataToServerJSON(testName, imageMetadata)
 
 	require.NoError(t, err)
 	require.NotNil(t, serverJSON)
@@ -448,21 +448,21 @@ func TestImageMetadataToServerJSON_WithPublisherExtensions(t *testing.T) {
 	t.Parallel()
 
 	imageMetadata := createTestImageMetadata()
-	serverJSON, err := ImageMetadataToServerJSON("test", imageMetadata)
+	serverJSON, err := ImageMetadataToServerJSON(testName, imageMetadata)
 
 	require.NoError(t, err)
 	require.NotNil(t, serverJSON)
 	require.NotNil(t, serverJSON.Meta)
 	require.NotNil(t, serverJSON.Meta.PublisherProvided)
 
-	stacklokData, ok := serverJSON.Meta.PublisherProvided["io.github.stacklok"].(map[string]interface{})
+	stacklokData, ok := serverJSON.Meta.PublisherProvided[testNamespace].(map[string]interface{})
 	require.True(t, ok)
 
-	imageData, ok := stacklokData["ghcr.io/test/server:latest"].(map[string]interface{})
+	imageData, ok := stacklokData[testImageRef].(map[string]interface{})
 	require.True(t, ok)
 
-	assert.Equal(t, "active", imageData["status"])
-	assert.Equal(t, "Official", imageData["tier"])
+	assert.Equal(t, defaultStatus, imageData[statusKey])
+	assert.Equal(t, testTier, imageData[tierKey])
 }
 
 func TestImageMetadataToServerJSON_EmptyStatusDefaultsToActive(t *testing.T) {
@@ -471,18 +471,18 @@ func TestImageMetadataToServerJSON_EmptyStatusDefaultsToActive(t *testing.T) {
 	imageMetadata := createTestImageMetadata()
 	imageMetadata.Status = "" // Empty status should default to "active"
 
-	serverJSON, err := ImageMetadataToServerJSON("test", imageMetadata)
+	serverJSON, err := ImageMetadataToServerJSON(testName, imageMetadata)
 
 	require.NoError(t, err)
 	require.NotNil(t, serverJSON)
 
-	stacklokData, ok := serverJSON.Meta.PublisherProvided["io.github.stacklok"].(map[string]interface{})
+	stacklokData, ok := serverJSON.Meta.PublisherProvided[testNamespace].(map[string]interface{})
 	require.True(t, ok)
 
-	imageData, ok := stacklokData["ghcr.io/test/server:latest"].(map[string]interface{})
+	imageData, ok := stacklokData[testImageRef].(map[string]interface{})
 	require.True(t, ok)
 
-	assert.Equal(t, "active", imageData["status"])
+	assert.Equal(t, defaultStatus, imageData[statusKey])
 }
 
 func TestRemoteServerMetadataToServerJSON_EmptyStatusDefaultsToActive(t *testing.T) {
@@ -496,24 +496,24 @@ func TestRemoteServerMetadataToServerJSON_EmptyStatusDefaultsToActive(t *testing
 	require.NoError(t, err)
 	require.NotNil(t, serverJSON)
 
-	stacklokData, ok := serverJSON.Meta.PublisherProvided["io.github.stacklok"].(map[string]interface{})
+	stacklokData, ok := serverJSON.Meta.PublisherProvided[testNamespace].(map[string]interface{})
 	require.True(t, ok)
 
-	remoteData, ok := stacklokData["https://api.example.com/mcp"].(map[string]interface{})
+	remoteData, ok := stacklokData[testRemoteURL].(map[string]interface{})
 	require.True(t, ok)
 
-	assert.Equal(t, "active", remoteData["status"])
+	assert.Equal(t, defaultStatus, remoteData[statusKey])
 }
 
 func TestImageMetadataToServerJSON_ReverseDNSName(t *testing.T) {
 	t.Parallel()
 
 	imageMetadata := createTestImageMetadata()
-	serverJSON, err := ImageMetadataToServerJSON("fetch", imageMetadata)
+	serverJSON, err := ImageMetadataToServerJSON(testServerNameFetch, imageMetadata)
 
 	require.NoError(t, err)
 	require.NotNil(t, serverJSON)
-	assert.Equal(t, "io.github.stacklok/fetch", serverJSON.Name)
+	assert.Equal(t, testServerNameFetchFQ, serverJSON.Name)
 }
 
 // Test Suite 3: ServerJSONToRemoteServerMetadata
@@ -522,7 +522,7 @@ func TestServerJSONToRemoteServerMetadata_Success(t *testing.T) {
 	t.Parallel()
 
 	serverJSON := &upstream.ServerJSON{
-		Name:        "io.github.stacklok/test-remote",
+		Name:        testNamespace + "/test-remote",
 		Title:       "Test Remote",
 		Description: "Test remote server",
 		Repository: &model.Repository{
@@ -530,21 +530,21 @@ func TestServerJSONToRemoteServerMetadata_Success(t *testing.T) {
 		},
 		Remotes: []model.Transport{
 			{
-				Type: "sse",
-				URL:  "https://api.example.com/mcp",
+				Type: testTransportSSE,
+				URL:  testRemoteURL,
 			},
 		},
 		Meta: &upstream.ServerMeta{
 			PublisherProvided: map[string]interface{}{
-				"io.github.stacklok": map[string]interface{}{
-					"https://api.example.com/mcp": map[string]interface{}{
-						"status":   "active",
-						"tier":     "Official",
-						"tools":    []interface{}{"tool1"},
+				testNamespace: map[string]interface{}{
+					testRemoteURL: map[string]interface{}{
+						statusKey:  defaultStatus,
+						tierKey:    testTier,
+						toolsKey:   []interface{}{testToolName},
 						"overview": "# Test Remote\n\nA test remote server.",
 						"tool_definitions": []interface{}{
 							map[string]interface{}{
-								"name":        "tool1",
+								"name":        testToolName,
 								"description": "Remote tool",
 							},
 						},
@@ -559,17 +559,17 @@ func TestServerJSONToRemoteServerMetadata_Success(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, remoteMetadata)
 
-	assert.Equal(t, "https://api.example.com/mcp", remoteMetadata.URL)
+	assert.Equal(t, testRemoteURL, remoteMetadata.URL)
 	assert.Equal(t, "Test Remote", remoteMetadata.Title)
 	assert.Equal(t, "Test remote server", remoteMetadata.Description)
-	assert.Equal(t, "sse", remoteMetadata.Transport)
+	assert.Equal(t, testTransportSSE, remoteMetadata.Transport)
 	assert.Equal(t, "https://github.com/test/remote", remoteMetadata.RepositoryURL)
-	assert.Equal(t, "active", remoteMetadata.Status)
-	assert.Equal(t, "Official", remoteMetadata.Tier)
-	assert.Equal(t, []string{"tool1"}, remoteMetadata.Tools)
+	assert.Equal(t, defaultStatus, remoteMetadata.Status)
+	assert.Equal(t, testTier, remoteMetadata.Tier)
+	assert.Equal(t, []string{testToolName}, remoteMetadata.Tools)
 	assert.Equal(t, "# Test Remote\n\nA test remote server.", remoteMetadata.Overview)
 	require.Len(t, remoteMetadata.ToolDefinitions, 1)
-	assert.Equal(t, "tool1", remoteMetadata.ToolDefinitions[0].Name)
+	assert.Equal(t, testToolName, remoteMetadata.ToolDefinitions[0].Name)
 }
 
 func TestServerJSONToRemoteServerMetadata_NilInput(t *testing.T) {
@@ -586,7 +586,7 @@ func TestServerJSONToRemoteServerMetadata_NoRemotes(t *testing.T) {
 	t.Parallel()
 
 	serverJSON := &upstream.ServerJSON{
-		Name:    "test",
+		Name:    testName,
 		Remotes: []model.Transport{},
 	}
 
@@ -601,18 +601,18 @@ func TestServerJSONToRemoteServerMetadata_WithHeaders(t *testing.T) {
 	t.Parallel()
 
 	serverJSON := &upstream.ServerJSON{
-		Name:        "test",
+		Name:        testName,
 		Description: "Test",
 		Remotes: []model.Transport{
 			{
-				Type: "sse",
+				Type: testTransportSSE,
 				URL:  "https://api.example.com",
 				Headers: []model.KeyValueInput{
 					{
 						Name: "Authorization",
 						InputWithVariables: model.InputWithVariables{
 							Input: model.Input{
-								Description: "Auth token",
+								Description: envDescAuthToken,
 								IsRequired:  true,
 								IsSecret:    true,
 							},
@@ -630,7 +630,7 @@ func TestServerJSONToRemoteServerMetadata_WithHeaders(t *testing.T) {
 	require.Len(t, remoteMetadata.Headers, 1)
 
 	assert.Equal(t, "Authorization", remoteMetadata.Headers[0].Name)
-	assert.Equal(t, "Auth token", remoteMetadata.Headers[0].Description)
+	assert.Equal(t, envDescAuthToken, remoteMetadata.Headers[0].Description)
 	assert.True(t, remoteMetadata.Headers[0].Required)
 	assert.True(t, remoteMetadata.Headers[0].Secret)
 }
@@ -639,11 +639,11 @@ func TestServerJSONToRemoteServerMetadata_MissingPublisherExtensions(t *testing.
 	t.Parallel()
 
 	serverJSON := &upstream.ServerJSON{
-		Name:        "test",
+		Name:        testName,
 		Description: "Test",
 		Remotes: []model.Transport{
 			{
-				Type: "sse",
+				Type: testTransportSSE,
 				URL:  "https://api.example.com",
 			},
 		},
@@ -675,14 +675,14 @@ func TestRemoteServerMetadataToServerJSON_Success(t *testing.T) {
 	assert.Equal(t, "Test remote server", serverJSON.Description)
 	assert.Equal(t, "https://github.com/test/remote", serverJSON.Repository.URL)
 	assert.Len(t, serverJSON.Remotes, 1)
-	assert.Equal(t, "sse", serverJSON.Remotes[0].Type)
-	assert.Equal(t, "https://api.example.com/mcp", serverJSON.Remotes[0].URL)
+	assert.Equal(t, testTransportSSE, serverJSON.Remotes[0].Type)
+	assert.Equal(t, testRemoteURL, serverJSON.Remotes[0].URL)
 }
 
 func TestRemoteServerMetadataToServerJSON_NilInput(t *testing.T) {
 	t.Parallel()
 
-	serverJSON, err := RemoteServerMetadataToServerJSON("test", nil)
+	serverJSON, err := RemoteServerMetadataToServerJSON(testName, nil)
 
 	assert.Error(t, err)
 	assert.Nil(t, serverJSON)
@@ -713,7 +713,7 @@ func TestRemoteServerMetadataToServerJSON_WithHeaders(t *testing.T) {
 		},
 	}
 
-	serverJSON, err := RemoteServerMetadataToServerJSON("test", remoteMetadata)
+	serverJSON, err := RemoteServerMetadataToServerJSON(testName, remoteMetadata)
 
 	require.NoError(t, err)
 	require.NotNil(t, serverJSON)
@@ -731,21 +731,21 @@ func TestRemoteServerMetadataToServerJSON_WithPublisherExtensions(t *testing.T) 
 	t.Parallel()
 
 	remoteMetadata := createTestRemoteServerMetadata()
-	serverJSON, err := RemoteServerMetadataToServerJSON("test", remoteMetadata)
+	serverJSON, err := RemoteServerMetadataToServerJSON(testName, remoteMetadata)
 
 	require.NoError(t, err)
 	require.NotNil(t, serverJSON)
 	require.NotNil(t, serverJSON.Meta)
 	require.NotNil(t, serverJSON.Meta.PublisherProvided)
 
-	stacklokData, ok := serverJSON.Meta.PublisherProvided["io.github.stacklok"].(map[string]interface{})
+	stacklokData, ok := serverJSON.Meta.PublisherProvided[testNamespace].(map[string]interface{})
 	require.True(t, ok)
 
-	remoteData, ok := stacklokData["https://api.example.com/mcp"].(map[string]interface{})
+	remoteData, ok := stacklokData[testRemoteURL].(map[string]interface{})
 	require.True(t, ok)
 
-	assert.Equal(t, "active", remoteData["status"])
-	assert.Equal(t, "Official", remoteData["tier"])
+	assert.Equal(t, defaultStatus, remoteData[statusKey])
+	assert.Equal(t, testTier, remoteData[tierKey])
 }
 
 // Test Suite 5: Utility Functions
@@ -760,18 +760,18 @@ func TestExtractServerName(t *testing.T) {
 	}{
 		{
 			name:     "reverse DNS format",
-			input:    "io.github.stacklok/fetch",
-			expected: "fetch",
+			input:    testServerNameFetchFQ,
+			expected: testServerNameFetch,
 		},
 		{
 			name:     "no slash",
-			input:    "fetch",
-			expected: "fetch",
+			input:    testServerNameFetch,
+			expected: testServerNameFetch,
 		},
 		{
 			name:     "returns original if multiple slashes",
-			input:    "io.github.stacklok/mcp/server",
-			expected: "io.github.stacklok/mcp/server", // Function only splits on first slash, returns original if not exactly 2 parts
+			input:    testNamespace + "/mcp/server",
+			expected: testNamespace + "/mcp/server", // Function only splits on first slash, returns original if not exactly 2 parts
 		},
 	}
 
@@ -794,13 +794,13 @@ func TestBuildReverseDNSName(t *testing.T) {
 	}{
 		{
 			name:     "simple name",
-			input:    "fetch",
-			expected: "io.github.stacklok/fetch",
+			input:    testServerNameFetch,
+			expected: testServerNameFetchFQ,
 		},
 		{
 			name:     "already formatted",
-			input:    "io.github.stacklok/fetch",
-			expected: "io.github.stacklok/fetch",
+			input:    testServerNameFetchFQ,
+			expected: testServerNameFetchFQ,
 		},
 		{
 			name:     "other namespace",
@@ -891,9 +891,9 @@ func TestRoundTrip_ImageMetadataWithAllFields(t *testing.T) {
 			Description:   "Full featured server",
 			Transport:     model.TransportTypeStreamableHTTP,
 			RepositoryURL: "https://github.com/test/full",
-			Status:        "active",
-			Tier:          "Official",
-			Tools:         []string{"tool1", "tool2", "tool3"},
+			Status:        defaultStatus,
+			Tier:          testTier,
+			Tools:         []string{testToolName, testToolNameAlt, "tool3"},
 			Tags:          []string{"tag1", "tag2"},
 			Metadata: &registry.Metadata{
 				Stars:       500,
@@ -904,7 +904,7 @@ func TestRoundTrip_ImageMetadataWithAllFields(t *testing.T) {
 		TargetPort: 8080,
 		EnvVars: []*registry.EnvVar{
 			{
-				Name:        "API_KEY",
+				Name:        envAPIKey,
 				Description: "API Key for authentication",
 				Required:    true,
 				Secret:      true,
@@ -990,11 +990,11 @@ func TestRealWorld_GitHubServer(t *testing.T) {
 		},
 		Meta: &upstream.ServerMeta{
 			PublisherProvided: map[string]interface{}{
-				"io.github.stacklok": map[string]interface{}{
+				testNamespace: map[string]interface{}{
 					"ghcr.io/github/github-mcp-server:0.19.1": map[string]interface{}{
-						"status": "active",
-						"tier":   "Official",
-						"tools": []interface{}{
+						statusKey: defaultStatus,
+						tierKey:   testTier,
+						toolsKey: []interface{}{
 							"add_comment_to_pending_review", "add_issue_comment", "add_sub_issue",
 							"assign_copilot_to_issue", "create_branch", "create_issue",
 							"create_or_update_file", "create_pull_request", "create_repository",
@@ -1043,8 +1043,8 @@ func TestRealWorld_GitHubServer(t *testing.T) {
 	assert.True(t, imageMetadata.EnvVars[0].Secret)
 
 	// Verify publisher extensions were extracted
-	assert.Equal(t, "active", imageMetadata.Status)
-	assert.Equal(t, "Official", imageMetadata.Tier)
+	assert.Equal(t, defaultStatus, imageMetadata.Status)
+	assert.Equal(t, testTier, imageMetadata.Tier)
 	require.Len(t, imageMetadata.Tools, 46, "Should have 46 tools")
 	assert.Contains(t, imageMetadata.Tools, "create_pull_request")
 	assert.Contains(t, imageMetadata.Tools, "search_repositories")
@@ -1076,17 +1076,17 @@ func TestRealWorld_GitHubServer(t *testing.T) {
 	// Verify publisher extensions are present in round-trip
 	require.NotNil(t, resultServerJSON.Meta)
 	require.NotNil(t, resultServerJSON.Meta.PublisherProvided)
-	stacklokData, ok := resultServerJSON.Meta.PublisherProvided["io.github.stacklok"].(map[string]interface{})
+	stacklokData, ok := resultServerJSON.Meta.PublisherProvided[testNamespace].(map[string]interface{})
 	require.True(t, ok, "Should have io.github.stacklok namespace")
 	imageData, ok := stacklokData["ghcr.io/github/github-mcp-server:0.19.1"].(map[string]interface{})
 	require.True(t, ok, "Should have image-specific extensions")
 
 	// Verify extensions preserved
-	assert.Equal(t, "active", imageData["status"])
-	assert.Equal(t, "Official", imageData["tier"])
+	assert.Equal(t, defaultStatus, imageData[statusKey])
+	assert.Equal(t, testTier, imageData[tierKey])
 
 	// Verify tools are preserved as interface slice
-	tools, ok := imageData["tools"].([]interface{})
+	tools, ok := imageData[toolsKey].([]interface{})
 	require.True(t, ok, "Tools should be []interface{}")
 	assert.Len(t, tools, 46)
 
@@ -1278,15 +1278,15 @@ func TestRealWorld_GitHubServer_ExactData(t *testing.T) {
 	// Verify publisher extensions contain all the extra data
 	require.NotNil(t, serverJSON.Meta)
 	require.NotNil(t, serverJSON.Meta.PublisherProvided)
-	stacklokData, ok := serverJSON.Meta.PublisherProvided["io.github.stacklok"].(map[string]interface{})
+	stacklokData, ok := serverJSON.Meta.PublisherProvided[testNamespace].(map[string]interface{})
 	require.True(t, ok)
 	extensions, ok := stacklokData["ghcr.io/github/github-mcp-server:v0.19.1"].(map[string]interface{})
 	require.True(t, ok)
 
 	// Verify extensions
-	assert.Equal(t, "Active", extensions["status"])
-	assert.Equal(t, "Official", extensions["tier"])
-	assert.NotNil(t, extensions["tools"])
+	assert.Equal(t, "Active", extensions[statusKey])
+	assert.Equal(t, testTier, extensions[tierKey])
+	assert.NotNil(t, extensions[toolsKey])
 	assert.NotNil(t, extensions["tags"])
 	assert.NotNil(t, extensions["metadata"])
 	assert.NotNil(t, extensions["permissions"])

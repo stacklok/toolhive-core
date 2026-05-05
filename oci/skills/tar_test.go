@@ -17,8 +17,8 @@ func TestCreateTar_Reproducible(t *testing.T) {
 	t.Parallel()
 
 	files := []FileEntry{
-		{Path: "b.txt", Content: []byte("content b")},
-		{Path: "a.txt", Content: []byte("content a")},
+		{Path: testFileB, Content: []byte("content b")},
+		{Path: testFileA, Content: []byte("content a")},
 		{Path: "c/d.txt", Content: []byte("content d")},
 	}
 
@@ -37,13 +37,13 @@ func TestCreateTar_DifferentOrder(t *testing.T) {
 	t.Parallel()
 
 	files1 := []FileEntry{
-		{Path: "b.txt", Content: []byte("b")},
-		{Path: "a.txt", Content: []byte("a")},
+		{Path: testFileB, Content: []byte("b")},
+		{Path: testFileA, Content: []byte("a")},
 	}
 
 	files2 := []FileEntry{
-		{Path: "a.txt", Content: []byte("a")},
-		{Path: "b.txt", Content: []byte("b")},
+		{Path: testFileA, Content: []byte("a")},
+		{Path: testFileB, Content: []byte("b")},
 	}
 
 	opts := DefaultTarOptions()
@@ -107,7 +107,7 @@ func TestExtractTar_RoundTrip(t *testing.T) {
 	t.Parallel()
 
 	originalFiles := []FileEntry{
-		{Path: "a.txt", Content: []byte("content a")},
+		{Path: testFileA, Content: []byte("content a")},
 		{Path: "b/c.txt", Content: []byte("content c")},
 	}
 

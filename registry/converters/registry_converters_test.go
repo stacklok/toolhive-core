@@ -23,8 +23,8 @@ func TestNewUpstreamRegistryFromToolhiveRegistry(t *testing.T) {
 		{
 			name: "successful conversion with container servers",
 			toolhiveReg: &registry.Registry{
-				Version:     "1.0.0",
-				LastUpdated: "2024-01-01T00:00:00Z",
+				Version:     testVersion,
+				LastUpdated: testLastUpdated,
 				Servers: map[string]*registry.ImageMetadata{
 					"test-server": {
 						BaseServerMetadata: registry.BaseServerMetadata{
@@ -43,8 +43,8 @@ func TestNewUpstreamRegistryFromToolhiveRegistry(t *testing.T) {
 			expectError: false,
 			validate: func(t *testing.T, sr *registry.UpstreamRegistry) {
 				t.Helper()
-				assert.Equal(t, "1.0.0", sr.Version)
-				assert.Equal(t, "2024-01-01T00:00:00Z", sr.Meta.LastUpdated)
+				assert.Equal(t, testVersion, sr.Version)
+				assert.Equal(t, testLastUpdated, sr.Meta.LastUpdated)
 				assert.Len(t, sr.Data.Servers, 1)
 				assert.Contains(t, sr.Data.Servers[0].Name, "test-server")
 				assert.Equal(t, "A test server", sr.Data.Servers[0].Description)
@@ -53,8 +53,8 @@ func TestNewUpstreamRegistryFromToolhiveRegistry(t *testing.T) {
 		{
 			name: "successful conversion with remote servers",
 			toolhiveReg: &registry.Registry{
-				Version:     "1.0.0",
-				LastUpdated: "2024-01-01T00:00:00Z",
+				Version:     testVersion,
+				LastUpdated: testLastUpdated,
 				Servers:     make(map[string]*registry.ImageMetadata),
 				RemoteServers: map[string]*registry.RemoteServerMetadata{
 					"remote-server": {
@@ -63,7 +63,7 @@ func TestNewUpstreamRegistryFromToolhiveRegistry(t *testing.T) {
 							Description: "A remote server",
 							Tier:        "Community",
 							Status:      "Active",
-							Transport:   "sse",
+							Transport:   testTransportSSE,
 							Tools:       []string{"remote_tool"},
 						},
 						URL: "https://example.com",
@@ -80,8 +80,8 @@ func TestNewUpstreamRegistryFromToolhiveRegistry(t *testing.T) {
 		{
 			name: "empty registry",
 			toolhiveReg: &registry.Registry{
-				Version:       "1.0.0",
-				LastUpdated:   "2024-01-01T00:00:00Z",
+				Version:       testVersion,
+				LastUpdated:   testLastUpdated,
 				Servers:       make(map[string]*registry.ImageMetadata),
 				RemoteServers: make(map[string]*registry.RemoteServerMetadata),
 			},

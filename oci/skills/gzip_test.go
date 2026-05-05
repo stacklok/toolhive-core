@@ -149,8 +149,8 @@ func TestCompressTar_Reproducible(t *testing.T) {
 	t.Parallel()
 
 	files := []FileEntry{
-		{Path: "b.txt", Content: []byte("content b")},
-		{Path: "a.txt", Content: []byte("content a")},
+		{Path: testFileB, Content: []byte("content b")},
+		{Path: testFileA, Content: []byte("content a")},
 	}
 
 	tarOpts := DefaultTarOptions()
@@ -169,8 +169,8 @@ func TestCompressTar_RoundTrip(t *testing.T) {
 	t.Parallel()
 
 	originalFiles := []FileEntry{
-		{Path: "a.txt", Content: []byte("content a")},
-		{Path: "dir/b.txt", Content: []byte("content b")},
+		{Path: testFileA, Content: []byte("content a")},
+		{Path: "dir/" + testFileB, Content: []byte("content b")},
 	}
 
 	tarOpts := DefaultTarOptions()

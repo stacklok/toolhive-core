@@ -222,7 +222,7 @@ func TestStore_GetIndex(t *testing.T) {
 				MediaType: ocispec.MediaTypeImageManifest,
 				Digest:    digest.FromString("test"),
 				Size:      100,
-				Platform:  &ocispec.Platform{OS: "linux", Architecture: "amd64"},
+				Platform:  &ocispec.Platform{OS: OSLinux, Architecture: ArchAMD64},
 			},
 		},
 	}
@@ -239,8 +239,8 @@ func TestStore_GetIndex(t *testing.T) {
 	assert.Equal(t, 2, got.SchemaVersion)
 	assert.Equal(t, ocispec.MediaTypeImageIndex, got.MediaType)
 	require.Len(t, got.Manifests, 1)
-	assert.Equal(t, "linux", got.Manifests[0].Platform.OS)
-	assert.Equal(t, "amd64", got.Manifests[0].Platform.Architecture)
+	assert.Equal(t, OSLinux, got.Manifests[0].Platform.OS)
+	assert.Equal(t, ArchAMD64, got.Manifests[0].Platform.Architecture)
 }
 
 func TestStore_IsIndex(t *testing.T) {

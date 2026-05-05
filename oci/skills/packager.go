@@ -93,6 +93,9 @@ type skillDirContent struct {
 	fm *frontmatter
 }
 
+// SkillFileName is the required metadata file name for a skill directory.
+const SkillFileName = "SKILL.md"
+
 // maxFrontmatterSize limits frontmatter to prevent YAML parsing attacks.
 const maxFrontmatterSize = 64 * 1024
 
@@ -223,7 +226,7 @@ func readSkillDirectory(dir string) (*skillDirContent, error) {
 	}
 
 	// Read SKILL.md (required)
-	skillMDPath := filepath.Join(dir, "SKILL.md")
+	skillMDPath := filepath.Join(dir, SkillFileName)
 	skillMD, err := os.ReadFile(skillMDPath) //#nosec G304 -- path constructed from user-provided skill directory
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -317,7 +320,7 @@ func collectSkillFiles(dir string) (map[string][]byte, error) {
 		}
 
 		// Skip SKILL.md since we handle it separately
-		if relPath == "SKILL.md" {
+		if relPath == SkillFileName {
 			return nil
 		}
 
@@ -397,7 +400,7 @@ func createContentLayer(content *skillDirContent, opts PackageOptions) (compress
 
 	// Add SKILL.md first
 	files = append(files, FileEntry{
-		Path:    "SKILL.md",
+		Path:    SkillFileName,
 		Content: content.skillMD,
 	})
 
@@ -439,7 +442,7 @@ func createOCIConfig(
 	opts PackageOptions,
 ) (*ocispec.Image, *SkillConfig) {
 	// Collect all file paths
-	allFiles := []string{"SKILL.md"}
+	allFiles := []string{SkillFileName}
 	for p := range content.files {
 		allFiles = append(allFiles, p)
 	}

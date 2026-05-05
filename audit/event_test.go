@@ -15,16 +15,26 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	subjKeyUser      = "user"
+	subjKeyUserID    = "user_id"
+	subjKeyUserAgent = "user_agent"
+	targetKeyName    = "name"
+	targetKeyEndpt   = "endpoint"
+	targetKeyType    = "type"
+	targetTypeTool   = "tool"
+)
+
 func TestNewAuditEvent(t *testing.T) {
 	t.Parallel()
 	source := EventSource{
 		Type:  SourceTypeNetwork,
 		Value: "192.168.1.100",
-		Extra: map[string]any{"user_agent": "test-agent"},
+		Extra: map[string]any{subjKeyUserAgent: "test-agent"},
 	}
 	subjects := map[string]string{
-		"user":    "testuser",
-		"user_id": "user123",
+		subjKeyUser:   "testuser",
+		subjKeyUserID: "user123",
 	}
 
 	event := NewAuditEvent("test_event", source, OutcomeSuccess, subjects, "test-component")
@@ -42,7 +52,7 @@ func TestNewAuditEventWithID(t *testing.T) {
 	t.Parallel()
 	auditID := "custom-audit-id"
 	source := EventSource{Type: SourceTypeLocal, Value: "localhost"}
-	subjects := map[string]string{"user": "admin"}
+	subjects := map[string]string{subjKeyUser: "admin"}
 
 	event := NewAuditEventWithID(auditID, "admin_action", source, OutcomeSuccess, subjects, "admin-panel")
 
@@ -58,9 +68,9 @@ func TestAuditEventWithTarget(t *testing.T) {
 	t.Parallel()
 	event := NewAuditEvent("test", EventSource{}, OutcomeSuccess, map[string]string{}, "test")
 	target := map[string]string{
-		"type":     "tool",
-		"name":     "test-tool",
-		"endpoint": "/api/tools/test",
+		targetKeyType:  targetTypeTool,
+		targetKeyName:  "test-tool",
+		targetKeyEndpt: "/api/tools/test",
 	}
 
 	result := event.WithTarget(target)
@@ -106,21 +116,21 @@ func TestAuditEventJSONSerialization(t *testing.T) {
 		Type:  SourceTypeNetwork,
 		Value: "10.0.0.1",
 		Extra: map[string]any{
-			"user_agent": "Mozilla/5.0",
-			"request_id": "req-123",
+			subjKeyUserAgent: "Mozilla/5.0",
+			"request_id":     "req-123",
 		},
 	}
 	subjects := map[string]string{
-		"user":           "john.doe",
-		"user_id":        "user-456",
+		subjKeyUser:      "john.doe",
+		subjKeyUserID:    "user-456",
 		"client_name":    "test-client",
 		"client_version": "1.0.0",
 	}
 	target := map[string]string{
-		"type":     "tool",
-		"name":     "calculator",
-		"method":   "POST",
-		"endpoint": "/api/tools/calculator",
+		targetKeyType:  targetTypeTool,
+		targetKeyName:  "calculator",
+		"method":       "POST",
+		targetKeyEndpt: "/api/tools/calculator",
 	}
 
 	event := NewAuditEvent("mcp_tool_call", source, OutcomeSuccess, subjects, "calculator-service")
@@ -220,16 +230,16 @@ func TestAuditEventLogTo(t *testing.T) {
 	source := EventSource{
 		Type:  SourceTypeNetwork,
 		Value: "192.168.1.100",
-		Extra: map[string]any{"user_agent": "test-agent"},
+		Extra: map[string]any{subjKeyUserAgent: "test-agent"},
 	}
 	subjects := map[string]string{
-		"user":    "testuser",
-		"user_id": "user123",
+		subjKeyUser:   "testuser",
+		subjKeyUserID: "user123",
 	}
 	target := map[string]string{
-		"type":     "tool",
-		"name":     "calculator",
-		"endpoint": "/api/tools/calculator",
+		targetKeyType:  targetTypeTool,
+		targetKeyName:  "calculator",
+		targetKeyEndpt: "/api/tools/calculator",
 	}
 
 	event := NewAuditEvent("mcp_tool_call", source, OutcomeSuccess, subjects, "test-component")
@@ -262,12 +272,12 @@ func TestAuditEventLogTo(t *testing.T) {
 
 	subjectsData, ok := logEntry["subjects"].(map[string]any)
 	require.True(t, ok)
-	assert.Equal(t, "testuser", subjectsData["user"])
-	assert.Equal(t, "user123", subjectsData["user_id"])
+	assert.Equal(t, "testuser", subjectsData[subjKeyUser])
+	assert.Equal(t, "user123", subjectsData[subjKeyUserID])
 
 	targetData, ok := logEntry["target"].(map[string]any)
 	require.True(t, ok)
-	assert.Equal(t, "tool", targetData["type"])
-	assert.Equal(t, "calculator", targetData["name"])
-	assert.Equal(t, "/api/tools/calculator", targetData["endpoint"])
+	assert.Equal(t, targetTypeTool, targetData[targetKeyType])
+	assert.Equal(t, "calculator", targetData[targetKeyName])
+	assert.Equal(t, "/api/tools/calculator", targetData[targetKeyEndpt])
 }

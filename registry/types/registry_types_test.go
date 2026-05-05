@@ -159,8 +159,8 @@ func TestRegistry_GetServerByName(t *testing.T) {
 		remote   bool
 		found    bool
 	}{
-		{"server-a", "server-a", false, true},
-		{"remote-a", "remote-a", true, true},
+		{testServerName, testServerName, false, true},
+		{testRemoteName, testRemoteName, true, true},
 		{"missing", "", false, false},
 	}
 	for _, tc := range tests {
