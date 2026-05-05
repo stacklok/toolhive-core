@@ -134,11 +134,21 @@ func ParsePlatform(s string) (ocispec.Platform, error) {
 	return p, nil
 }
 
+// OS and architecture constants for OCI platform specifications.
+const (
+	// OSLinux is the Linux OS identifier used in OCI platform specs.
+	OSLinux = "linux"
+	// ArchAMD64 is the x86-64 architecture identifier used in OCI platform specs.
+	ArchAMD64 = "amd64"
+	// ArchARM64 is the 64-bit ARM architecture identifier used in OCI platform specs.
+	ArchARM64 = "arm64"
+)
+
 // DefaultPlatforms are the default platforms for skill artifacts.
 // These cover most Kubernetes clusters.
 var DefaultPlatforms = []ocispec.Platform{
-	{OS: "linux", Architecture: "amd64"},
-	{OS: "linux", Architecture: "arm64"},
+	{OS: OSLinux, Architecture: ArchAMD64},
+	{OS: OSLinux, Architecture: ArchARM64},
 }
 
 // ParseRequiresAnnotation parses skill dependency references from manifest annotations.

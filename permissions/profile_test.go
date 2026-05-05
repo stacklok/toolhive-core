@@ -11,6 +11,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const (
+	testProfileName         = "test"
+	testNameSinglePath      = "Single path"
+	testNameHostToContainer = "Host path to container path"
+	testNameResourceURI     = "Resource URI"
+	pathDir                 = "/path/to/dir"
+	pathContainer           = "/container/path"
+	pathWindowsFooBar       = `C:\foo\bar`
+	mountHostToContainer    = "/host/path:/container/path"
+	mountVolume             = "volume://myvolume:/container/path"
+	mountSecret             = "secret://mysecret:/container/path"
+	mountInjection          = "/path/with/$(rm -rf *):/container/path"
+	mountTraversal          = "/path/with/../../../etc/passwd:/container/path"
+	mountVolumeRmrf         = "volume://$(rm -rf *):/container/path"
+)
+
 func TestMountDeclaration_Parse(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -21,10 +37,10 @@ func TestMountDeclaration_Parse(t *testing.T) {
 		expectError    bool
 	}{
 		{
-			name:           "Single path",
-			declaration:    "/path/to/dir",
-			expectedSource: "/path/to/dir",
-			expectedTarget: "/path/to/dir",
+			name:           testNameSinglePath,
+			declaration:    pathDir,
+			expectedSource: pathDir,
+			expectedTarget: pathDir,
 			expectError:    false,
 		},
 		{
@@ -33,51 +49,51 @@ func TestMountDeclaration_Parse(t *testing.T) {
 			// e.g. C:\foo -> /C:\\foo
 			// While this behaviour is unusual, it's valid, and we should support it.
 			name:           "Single path (Windows)",
-			declaration:    "C:\\foo\\bar",
-			expectedSource: "C:\\foo\\bar",
-			expectedTarget: "C:\\foo\\bar",
+			declaration:    pathWindowsFooBar,
+			expectedSource: pathWindowsFooBar,
+			expectedTarget: pathWindowsFooBar,
 			expectError:    false,
 		},
 		{
-			name:           "Host path to container path",
-			declaration:    "/host/path:/container/path",
+			name:           testNameHostToContainer,
+			declaration:    mountHostToContainer,
 			expectedSource: "/host/path",
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
-			name:           "Resource URI",
-			declaration:    "volume://myvolume:/container/path",
+			name:           testNameResourceURI,
+			declaration:    mountVolume,
 			expectedSource: "volume://myvolume",
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
 			name:           "Resource URI (Windows)",
 			declaration:    "volume://C:\\Foo\\Bar:/container/path",
 			expectedSource: "volume://C:\\Foo\\Bar",
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
 			name:           "Resource URI (Windows forward slashes)",
 			declaration:    "volume://C:/Foo/Bar:/container/path",
 			expectedSource: "volume://C:/Foo/Bar",
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
 			name:           "Resource URI (Windows mixed slashes)",
 			declaration:    "volume://C:\\Foo/Bar:/container/path",
 			expectedSource: "volume://C:\\Foo/Bar",
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
 			name:           "Different resource URI",
-			declaration:    "secret://mysecret:/container/path",
+			declaration:    mountSecret,
 			expectedSource: "secret://mysecret",
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
@@ -106,42 +122,42 @@ func TestMountDeclaration_Parse(t *testing.T) {
 			name:           "Path with spaces",
 			declaration:    "/path with spaces:/container/path",
 			expectedSource: "/path with spaces",
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
 			name:           "Path with special characters",
 			declaration:    "/path/with/special/chars!@#:/container/path",
 			expectedSource: "/path/with/special/chars!@#",
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
 			name:           "Path with Unicode characters",
 			declaration:    "/path/with/unicode/😀:/container/path",
 			expectedSource: "/path/with/unicode/😀",
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
 			name:           "Windows style path",
 			declaration:    "C:\\path\\to\\dir:/container/path",
 			expectedSource: "C:\\path\\to\\dir",
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
 			name:           "Windows style path (forward slashes)",
 			declaration:    "C:/path/to/dir:/container/path",
 			expectedSource: "C:/path/to/dir",
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
 			name:           "Windows style path (mixed slashes)",
 			declaration:    "C:\\path/to\\dir:/container/path", // Yes, this is allowed on Windows...
 			expectedSource: "C:\\path/to\\dir",
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
@@ -168,36 +184,36 @@ func TestMountDeclaration_Parse(t *testing.T) {
 		{
 			name:           "Path with trailing slash",
 			declaration:    "/path/to/dir/:/container/path/",
-			expectedSource: "/path/to/dir",
-			expectedTarget: "/container/path",
+			expectedSource: pathDir,
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
 			name:           "Path with multiple slashes",
 			declaration:    "/path//to///dir:/container//path",
-			expectedSource: "/path/to/dir",
-			expectedTarget: "/container/path",
+			expectedSource: pathDir,
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
 			name:           "Path with Unicode characters",
 			declaration:    "/path/with/unicode/😀:/container/path",
 			expectedSource: "/path/with/unicode/😀",
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 		{
 			name:           "Path with potential command injection",
-			declaration:    "/path/with/$(rm -rf *):/container/path",
+			declaration:    mountInjection,
 			expectedSource: "",
 			expectedTarget: "",
 			expectError:    true, // Now expecting an error due to validation
 		},
 		{
 			name:           "Path with potential path traversal",
-			declaration:    "/path/with/../../../etc/passwd:/container/path",
+			declaration:    mountTraversal,
 			expectedSource: "/etc/passwd", // filepath.Clean resolves the path
-			expectedTarget: "/container/path",
+			expectedTarget: pathContainer,
 			expectError:    false,
 		},
 	}
@@ -227,18 +243,18 @@ func TestMountDeclaration_IsValid(t *testing.T) {
 		expected    bool
 	}{
 		{
-			name:        "Single path",
-			declaration: "/path/to/dir",
+			name:        testNameSinglePath,
+			declaration: pathDir,
 			expected:    true,
 		},
 		{
-			name:        "Host path to container path",
-			declaration: "/host/path:/container/path",
+			name:        testNameHostToContainer,
+			declaration: mountHostToContainer,
 			expected:    true,
 		},
 		{
-			name:        "Resource URI",
-			declaration: "volume://myvolume:/container/path",
+			name:        testNameResourceURI,
+			declaration: mountVolume,
 			expected:    true,
 		},
 		{
@@ -249,12 +265,12 @@ func TestMountDeclaration_IsValid(t *testing.T) {
 		// Security-focused tests
 		{
 			name:        "Path with potential command injection",
-			declaration: "/path/with/$(rm -rf *):/container/path",
+			declaration: mountInjection,
 			expected:    false, // Now invalid due to validation
 		},
 		{
 			name:        "Path with potential path traversal",
-			declaration: "/path/with/../../../etc/passwd:/container/path",
+			declaration: mountTraversal,
 			expected:    true, // Valid format, but potentially dangerous
 		},
 	}
@@ -275,23 +291,23 @@ func TestMountDeclaration_IsResourceURI(t *testing.T) {
 		expected    bool
 	}{
 		{
-			name:        "Single path",
-			declaration: "/path/to/dir",
+			name:        testNameSinglePath,
+			declaration: pathDir,
 			expected:    false,
 		},
 		{
-			name:        "Host path to container path",
-			declaration: "/host/path:/container/path",
+			name:        testNameHostToContainer,
+			declaration: mountHostToContainer,
 			expected:    false,
 		},
 		{
-			name:        "Resource URI",
-			declaration: "volume://myvolume:/container/path",
+			name:        testNameResourceURI,
+			declaration: mountVolume,
 			expected:    true,
 		},
 		{
 			name:        "Different resource URI",
-			declaration: "secret://mysecret:/container/path",
+			declaration: mountSecret,
 			expected:    true,
 		},
 		// Security-focused tests
@@ -302,7 +318,7 @@ func TestMountDeclaration_IsResourceURI(t *testing.T) {
 		},
 		{
 			name:        "Resource URI with potential command injection",
-			declaration: "volume://$(rm -rf *):/container/path",
+			declaration: mountVolumeRmrf,
 			expected:    true, // Valid format, but potentially dangerous
 		},
 	}
@@ -324,33 +340,33 @@ func TestMountDeclaration_GetResourceType(t *testing.T) {
 		expectError  bool
 	}{
 		{
-			name:         "Single path",
-			declaration:  "/path/to/dir",
+			name:         testNameSinglePath,
+			declaration:  pathDir,
 			expectedType: "",
 			expectError:  true,
 		},
 		{
-			name:         "Host path to container path",
-			declaration:  "/host/path:/container/path",
+			name:         testNameHostToContainer,
+			declaration:  mountHostToContainer,
 			expectedType: "",
 			expectError:  true,
 		},
 		{
 			name:         "Volume resource URI",
-			declaration:  "volume://myvolume:/container/path",
+			declaration:  mountVolume,
 			expectedType: "volume",
 			expectError:  false,
 		},
 		{
 			name:         "Secret resource URI",
-			declaration:  "secret://mysecret:/container/path",
+			declaration:  mountSecret,
 			expectedType: "secret",
 			expectError:  false,
 		},
 		// Security-focused tests
 		{
 			name:         "Resource URI with potential command injection",
-			declaration:  "volume://$(rm -rf *):/container/path",
+			declaration:  mountVolumeRmrf,
 			expectedType: "volume",
 			expectError:  false, // Valid format, but potentially dangerous
 		},
@@ -388,9 +404,9 @@ func TestParseMountDeclarations(t *testing.T) {
 		{
 			name: "Valid declarations",
 			declarations: []string{
-				"/path/to/dir",
-				"/host/path:/container/path",
-				"volume://myvolume:/container/path",
+				pathDir,
+				mountHostToContainer,
+				mountVolume,
 			},
 			expectError: false,
 		},
@@ -403,9 +419,9 @@ func TestParseMountDeclarations(t *testing.T) {
 		{
 			name: "Declarations with potential security issues",
 			declarations: []string{
-				"/path/with/$(rm -rf *):/container/path",
-				"volume://$(rm -rf *):/container/path",
-				"/path/with/../../../etc/passwd:/container/path",
+				mountInjection,
+				mountVolumeRmrf,
+				mountTraversal,
 			},
 			expectError: true, // Now expecting an error due to validation
 		},
@@ -434,11 +450,11 @@ func TestMountDeclaration_SecurityValidation(t *testing.T) {
 	// These tests check that our parsing is robust against various security issues
 
 	// Test for path traversal - this should be cleaned but allowed
-	traversalMount := MountDeclaration("/etc/passwd:/container/path")
+	traversalMount := MountDeclaration("/etc/passwd:" + pathContainer)
 	source, target, err := traversalMount.Parse()
 	require.NoError(t, err)
 	assert.Equal(t, "/etc/passwd", source)
-	assert.Equal(t, "/container/path", target)
+	assert.Equal(t, pathContainer, target)
 
 	// Test for command injection - this should be rejected
 	injectionMount := MountDeclaration("$(rm -rf *):/container/path")
@@ -463,11 +479,11 @@ func TestMountDeclaration_EdgeCases(t *testing.T) {
 
 	// Test with very long paths
 	longPath := "/very/long/path/" + strings.Repeat("a", 1000)
-	longMount := MountDeclaration(longPath + ":/container/path")
+	longMount := MountDeclaration(longPath + ":" + pathContainer)
 	source, target, err := longMount.Parse()
 	require.NoError(t, err)
 	assert.Equal(t, longPath, source)
-	assert.Equal(t, "/container/path", target)
+	assert.Equal(t, pathContainer, target)
 
 	// Test with path containing "://" but not at the beginning
 	pathWithColon := MountDeclaration("/some/other/path/://:/tmp/foo")

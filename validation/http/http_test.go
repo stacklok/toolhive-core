@@ -11,6 +11,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const tcEmptyString = "empty string"
+
 func TestValidateHeaderName(t *testing.T) {
 	t.Parallel()
 
@@ -33,7 +35,7 @@ func TestValidateHeaderName(t *testing.T) {
 		// Other invalid characters
 		{"null byte", "X-API-Key\x00", true},
 		{"contains space", "X API Key", true},
-		{"empty string", "", true},
+		{tcEmptyString, "", true},
 
 		// Length limits
 		{"too long", strings.Repeat("A", 300), true},
@@ -78,7 +80,7 @@ func TestValidateHeaderValue(t *testing.T) {
 
 		// Length limits
 		{"too long", strings.Repeat("A", 10000), true},
-		{"empty string", "", true},
+		{tcEmptyString, "", true},
 	}
 
 	for _, tt := range tests {
@@ -136,7 +138,7 @@ func TestValidateResourceURI(t *testing.T) {
 		},
 		// Invalid cases
 		{
-			name:          "empty string",
+			name:          tcEmptyString,
 			input:         "",
 			expectError:   true,
 			errorContains: "cannot be empty",

@@ -122,7 +122,7 @@ func TestPackager_Package_VerifyLayer(t *testing.T) {
 
 	found := false
 	for _, f := range files {
-		if f.Path == "SKILL.md" {
+		if f.Path == SkillFileName {
 			found = true
 			break
 		}
@@ -182,8 +182,8 @@ func TestPackager_Package_VerifyOCIConfig(t *testing.T) {
 	var ociConfig ocispec.Image
 	require.NoError(t, json.Unmarshal(configBytes, &ociConfig))
 
-	assert.Equal(t, "amd64", ociConfig.Architecture)
-	assert.Equal(t, "linux", ociConfig.OS)
+	assert.Equal(t, ArchAMD64, ociConfig.Architecture)
+	assert.Equal(t, OSLinux, ociConfig.OS)
 	assert.NotNil(t, ociConfig.Created, "top-level created field should be set")
 	assert.Equal(t, "layers", ociConfig.RootFS.Type)
 	require.Len(t, ociConfig.RootFS.DiffIDs, 1)
@@ -197,7 +197,7 @@ func TestPackager_Package_VerifyOCIConfig(t *testing.T) {
 
 	var allowedTools []string
 	require.NoError(t, json.Unmarshal([]byte(labels[LabelSkillAllowedTools]), &allowedTools))
-	assert.Equal(t, []string{"Read", "Grep"}, allowedTools)
+	assert.Equal(t, []string{testToolRead, testToolGrep}, allowedTools)
 
 	require.Len(t, ociConfig.History, 1)
 	assert.Equal(t, "toolhive package", ociConfig.History[0].CreatedBy)
@@ -212,8 +212,8 @@ func TestPackager_Package_MultiPlatformConfigMatch(t *testing.T) {
 
 	packager := NewPackager(store)
 	platforms := []ocispec.Platform{
-		{OS: "linux", Architecture: "amd64"},
-		{OS: "linux", Architecture: "arm64"},
+		{OS: OSLinux, Architecture: ArchAMD64},
+		{OS: OSLinux, Architecture: ArchARM64},
 	}
 	opts := PackageOptions{
 		Epoch:     time.Unix(0, 0).UTC(),
@@ -299,7 +299,7 @@ version: 1.0.0
 ---
 # No Name Skill
 `
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillMD), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, SkillFileName), []byte(skillMD), 0600))
 
 	store, err := NewStore(t.TempDir())
 	require.NoError(t, err)
@@ -397,7 +397,7 @@ func TestPackager_Package_InvalidFrontmatter(t *testing.T) {
 			t.Parallel()
 
 			dir := t.TempDir()
-			require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(tt.content), 0600))
+			require.NoError(t, os.WriteFile(filepath.Join(dir, SkillFileName), []byte(tt.content), 0600))
 
 			store, err := NewStore(t.TempDir())
 			require.NoError(t, err)
@@ -475,10 +475,10 @@ license: MIT
 ---
 # Body`,
 			want: &frontmatter{
-				Name:         "my-skill",
+				Name:         testSkillMySkill,
 				Description:  "A great skill",
 				Version:      "2.0.0",
-				AllowedTools: stringOrSlice{"Read", "Write"},
+				AllowedTools: stringOrSlice{testToolRead, "Write"},
 				License:      "MIT",
 			},
 		},
@@ -491,9 +491,9 @@ allowed-tools: Read Grep Glob
 ---
 # Body`,
 			want: &frontmatter{
-				Name:         "my-skill",
+				Name:         testSkillMySkill,
 				Description:  "A skill",
-				AllowedTools: stringOrSlice{"Read", "Grep", "Glob"},
+				AllowedTools: stringOrSlice{testToolRead, testToolGrep, "Glob"},
 			},
 		},
 		{
@@ -505,9 +505,9 @@ allowed-tools: Read, Grep, Glob
 ---
 # Body`,
 			want: &frontmatter{
-				Name:         "my-skill",
+				Name:         testSkillMySkill,
 				Description:  "A skill",
-				AllowedTools: stringOrSlice{"Read", "Grep", "Glob"},
+				AllowedTools: stringOrSlice{testToolRead, testToolGrep, "Glob"},
 			},
 		},
 		{
@@ -547,7 +547,7 @@ version: 1.0.0
 ---
 # Too Many Files Skill
 `
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillMD), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, SkillFileName), []byte(skillMD), 0600))
 
 	// Create maxSkillFiles + 1 extra files (SKILL.md is excluded from the count)
 	for i := range maxSkillFiles + 1 {
@@ -608,7 +608,7 @@ func TestPackager_Package_SentinelErrors(t *testing.T) {
 				t.Helper()
 				dir := t.TempDir()
 				require.NoError(t, os.WriteFile(
-					filepath.Join(dir, "SKILL.md"),
+					filepath.Join(dir, SkillFileName),
 					[]byte("# no frontmatter\n"),
 					0600,
 				))
@@ -622,7 +622,7 @@ func TestPackager_Package_SentinelErrors(t *testing.T) {
 				t.Helper()
 				dir := t.TempDir()
 				require.NoError(t, os.WriteFile(
-					filepath.Join(dir, "SKILL.md"),
+					filepath.Join(dir, SkillFileName),
 					[]byte("---\nname: test\n# never closed"),
 					0600,
 				))
@@ -639,7 +639,7 @@ func TestPackager_Package_SentinelErrors(t *testing.T) {
 				buf.WriteString("---\nname: test\nfiller: ")
 				buf.Write(bytes.Repeat([]byte("a"), maxFrontmatterSize+1))
 				buf.WriteString("\n---\n# body\n")
-				require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), buf.Bytes(), 0600))
+				require.NoError(t, os.WriteFile(filepath.Join(dir, SkillFileName), buf.Bytes(), 0600))
 				return dir
 			},
 			wantErr: ErrInvalidFrontmatter,
@@ -650,7 +650,7 @@ func TestPackager_Package_SentinelErrors(t *testing.T) {
 				t.Helper()
 				dir := t.TempDir()
 				require.NoError(t, os.WriteFile(
-					filepath.Join(dir, "SKILL.md"),
+					filepath.Join(dir, SkillFileName),
 					[]byte("---\nname: [unclosed\n---\n# body\n"),
 					0600,
 				))
@@ -664,7 +664,7 @@ func TestPackager_Package_SentinelErrors(t *testing.T) {
 				t.Helper()
 				dir := t.TempDir()
 				require.NoError(t, os.WriteFile(
-					filepath.Join(dir, "SKILL.md"),
+					filepath.Join(dir, SkillFileName),
 					[]byte("---\ndescription: nameless skill\n---\n# body\n"),
 					0600,
 				))
@@ -760,7 +760,7 @@ allowed-tools:
 
 This is a test skill.
 `
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillMD), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, SkillFileName), []byte(skillMD), 0600))
 
 	return dir
 }
@@ -775,7 +775,7 @@ version: 1.0.0
 ---
 # Test Skill
 `
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillMD), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, SkillFileName), []byte(skillMD), 0600))
 }
 
 func createTestSkillDirWithScripts(t *testing.T) string {

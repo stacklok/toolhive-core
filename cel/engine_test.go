@@ -14,11 +14,28 @@ import (
 	"github.com/stacklok/toolhive-core/cel"
 )
 
+const (
+	claimsVar    = "claims"
+	claimSub     = "sub"
+	claimAct     = "act"
+	claimGroups  = "groups"
+	groupAdmins  = "admins"
+	groupUsers   = "users"
+	userAgent456 = "agent456"
+	testUser123  = "user123"
+
+	testExprSubUser123         = `claims["sub"] == "user123"`
+	testExprAdminsInGroups     = `"admins" in claims["groups"]`
+	testExprActInClaims        = `"act" in claims`
+	testExprAdminsNotDelegated = `"admins" in claims["groups"] && !("act" in claims)`
+	testExprTernaryDelegated   = `"act" in claims ? "delegated" : "direct"`
+)
+
 // newTestClaimsEngine creates a CEL engine for testing claims-based expressions.
 // This demonstrates how consumers should configure the generic CEL engine.
 func newTestClaimsEngine() *cel.Engine {
 	return cel.NewEngine(
-		celgo.Variable("claims", celgo.MapType(celgo.StringType, celgo.DynType)),
+		celgo.Variable(claimsVar, celgo.MapType(celgo.StringType, celgo.DynType)),
 	)
 }
 
@@ -29,7 +46,7 @@ func TestNewEngine(t *testing.T) {
 	require.NotNil(t, engine)
 
 	// Should be able to compile a valid expression
-	expr, err := engine.Compile(`claims["sub"] == "user123"`)
+	expr, err := engine.Compile(testExprSubUser123)
 	require.NoError(t, err)
 	require.NotNil(t, expr)
 }
@@ -45,15 +62,15 @@ func TestEngine_Compile_ValidExpressions(t *testing.T) {
 	}{
 		{
 			name: "string equality",
-			expr: `claims["sub"] == "user123"`,
+			expr: testExprSubUser123,
 		},
 		{
 			name: "membership in array",
-			expr: `"admins" in claims["groups"]`,
+			expr: testExprAdminsInGroups,
 		},
 		{
 			name: "key exists in map",
-			expr: `"act" in claims`,
+			expr: testExprActInClaims,
 		},
 		{
 			name: "nested access",
@@ -61,7 +78,7 @@ func TestEngine_Compile_ValidExpressions(t *testing.T) {
 		},
 		{
 			name: "boolean and",
-			expr: `"admins" in claims["groups"] && !("act" in claims)`,
+			expr: testExprAdminsNotDelegated,
 		},
 		{
 			name: "boolean or",
@@ -77,7 +94,7 @@ func TestEngine_Compile_ValidExpressions(t *testing.T) {
 		},
 		{
 			name: "ternary expression",
-			expr: `"act" in claims ? "delegated" : "direct"`,
+			expr: testExprTernaryDelegated,
 		},
 		{
 			name: "true literal",
@@ -179,7 +196,7 @@ func TestEngine_Check(t *testing.T) {
 
 	t.Run("valid expression", func(t *testing.T) {
 		t.Parallel()
-		err := engine.Check(`claims["sub"] == "user123"`)
+		err := engine.Check(testExprSubUser123)
 		require.NoError(t, err)
 	})
 
@@ -206,92 +223,92 @@ func TestCompiledExpression_Evaluate(t *testing.T) {
 	}{
 		{
 			name: "string equality true",
-			expr: `claims["sub"] == "user123"`,
+			expr: testExprSubUser123,
 			claims: map[string]any{
-				"sub": "user123",
+				claimSub: testUser123,
 			},
 			expected: true,
 		},
 		{
 			name: "string equality false",
-			expr: `claims["sub"] == "user123"`,
+			expr: testExprSubUser123,
 			claims: map[string]any{
-				"sub": "other-user",
+				claimSub: "other-user",
 			},
 			expected: false,
 		},
 		{
 			name: "membership in array true",
-			expr: `"admins" in claims["groups"]`,
+			expr: testExprAdminsInGroups,
 			claims: map[string]any{
-				"groups": []any{"users", "admins", "developers"},
+				claimGroups: []any{groupUsers, groupAdmins, "developers"},
 			},
 			expected: true,
 		},
 		{
 			name: "membership in array false",
-			expr: `"admins" in claims["groups"]`,
+			expr: testExprAdminsInGroups,
 			claims: map[string]any{
-				"groups": []any{"users", "developers"},
+				claimGroups: []any{groupUsers, "developers"},
 			},
 			expected: false,
 		},
 		{
 			name: "key exists in map true",
-			expr: `"act" in claims`,
+			expr: testExprActInClaims,
 			claims: map[string]any{
-				"sub": "user123",
-				"act": map[string]any{
-					"sub": "agent456",
+				claimSub: testUser123,
+				claimAct: map[string]any{
+					claimSub: userAgent456,
 				},
 			},
 			expected: true,
 		},
 		{
 			name: "key missing from map",
-			expr: `"act" in claims`,
+			expr: testExprActInClaims,
 			claims: map[string]any{
-				"sub": "user123",
+				claimSub: testUser123,
 			},
 			expected: false,
 		},
 		{
 			name: "complex boolean expression",
-			expr: `"admins" in claims["groups"] && !("act" in claims)`,
+			expr: testExprAdminsNotDelegated,
 			claims: map[string]any{
-				"sub":    "user123",
-				"groups": []any{"admins"},
+				claimSub:    testUser123,
+				claimGroups: []any{groupAdmins},
 			},
 			expected: true,
 		},
 		{
 			name: "complex boolean with agent delegation",
-			expr: `"admins" in claims["groups"] && !("act" in claims)`,
+			expr: testExprAdminsNotDelegated,
 			claims: map[string]any{
-				"sub":    "user123",
-				"groups": []any{"admins"},
-				"act": map[string]any{
-					"sub": "agent456",
+				claimSub:    testUser123,
+				claimGroups: []any{groupAdmins},
+				claimAct: map[string]any{
+					claimSub: userAgent456,
 				},
 			},
 			expected: false,
 		},
 		{
 			name: "ternary expression",
-			expr: `"act" in claims ? "delegated" : "direct"`,
+			expr: testExprTernaryDelegated,
 			claims: map[string]any{
-				"sub": "user123",
-				"act": map[string]any{
-					"sub": "agent456",
+				claimSub: testUser123,
+				claimAct: map[string]any{
+					claimSub: userAgent456,
 				},
 			},
 			expected: "delegated",
 		},
 		{
 			name: "ternary expression no delegation",
-			expr: `"act" in claims ? "delegated" : "direct"`,
+			expr: testExprTernaryDelegated,
 			claims: map[string]any{
-				"sub": "user123",
+				claimSub: testUser123,
 			},
 			expected: "direct",
 		},
@@ -316,7 +333,7 @@ func TestCompiledExpression_Evaluate(t *testing.T) {
 			expr, err := engine.Compile(tt.expr)
 			require.NoError(t, err)
 
-			ctx := map[string]any{"claims": tt.claims}
+			ctx := map[string]any{claimsVar: tt.claims}
 			result, err := expr.Evaluate(ctx)
 			require.NoError(t, err)
 			assert.Equal(t, tt.expected, result)
@@ -332,10 +349,10 @@ func TestCompiledExpression_EvaluateBool(t *testing.T) {
 	t.Run("returns true", func(t *testing.T) {
 		t.Parallel()
 
-		expr, err := engine.Compile(`claims["sub"] == "user123"`)
+		expr, err := engine.Compile(testExprSubUser123)
 		require.NoError(t, err)
 
-		ctx := map[string]any{"claims": map[string]any{"sub": "user123"}}
+		ctx := map[string]any{claimsVar: map[string]any{claimSub: testUser123}}
 		result, err := expr.EvaluateBool(ctx)
 		require.NoError(t, err)
 		assert.True(t, result)
@@ -344,10 +361,10 @@ func TestCompiledExpression_EvaluateBool(t *testing.T) {
 	t.Run("returns false", func(t *testing.T) {
 		t.Parallel()
 
-		expr, err := engine.Compile(`claims["sub"] == "user123"`)
+		expr, err := engine.Compile(testExprSubUser123)
 		require.NoError(t, err)
 
-		ctx := map[string]any{"claims": map[string]any{"sub": "other"}}
+		ctx := map[string]any{claimsVar: map[string]any{claimSub: "other"}}
 		result, err := expr.EvaluateBool(ctx)
 		require.NoError(t, err)
 		assert.False(t, result)
@@ -359,7 +376,7 @@ func TestCompiledExpression_EvaluateBool(t *testing.T) {
 		expr, err := engine.Compile(`claims["sub"]`)
 		require.NoError(t, err)
 
-		ctx := map[string]any{"claims": map[string]any{"sub": "user123"}}
+		ctx := map[string]any{claimsVar: map[string]any{claimSub: testUser123}}
 		_, err = expr.EvaluateBool(ctx)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, cel.ErrInvalidResult)
@@ -373,7 +390,7 @@ func TestCompiledExpression_EvaluateBool(t *testing.T) {
 		require.NoError(t, err)
 
 		// Provide an empty claims map so the nested access fails at runtime
-		ctx := map[string]any{"claims": map[string]any{}}
+		ctx := map[string]any{claimsVar: map[string]any{}}
 		_, err = expr.EvaluateBool(ctx)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, cel.ErrEvaluation)
@@ -422,7 +439,7 @@ func TestEngine_WithMaxExpressionLength(t *testing.T) {
 
 		engine := newTestClaimsEngine().WithMaxExpressionLength(10)
 
-		_, err := engine.Compile(`claims["sub"] == "user123"`)
+		_, err := engine.Compile(testExprSubUser123)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, cel.ErrExpressionCheck)
 	})
@@ -442,7 +459,7 @@ func TestEngine_WithMaxExpressionLength(t *testing.T) {
 
 		engine := newTestClaimsEngine().WithMaxExpressionLength(5)
 
-		err := engine.Check(`claims["sub"] == "user123"`)
+		err := engine.Check(testExprSubUser123)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, cel.ErrExpressionCheck)
 	})
@@ -463,10 +480,10 @@ func TestEngine_WithCostLimit(t *testing.T) {
 
 		engine := newTestClaimsEngine().WithCostLimit(cel.DefaultCostLimit)
 
-		expr, err := engine.Compile(`claims["sub"] == "user123"`)
+		expr, err := engine.Compile(testExprSubUser123)
 		require.NoError(t, err)
 
-		ctx := map[string]any{"claims": map[string]any{"sub": "user123"}}
+		ctx := map[string]any{claimsVar: map[string]any{claimSub: testUser123}}
 		result, err := expr.EvaluateBool(ctx)
 		require.NoError(t, err)
 		assert.True(t, result)
@@ -477,10 +494,10 @@ func TestEngine_WithCostLimit(t *testing.T) {
 
 		engine := newTestClaimsEngine().WithCostLimit(0)
 
-		expr, err := engine.Compile(`claims["sub"] == "user123"`)
+		expr, err := engine.Compile(testExprSubUser123)
 		require.NoError(t, err)
 
-		ctx := map[string]any{"claims": map[string]any{"sub": "user123"}}
+		ctx := map[string]any{claimsVar: map[string]any{claimSub: testUser123}}
 		_, err = expr.EvaluateBool(ctx)
 		require.Error(t, err)
 		assert.ErrorIs(t, err, cel.ErrEvaluation)
@@ -493,7 +510,7 @@ func TestEngine_Concurrency(t *testing.T) {
 	engine := newTestClaimsEngine()
 
 	// Compile the expression once
-	expr, err := engine.Compile(`"admins" in claims["groups"]`)
+	expr, err := engine.Compile(testExprAdminsInGroups)
 	require.NoError(t, err)
 
 	// Evaluate concurrently
@@ -503,14 +520,14 @@ func TestEngine_Concurrency(t *testing.T) {
 
 	for i := 0; i < numGoroutines; i++ {
 		go func(i int) {
-			groups := []any{"users"}
+			groups := []any{groupUsers}
 			if i%2 == 0 {
-				groups = append(groups, "admins")
+				groups = append(groups, groupAdmins)
 			}
 
 			ctx := map[string]any{
-				"claims": map[string]any{
-					"groups": groups,
+				claimsVar: map[string]any{
+					claimGroups: groups,
 				},
 			}
 

@@ -37,6 +37,13 @@ var (
 	MaxAttestationsBytesLimit int64 = 10 * 1024 * 1024
 )
 
+// OCI and Sigstore media type constants used when inspecting referrer manifests.
+const (
+	MediaTypeOCIEmptyV1JSON            = "application/vnd.oci.empty.v1+json"
+	MediaTypeCosignSimpleSigningV1JSON = "application/vnd.dev.cosign.simplesigning.v1+json"
+	MediaTypeSigstoreBundleV03JSON     = "application/vnd.dev.sigstore.bundle.v0.3+json"
+)
+
 const (
 	sigstoreBundleMediaType01 = "application/vnd.dev.sigstore.bundle+json;version=0.1"
 	// githubTokenIssuer is the issuer stamped into sigstore certs

@@ -24,6 +24,8 @@ import (
 	"github.com/stacklok/toolhive-core/httperr"
 )
 
+const mediaTypeOctetStream = "application/octet-stream"
+
 // Store provides local OCI artifact storage backed by an OCI Image Layout.
 type Store struct {
 	root  string
@@ -56,7 +58,7 @@ func DefaultStoreRoot() string {
 func (s *Store) PutBlob(ctx context.Context, content []byte) (digest.Digest, error) {
 	d := digest.FromBytes(content)
 	desc := ocispec.Descriptor{
-		MediaType: "application/octet-stream",
+		MediaType: mediaTypeOctetStream,
 		Digest:    d,
 		Size:      int64(len(content)),
 	}
@@ -88,7 +90,7 @@ func (s *Store) PutManifest(ctx context.Context, content []byte) (digest.Digest,
 	var header struct {
 		MediaType string `json:"mediaType"`
 	}
-	mediaType := "application/octet-stream"
+	mediaType := mediaTypeOctetStream
 	if err := json.Unmarshal(content, &header); err == nil && header.MediaType != "" {
 		mediaType = header.MediaType
 	}
