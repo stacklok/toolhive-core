@@ -8,7 +8,7 @@ require (
 	github.com/google/go-containerregistry v0.21.5
 	github.com/google/uuid v1.6.0
 	github.com/mark3labs/mcp-go v0.51.0
-	github.com/modelcontextprotocol/registry v1.7.7
+	github.com/modelcontextprotocol/registry v1.7.8
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/sigstore/protobuf-specs v0.5.1
