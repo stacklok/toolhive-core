@@ -18,7 +18,7 @@ func TestUpstreamRegistry_JSONSerialization(t *testing.T) {
 	t.Parallel()
 	registry := &UpstreamRegistry{
 		Schema:  UpstreamRegistrySchemaURL,
-		Version: "1.0.0",
+		Version: testVersion,
 		Meta: UpstreamMeta{
 			LastUpdated: time.Now().Format(time.RFC3339),
 		},
@@ -48,7 +48,7 @@ func TestUpstreamRegistry_YAMLSerialization(t *testing.T) {
 	t.Parallel()
 	registry := &UpstreamRegistry{
 		Schema:  UpstreamRegistrySchemaURL,
-		Version: "1.0.0",
+		Version: testVersion,
 		Meta: UpstreamMeta{
 			LastUpdated: "2024-01-15T10:30:00Z",
 		},
@@ -76,7 +76,7 @@ func TestUpstreamRegistry_WithGroups(t *testing.T) {
 	t.Parallel()
 	registry := &UpstreamRegistry{
 		Schema:  UpstreamRegistrySchemaURL,
-		Version: "1.0.0",
+		Version: testVersion,
 		Meta: UpstreamMeta{
 			LastUpdated: time.Now().Format(time.RFC3339),
 		},
@@ -107,7 +107,7 @@ func TestUpstreamRegistry_SchemaField(t *testing.T) {
 
 	registry := &UpstreamRegistry{
 		Schema:  UpstreamRegistrySchemaURL,
-		Version: "1.0.0",
+		Version: testVersion,
 		Meta: UpstreamMeta{
 			LastUpdated: time.Now().Format(time.RFC3339),
 		},
@@ -182,7 +182,7 @@ func TestUpstreamRegistry_WithSkills(t *testing.T) {
 	t.Parallel()
 	reg := &UpstreamRegistry{
 		Schema:  UpstreamRegistrySchemaURL,
-		Version: "1.0.0",
+		Version: testVersion,
 		Meta: UpstreamMeta{
 			LastUpdated: time.Now().Format(time.RFC3339),
 		},
@@ -193,7 +193,7 @@ func TestUpstreamRegistry_WithSkills(t *testing.T) {
 					Namespace:   "io.github.stacklok",
 					Name:        "pdf-processor",
 					Description: "Extract text and tables from PDF files",
-					Version:     "1.0.0",
+					Version:     testVersion,
 					Status:      "active",
 					Packages: []SkillPackage{
 						{
@@ -215,7 +215,7 @@ func TestUpstreamRegistry_WithSkills(t *testing.T) {
 	require.Len(t, decoded.Data.Skills, 1)
 	assert.Equal(t, "io.github.stacklok", decoded.Data.Skills[0].Namespace)
 	assert.Equal(t, "pdf-processor", decoded.Data.Skills[0].Name)
-	assert.Equal(t, "1.0.0", decoded.Data.Skills[0].Version)
+	assert.Equal(t, testVersion, decoded.Data.Skills[0].Version)
 	require.Len(t, decoded.Data.Skills[0].Packages, 1)
 	assert.Equal(t, "oci", decoded.Data.Skills[0].Packages[0].RegistryType)
 }
@@ -230,7 +230,7 @@ func TestRegistryGroup_Structure(t *testing.T) {
 			{
 				Name:        "io.test/server1",
 				Description: "Test server 1",
-				Version:     "1.0.0",
+				Version:     testVersion,
 			},
 		},
 	}

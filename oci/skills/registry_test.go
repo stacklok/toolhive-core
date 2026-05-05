@@ -78,7 +78,7 @@ func TestIsManifestMediaType(t *testing.T) {
 		{"Docker manifest list", "application/vnd.docker.distribution.manifest.list.v2+json", true},
 		{"OCI config", "application/vnd.oci.image.config.v1+json", false},
 		{"OCI layer", "application/vnd.oci.image.layer.v1.tar+gzip", false},
-		{"octet-stream", "application/octet-stream", false},
+		{"octet-stream", mediaTypeOctetStream, false},
 	}
 
 	for _, tt := range tests {
@@ -316,7 +316,7 @@ func TestPushPull_IndexRoundTrip(t *testing.T) {
 				MediaType: ocispec.MediaTypeImageManifest,
 				Digest:    manifestDigest,
 				Size:      int64(len(manifestBytes)),
-				Platform:  &ocispec.Platform{OS: "linux", Architecture: "amd64"},
+				Platform:  &ocispec.Platform{OS: OSLinux, Architecture: ArchAMD64},
 			},
 		},
 	}

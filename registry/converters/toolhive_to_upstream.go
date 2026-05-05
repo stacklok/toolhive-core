@@ -23,6 +23,13 @@ import (
 	registry "github.com/stacklok/toolhive-core/registry/types"
 )
 
+const (
+	defaultVersion   = "1.0.0"
+	repoSourceGitHub = "github"
+	defaultStatus    = "active"
+	statusKey        = "status"
+)
+
 // ImageMetadataToServerJSON converts toolhive ImageMetadata to an upstream ServerJSON
 // The name parameter is deprecated and should match imageMetadata.Name. It's kept for backward compatibility.
 func ImageMetadataToServerJSON(name string, imageMetadata *registry.ImageMetadata) (*upstream.ServerJSON, error) {
@@ -45,14 +52,14 @@ func ImageMetadataToServerJSON(name string, imageMetadata *registry.ImageMetadat
 		Name:        canonicalName,
 		Title:       imageMetadata.Title,
 		Description: imageMetadata.Description,
-		Version:     "1.0.0", // TODO: Extract from image tag or metadata
+		Version:     defaultVersion, // TODO: Extract from image tag or metadata
 	}
 
 	// Set repository if available
 	if imageMetadata.RepositoryURL != "" {
 		serverJSON.Repository = &model.Repository{
 			URL:    imageMetadata.RepositoryURL,
-			Source: "github", // Assume GitHub
+			Source: repoSourceGitHub, // Assume GitHub
 		}
 	}
 
@@ -89,14 +96,14 @@ func RemoteServerMetadataToServerJSON(name string, remoteMetadata *registry.Remo
 		Name:        canonicalName,
 		Title:       remoteMetadata.Title,
 		Description: remoteMetadata.Description,
-		Version:     "1.0.0", // TODO: Version management
+		Version:     defaultVersion, // TODO: Version management
 	}
 
 	// Set repository if available
 	if remoteMetadata.RepositoryURL != "" {
 		serverJSON.Repository = &model.Repository{
 			URL:    remoteMetadata.RepositoryURL,
-			Source: "github", // Assume GitHub
+			Source: repoSourceGitHub, // Assume GitHub
 		}
 	}
 
@@ -191,7 +198,7 @@ func createRemotesFromRemoteMetadata(remoteMetadata *registry.RemoteServerMetada
 // map structure, defaulting Status to "active" if empty.
 func buildPublisherExtensionsMap(ext registry.ServerExtensions, innerKey string) map[string]interface{} {
 	if ext.Status == "" {
-		ext.Status = "active"
+		ext.Status = defaultStatus
 	}
 	return map[string]interface{}{
 		registry.ToolHivePublisherNamespace: map[string]interface{}{
@@ -247,12 +254,12 @@ func serverExtensionsToMap(ext registry.ServerExtensions) map[string]interface{}
 	data, err := json.Marshal(ext)
 	if err != nil {
 		// Fallback: return a minimal map with just the status
-		return map[string]interface{}{"status": ext.Status}
+		return map[string]interface{}{statusKey: ext.Status}
 	}
 
 	var result map[string]interface{}
 	if err := json.Unmarshal(data, &result); err != nil {
-		return map[string]interface{}{"status": ext.Status}
+		return map[string]interface{}{statusKey: ext.Status}
 	}
 
 	return result

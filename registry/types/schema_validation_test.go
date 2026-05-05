@@ -60,7 +60,7 @@ func TestRegistrySchemaValidation(t *testing.T) {
 				"servers": {}
 			}`,
 			expectError:   true,
-			errorContains: "version",
+			errorContains: errKeyVersion,
 		},
 		{
 			name: "missing required last_updated field",
@@ -69,7 +69,7 @@ func TestRegistrySchemaValidation(t *testing.T) {
 				"servers": {}
 			}`,
 			expectError:   true,
-			errorContains: "last_updated",
+			errorContains: errKeyLastUpdated,
 		},
 		{
 			name: "missing required servers field",
@@ -88,7 +88,7 @@ func TestRegistrySchemaValidation(t *testing.T) {
 				"servers": {}
 			}`,
 			expectError:   true,
-			errorContains: "version",
+			errorContains: errKeyVersion,
 		},
 		{
 			name: "invalid date format",
@@ -98,7 +98,7 @@ func TestRegistrySchemaValidation(t *testing.T) {
 				"servers": {}
 			}`,
 			expectError:   true,
-			errorContains: "last_updated",
+			errorContains: errKeyLastUpdated,
 		},
 		{
 			name: "server missing required description",
@@ -116,7 +116,7 @@ func TestRegistrySchemaValidation(t *testing.T) {
 				}
 			}`,
 			expectError:   true,
-			errorContains: "description",
+			errorContains: errKeyDescription,
 		},
 		{
 			name: "server missing required image",
@@ -153,7 +153,7 @@ func TestRegistrySchemaValidation(t *testing.T) {
 				}
 			}`,
 			expectError:   true,
-			errorContains: "status",
+			errorContains: errKeyStatus,
 		},
 		{
 			name: "server with invalid tier",
@@ -172,7 +172,7 @@ func TestRegistrySchemaValidation(t *testing.T) {
 				}
 			}`,
 			expectError:   true,
-			errorContains: "tier",
+			errorContains: errKeyTier,
 		},
 		{
 			name: "server with invalid transport",
@@ -229,7 +229,7 @@ func TestRegistrySchemaValidation(t *testing.T) {
 				}
 			}`,
 			expectError:   true,
-			errorContains: "description",
+			errorContains: errKeyDescription,
 		},
 		{
 			name: "non-matching server name passes without additionalProperties restriction",
@@ -356,10 +356,10 @@ func TestMultipleValidationErrors(t *testing.T) {
 	assert.Contains(t, errorMsg, "validation failed with", "Should indicate multiple errors")
 
 	// Should contain specific error details
-	assert.Contains(t, errorMsg, "version", "Should mention missing version")
-	assert.Contains(t, errorMsg, "last_updated", "Should mention missing last_updated")
-	assert.Contains(t, errorMsg, "description", "Should mention description length issue")
-	assert.Contains(t, errorMsg, "status", "Should mention invalid status")
+	assert.Contains(t, errorMsg, errKeyVersion, "Should mention missing version")
+	assert.Contains(t, errorMsg, errKeyLastUpdated, "Should mention missing last_updated")
+	assert.Contains(t, errorMsg, errKeyDescription, "Should mention description length issue")
+	assert.Contains(t, errorMsg, errKeyStatus, "Should mention invalid status")
 	assert.Contains(t, errorMsg, "tools", "Should mention empty tools array")
 
 	// Verify it's formatted as a numbered list
@@ -473,7 +473,7 @@ func TestValidateUpstreamRegistryBytes(t *testing.T) {
 				}
 			}`,
 			wantErr:       true,
-			errorContains: "last_updated",
+			errorContains: errKeyLastUpdated,
 		},
 		{
 			name: "invalid version format",
@@ -487,7 +487,7 @@ func TestValidateUpstreamRegistryBytes(t *testing.T) {
 				}
 			}`,
 			wantErr:       true,
-			errorContains: "version",
+			errorContains: errKeyVersion,
 		},
 		{
 			name: "invalid date format",
@@ -520,7 +520,7 @@ func TestValidateUpstreamRegistryBytes(t *testing.T) {
 				}
 			}`,
 			wantErr:       true,
-			errorContains: "description",
+			errorContains: errKeyDescription,
 		},
 	}
 
@@ -726,7 +726,7 @@ func TestValidatePublisherProvidedExtensionsBytes(t *testing.T) {
 				}
 			}`,
 			wantErr:       true,
-			errorContains: "status",
+			errorContains: errKeyStatus,
 		},
 		{
 			name: "invalid status value",
@@ -738,7 +738,7 @@ func TestValidatePublisherProvidedExtensionsBytes(t *testing.T) {
 				}
 			}`,
 			wantErr:       true,
-			errorContains: "status",
+			errorContains: errKeyStatus,
 		},
 		{
 			name: "invalid tier value",
@@ -751,7 +751,7 @@ func TestValidatePublisherProvidedExtensionsBytes(t *testing.T) {
 				}
 			}`,
 			wantErr:       true,
-			errorContains: "tier",
+			errorContains: errKeyTier,
 		},
 		{
 			name: "invalid proxy_port (too high)",
@@ -1057,7 +1057,7 @@ func TestValidateUpstreamRegistry_WithExtensions(t *testing.T) {
 				}
 			}`,
 			wantErr:       true,
-			errorContains: "status",
+			errorContains: errKeyStatus,
 		},
 		{
 			name: "invalid extensions - invalid tier value",
@@ -1087,7 +1087,7 @@ func TestValidateUpstreamRegistry_WithExtensions(t *testing.T) {
 				}
 			}`,
 			wantErr:       true,
-			errorContains: "tier",
+			errorContains: errKeyTier,
 		},
 		{
 			name: "valid registry with extensions in groups",
@@ -1158,7 +1158,7 @@ func TestValidateUpstreamRegistry_WithExtensions(t *testing.T) {
 				}
 			}`,
 			wantErr:       true,
-			errorContains: "status",
+			errorContains: errKeyStatus,
 		},
 	}
 
@@ -1448,7 +1448,7 @@ func TestValidateSkillBytes(t *testing.T) {
 				"version": "1.0.0"
 			}`,
 			wantErr:       true,
-			errorContains: "description",
+			errorContains: errKeyDescription,
 		},
 		{
 			name: "missing required version",
@@ -1458,7 +1458,7 @@ func TestValidateSkillBytes(t *testing.T) {
 				"description": "Extract text and tables"
 			}`,
 			wantErr:       true,
-			errorContains: "version",
+			errorContains: errKeyVersion,
 		},
 		{
 			name: "invalid status value",
@@ -1470,7 +1470,7 @@ func TestValidateSkillBytes(t *testing.T) {
 				"status": "invalid-status"
 			}`,
 			wantErr:       true,
-			errorContains: "status",
+			errorContains: errKeyStatus,
 		},
 		{
 			name: "invalid package registryType",
@@ -1518,7 +1518,7 @@ func TestRegistry_Validate(t *testing.T) {
 		{
 			name: "valid minimal registry",
 			registry: &Registry{
-				Version:     "1.0.0",
+				Version:     testVersion,
 				LastUpdated: "2025-01-01T00:00:00Z",
 				Servers:     map[string]*ImageMetadata{},
 			},
@@ -1557,7 +1557,7 @@ func TestUpstreamRegistry_Validate(t *testing.T) {
 			name: "valid minimal upstream registry",
 			registry: &UpstreamRegistry{
 				Schema:  UpstreamRegistrySchemaURL,
-				Version: "1.0.0",
+				Version: testVersion,
 				Meta: UpstreamMeta{
 					LastUpdated: "2025-01-01T00:00:00Z",
 				},
@@ -1636,7 +1636,7 @@ func TestSkill_Validate(t *testing.T) {
 				Namespace:   "io.github.example",
 				Name:        "my-skill",
 				Description: "A test skill for validation",
-				Version:     "1.0.0",
+				Version:     testVersion,
 			},
 			expectError: false,
 		},
@@ -1651,7 +1651,7 @@ func TestSkill_Validate(t *testing.T) {
 				Namespace:   "io.github.example",
 				Name:        "my-skill",
 				Description: "A test skill for validation",
-				Version:     "1.0.0",
+				Version:     testVersion,
 				Status:      "invalid-status",
 			},
 			expectError: true,

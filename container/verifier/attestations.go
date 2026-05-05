@@ -68,7 +68,7 @@ func bundleFromAttestation(imageRef string, keychain authn.Keychain) ([]sigstore
 		// where the referrers fallback tag doesn't propagate the inner manifest's
 		// artifactType.
 		if !hasSigstoreBundlePrefix(refDesc.ArtifactType) &&
-			refDesc.ArtifactType != "application/vnd.oci.empty.v1+json" &&
+			refDesc.ArtifactType != MediaTypeOCIEmptyV1JSON &&
 			refDesc.ArtifactType != "" {
 			continue
 		}

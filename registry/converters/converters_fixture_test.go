@@ -35,7 +35,7 @@ func TestConverters_Fixtures(t *testing.T) {
 			fixtureDir:   "testdata/image_to_server",
 			inputFile:    "input_github.json",
 			expectedFile: "expected_github.json",
-			serverName:   "github",
+			serverName:   repoSourceGitHub,
 			convertFunc:  "ImageToServer",
 			validateFunc: validateImageToServerConversion,
 		},
@@ -177,7 +177,7 @@ func getServerJSONExtensions(t *testing.T, serverJSON *upstream.ServerJSON, key 
 		return nil
 	}
 
-	stacklokData, ok := serverJSON.Meta.PublisherProvided["io.github.stacklok"].(map[string]interface{})
+	stacklokData, ok := serverJSON.Meta.PublisherProvided[testNamespace].(map[string]interface{})
 	if !ok {
 		return nil
 	}
@@ -214,8 +214,8 @@ func validateImageToServerConversion(t *testing.T, inputData, outputData []byte)
 	require.NotNil(t, extensions, "Extensions should exist for image")
 
 	// Verify key extension fields
-	assert.Equal(t, input.Status, extensions["status"], "Status should be in extensions")
-	assert.Equal(t, input.Tier, extensions["tier"], "Tier should be in extensions")
+	assert.Equal(t, input.Status, extensions[statusKey], "Status should be in extensions")
+	assert.Equal(t, input.Tier, extensions[tierKey], "Tier should be in extensions")
 	assert.NotNil(t, extensions["tools"], "Tools should be in extensions")
 	assert.NotNil(t, extensions["tags"], "Tags should be in extensions")
 

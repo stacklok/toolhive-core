@@ -150,7 +150,7 @@ func getSimpleSigningLayersFromSignatureManifest(manifestRef string, keychain au
 	// Loop through its layers and extract the simple signing layers
 	var results []v1.Descriptor
 	for _, layer := range manifest.Layers {
-		if layer.MediaType == "application/vnd.dev.cosign.simplesigning.v1+json" {
+		if layer.MediaType == MediaTypeCosignSimpleSigningV1JSON {
 			// We found a simple signing layer, store and return it even if we may fail to parse it later
 			results = append(results, layer)
 		}

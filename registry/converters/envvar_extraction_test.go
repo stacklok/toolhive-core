@@ -29,11 +29,11 @@ func TestExtractEnvFromRuntimeArgs(t *testing.T) {
 					InputWithVariables: model.InputWithVariables{
 						Input: model.Input{
 							Value:       "GITHUB_PERSONAL_ACCESS_TOKEN={token}",
-							Description: "Set an environment variable in the runtime",
+							Description: envDescRuntime,
 							IsRequired:  true,
 						},
 						Variables: map[string]model.Input{
-							"token": {
+							valueToken: {
 								IsRequired: true,
 								IsSecret:   true,
 								Format:     "string",
@@ -47,7 +47,7 @@ func TestExtractEnvFromRuntimeArgs(t *testing.T) {
 			expected: []*types.EnvVar{
 				{
 					Name:        "GITHUB_PERSONAL_ACCESS_TOKEN",
-					Description: "Set an environment variable in the runtime",
+					Description: envDescRuntime,
 					Required:    true,
 					Secret:      true,
 				},
@@ -59,8 +59,8 @@ func TestExtractEnvFromRuntimeArgs(t *testing.T) {
 				{
 					InputWithVariables: model.InputWithVariables{
 						Input: model.Input{
-							Value:       "API_KEY={key}",
-							Description: "API key",
+							Value:       envAPIKey + "={key}",
+							Description: envDescAPIKey,
 							IsRequired:  true,
 						},
 						Variables: map[string]model.Input{
@@ -76,7 +76,7 @@ func TestExtractEnvFromRuntimeArgs(t *testing.T) {
 				{
 					InputWithVariables: model.InputWithVariables{
 						Input: model.Input{
-							Value:       "DEBUG=true",
+							Value:       envDebug + "=" + envValueTrue,
 							Description: "Enable debug mode",
 							IsRequired:  false,
 						},
@@ -87,16 +87,16 @@ func TestExtractEnvFromRuntimeArgs(t *testing.T) {
 			},
 			expected: []*types.EnvVar{
 				{
-					Name:        "API_KEY",
-					Description: "API key",
+					Name:        envAPIKey,
+					Description: envDescAPIKey,
 					Required:    true,
 					Secret:      true,
 				},
 				{
-					Name:        "DEBUG",
+					Name:        envDebug,
 					Description: "Enable debug mode",
 					Required:    false,
-					Default:     "true",
+					Default:     envValueTrue,
 				},
 			},
 		},
@@ -106,12 +106,12 @@ func TestExtractEnvFromRuntimeArgs(t *testing.T) {
 				{
 					InputWithVariables: model.InputWithVariables{
 						Input: model.Input{
-							Value:       "TOKEN={token}",
-							Description: "Auth token",
+							Value:       envTokenTpl,
+							Description: envDescAuthToken,
 							IsRequired:  true,
 						},
 						Variables: map[string]model.Input{
-							"token": {
+							valueToken: {
 								IsRequired: true,
 								IsSecret:   true,
 							},
@@ -123,8 +123,8 @@ func TestExtractEnvFromRuntimeArgs(t *testing.T) {
 			},
 			expected: []*types.EnvVar{
 				{
-					Name:        "TOKEN",
-					Description: "Auth token",
+					Name:        envToken,
+					Description: envDescAuthToken,
 					Required:    true,
 					Secret:      true,
 				},
@@ -207,42 +207,42 @@ func TestParseEnvVarFromValue(t *testing.T) {
 	}{
 		{
 			name:        "static value",
-			value:       "DEBUG=true",
+			value:       envDebug + "=" + envValueTrue,
 			description: "Enable debug",
 			variables:   nil,
 			expected: &types.EnvVar{
-				Name:        "DEBUG",
+				Name:        envDebug,
 				Description: "Enable debug",
-				Default:     "true",
+				Default:     envValueTrue,
 			},
 		},
 		{
 			name:        "variable reference with metadata",
-			value:       "API_KEY={key}",
-			description: "API key",
+			value:       envAPIKey + "={key}",
+			description: envDescAPIKey,
 			variables: map[string]model.Input{
 				"key": {
 					IsRequired: true,
 					IsSecret:   true,
-					Default:    "default-key",
+					Default:    envValueDefault,
 				},
 			},
 			expected: &types.EnvVar{
-				Name:        "API_KEY",
-				Description: "API key",
+				Name:        envAPIKey,
+				Description: envDescAPIKey,
 				Required:    true,
 				Secret:      true,
-				Default:     "default-key",
+				Default:     envValueDefault,
 			},
 		},
 		{
 			name:        "variable reference without metadata",
-			value:       "TOKEN={token}",
-			description: "Auth token",
+			value:       envTokenTpl,
+			description: envDescAuthToken,
 			variables:   map[string]model.Input{},
 			expected: &types.EnvVar{
-				Name:        "TOKEN",
-				Description: "Auth token",
+				Name:        envToken,
+				Description: envDescAuthToken,
 			},
 		},
 		{
@@ -297,19 +297,19 @@ func TestExtractEnvironmentVariables(t *testing.T) {
 					{
 						InputWithVariables: model.InputWithVariables{
 							Input: model.Input{
-								Description: "API key",
+								Description: envDescAPIKey,
 								IsRequired:  true,
 								IsSecret:    true,
 							},
 						},
-						Name: "API_KEY",
+						Name: envAPIKey,
 					},
 				},
 			},
 			expected: []*types.EnvVar{
 				{
-					Name:        "API_KEY",
-					Description: "API key",
+					Name:        envAPIKey,
+					Description: envDescAPIKey,
 					Required:    true,
 					Secret:      true,
 				},
@@ -322,12 +322,12 @@ func TestExtractEnvironmentVariables(t *testing.T) {
 					{
 						InputWithVariables: model.InputWithVariables{
 							Input: model.Input{
-								Value:       "TOKEN={token}",
-								Description: "Auth token",
+								Value:       envTokenTpl,
+								Description: envDescAuthToken,
 								IsRequired:  true,
 							},
 							Variables: map[string]model.Input{
-								"token": {
+								valueToken: {
 									IsRequired: true,
 									IsSecret:   true,
 								},
@@ -340,8 +340,8 @@ func TestExtractEnvironmentVariables(t *testing.T) {
 			},
 			expected: []*types.EnvVar{
 				{
-					Name:        "TOKEN",
-					Description: "Auth token",
+					Name:        envToken,
+					Description: envDescAuthToken,
 					Required:    true,
 					Secret:      true,
 				},
@@ -432,7 +432,7 @@ func TestServerJSONToImageMetadata_GitHubServerEnvVars(t *testing.T) {
 		{
 			InputWithVariables: model.InputWithVariables{
 				Input: model.Input{
-					Value:       "true",
+					Value:       envValueTrue,
 					Description: "Run container in interactive mode",
 					IsRequired:  true,
 					Format:      "boolean",
@@ -445,11 +445,11 @@ func TestServerJSONToImageMetadata_GitHubServerEnvVars(t *testing.T) {
 			InputWithVariables: model.InputWithVariables{
 				Input: model.Input{
 					Value:       "GITHUB_PERSONAL_ACCESS_TOKEN={token}",
-					Description: "Set an environment variable in the runtime",
+					Description: envDescRuntime,
 					IsRequired:  true,
 				},
 				Variables: map[string]model.Input{
-					"token": {
+					valueToken: {
 						IsRequired: true,
 						IsSecret:   true,
 						Format:     "string",
@@ -468,7 +468,7 @@ func TestServerJSONToImageMetadata_GitHubServerEnvVars(t *testing.T) {
 	// Verify environment variable was extracted
 	require.Len(t, result.EnvVars, 1)
 	assert.Equal(t, "GITHUB_PERSONAL_ACCESS_TOKEN", result.EnvVars[0].Name)
-	assert.Equal(t, "Set an environment variable in the runtime", result.EnvVars[0].Description)
+	assert.Equal(t, envDescRuntime, result.EnvVars[0].Description)
 	assert.True(t, result.EnvVars[0].Required)
 	assert.True(t, result.EnvVars[0].Secret)
 }

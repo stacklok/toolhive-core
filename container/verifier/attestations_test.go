@@ -49,7 +49,7 @@ func TestHasSigstoreBundlePrefix(t *testing.T) {
 		},
 		{
 			name:  "v0.3 bundle type",
-			input: "application/vnd.dev.sigstore.bundle.v0.3+json",
+			input: MediaTypeSigstoreBundleV03JSON,
 			want:  true,
 		},
 		{
@@ -59,12 +59,12 @@ func TestHasSigstoreBundlePrefix(t *testing.T) {
 		},
 		{
 			name:  "OCI empty type (ambiguous, not a bundle)",
-			input: "application/vnd.oci.empty.v1+json",
+			input: MediaTypeOCIEmptyV1JSON,
 			want:  false,
 		},
 		{
 			name:  "cosign simplesigning type",
-			input: "application/vnd.dev.cosign.simplesigning.v1+json",
+			input: MediaTypeCosignSimpleSigningV1JSON,
 			want:  false,
 		},
 		{
@@ -105,7 +105,7 @@ func TestIsSigstoreBundle(t *testing.T) {
 			name: "config artifactType is sigstore bundle v0.3",
 			img: &fakeImage{manifest: &v1.Manifest{
 				Config: v1.Descriptor{
-					ArtifactType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+					ArtifactType: MediaTypeSigstoreBundleV03JSON,
 				},
 			}},
 			want: true,
@@ -123,10 +123,10 @@ func TestIsSigstoreBundle(t *testing.T) {
 			name: "layer media type is sigstore bundle",
 			img: &fakeImage{manifest: &v1.Manifest{
 				Config: v1.Descriptor{
-					ArtifactType: "application/vnd.oci.empty.v1+json",
+					ArtifactType: MediaTypeOCIEmptyV1JSON,
 				},
 				Layers: []v1.Descriptor{
-					{MediaType: types.MediaType("application/vnd.dev.sigstore.bundle.v0.3+json")},
+					{MediaType: types.MediaType(MediaTypeSigstoreBundleV03JSON)},
 				},
 			}},
 			want: true,
@@ -135,7 +135,7 @@ func TestIsSigstoreBundle(t *testing.T) {
 			name: "neither config nor layers match",
 			img: &fakeImage{manifest: &v1.Manifest{
 				Config: v1.Descriptor{
-					ArtifactType: "application/vnd.oci.empty.v1+json",
+					ArtifactType: MediaTypeOCIEmptyV1JSON,
 				},
 				Layers: []v1.Descriptor{
 					{MediaType: types.MediaType("application/vnd.oci.image.layer.v1.tar+gzip")},
@@ -158,7 +158,7 @@ func TestIsSigstoreBundle(t *testing.T) {
 			img: &fakeImage{manifest: &v1.Manifest{
 				Layers: []v1.Descriptor{
 					{MediaType: types.MediaType("application/octet-stream")},
-					{MediaType: types.MediaType("application/vnd.dev.sigstore.bundle.v0.3+json")},
+					{MediaType: types.MediaType(MediaTypeSigstoreBundleV03JSON)},
 				},
 			}},
 			want: true,
@@ -167,7 +167,7 @@ func TestIsSigstoreBundle(t *testing.T) {
 			name: "cosign simplesigning layer is not a sigstore bundle",
 			img: &fakeImage{manifest: &v1.Manifest{
 				Layers: []v1.Descriptor{
-					{MediaType: types.MediaType("application/vnd.dev.cosign.simplesigning.v1+json")},
+					{MediaType: types.MediaType(MediaTypeCosignSimpleSigningV1JSON)},
 				},
 			}},
 			want: false,
@@ -203,13 +203,13 @@ func TestBundleFromAttestation_FilterPredicates(t *testing.T) {
 	}{
 		{
 			name:     "sigstore bundle v0.3 - accepted without deep inspect",
-			artType:  "application/vnd.dev.sigstore.bundle.v0.3+json",
+			artType:  MediaTypeSigstoreBundleV03JSON,
 			wantSkip: false,
 			wantDeep: false,
 		},
 		{
 			name:     "OCI empty (go-containerregistry bug) - needs deep inspect",
-			artType:  "application/vnd.oci.empty.v1+json",
+			artType:  MediaTypeOCIEmptyV1JSON,
 			wantSkip: false,
 			wantDeep: true,
 		},
@@ -221,7 +221,7 @@ func TestBundleFromAttestation_FilterPredicates(t *testing.T) {
 		},
 		{
 			name:     "cosign simplesigning - fast-path skip",
-			artType:  "application/vnd.dev.cosign.simplesigning.v1+json",
+			artType:  MediaTypeCosignSimpleSigningV1JSON,
 			wantSkip: true,
 			wantDeep: false, // never reached
 		},
@@ -239,7 +239,7 @@ func TestBundleFromAttestation_FilterPredicates(t *testing.T) {
 
 			// Replicate the skip condition from bundleFromAttestation
 			skip := !hasSigstoreBundlePrefix(tt.artType) &&
-				tt.artType != "application/vnd.oci.empty.v1+json" &&
+				tt.artType != MediaTypeOCIEmptyV1JSON &&
 				tt.artType != ""
 			require.Equal(t, tt.wantSkip, skip, "skip predicate mismatch")
 
