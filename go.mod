@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/adrg/xdg v0.5.3
-	github.com/google/cel-go v0.28.0
+	github.com/google/cel-go v0.28.1
 	github.com/google/go-containerregistry v0.21.5
 	github.com/google/uuid v1.6.0
 	github.com/mark3labs/mcp-go v0.53.0
