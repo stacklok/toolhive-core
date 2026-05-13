@@ -14,7 +14,7 @@ import (
 	"github.com/xeipuuv/gojsonschema"
 )
 
-//go:embed data/toolhive-legacy-registry.schema.json data/upstream-registry.schema.json data/publisher-provided.schema.json data/skill.schema.json data/server.schema.json
+//go:embed data/upstream-registry.schema.json data/publisher-provided.schema.json data/skill.schema.json data/server.schema.json
 var embeddedSchemaFS embed.FS
 
 // referencedSchemas lists embedded schema files that declare an $id matching
@@ -50,15 +50,6 @@ func ensurePreloaded() error {
 	return preloadErr
 }
 
-// Validate validates the Registry against the legacy ToolHive registry schema.
-func (r *Registry) Validate() error {
-	data, err := json.Marshal(r)
-	if err != nil {
-		return fmt.Errorf("failed to serialize registry: %w", err)
-	}
-	return validateAgainstSchema(data, "data/toolhive-legacy-registry.schema.json", "registry schema validation failed")
-}
-
 // Validate validates the UpstreamRegistry against the upstream registry schema.
 // It also validates any publisher-provided extensions found in server definitions.
 func (r *UpstreamRegistry) Validate() error {
@@ -89,11 +80,6 @@ func (s *Skill) Validate() error {
 		return fmt.Errorf("failed to serialize skill: %w", err)
 	}
 	return validateAgainstSchema(data, "data/skill.schema.json", "skill schema validation failed")
-}
-
-// ValidateRegistrySchema validates raw registry JSON bytes against the legacy ToolHive registry schema.
-func ValidateRegistrySchema(registryData []byte) error {
-	return validateAgainstSchema(registryData, "data/toolhive-legacy-registry.schema.json", "registry schema validation failed")
 }
 
 // ValidateUpstreamRegistryBytes validates raw upstream registry JSON bytes against the upstream registry schema.
