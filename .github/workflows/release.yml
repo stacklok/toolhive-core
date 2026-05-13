@@ -26,5 +26,4 @@ jobs:
             registry/types/data/skill.schema.json \
             registry/types/data/upstream-registry.schema.json \
             registry/types/data/publisher-provided.schema.json \
-            registry/types/data/toolhive-legacy-registry.schema.json \
             --clobber

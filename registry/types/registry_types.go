@@ -14,13 +14,6 @@ import (
 	"github.com/stacklok/toolhive-core/permissions"
 )
 
-// Updates to the registry schema should be reflected in the JSON schema file located at
-// registry/types/data/toolhive-legacy-registry.schema.json.
-// The schema is used for validation and documentation purposes.
-//
-// The embedded registry.json is automatically validated against the schema during tests.
-// See registry/types/schema_validation_test.go for the validation implementation.
-
 // Group represents a collection of related MCP servers that can be deployed together
 type Group struct {
 	// Name is the identifier for the group, used when referencing the group in commands
