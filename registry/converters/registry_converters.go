@@ -47,7 +47,6 @@ func NewUpstreamRegistryFromToolhiveRegistry(toolhiveReg *registry.Registry) (*r
 		},
 		Data: registry.UpstreamData{
 			Servers: servers,
-			Groups:  []registry.UpstreamGroup{},
 		},
 	}, nil
 }

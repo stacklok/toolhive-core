@@ -35,43 +35,7 @@ func TestValidateUpstreamRegistryBytes(t *testing.T) {
 					"last_updated": "2024-01-15T10:30:00Z"
 				},
 				"data": {
-					"servers": [],
-					"groups": []
-				}
-			}`,
-			wantErr: false,
-		},
-		{
-			name: "valid registry without groups (optional)",
-			data: `{
-				"$schema": "https://raw.githubusercontent.com/stacklok/toolhive-core/main/registry/types/data/upstream-registry.schema.json",
-				"version": "1.0.0",
-				"meta": {
-					"last_updated": "2024-01-15T10:30:00Z"
-				},
-				"data": {
 					"servers": []
-				}
-			}`,
-			wantErr: false,
-		},
-		{
-			name: "valid registry with group",
-			data: `{
-				"$schema": "https://raw.githubusercontent.com/stacklok/toolhive-core/main/registry/types/data/upstream-registry.schema.json",
-				"version": "1.0.0",
-				"meta": {
-					"last_updated": "2024-01-15T10:30:00Z"
-				},
-				"data": {
-					"servers": [],
-					"groups": [
-						{
-							"name": "test-group",
-							"description": "Test group",
-							"servers": []
-						}
-					]
 				}
 			}`,
 			wantErr: false,
@@ -150,25 +114,6 @@ func TestValidateUpstreamRegistryBytes(t *testing.T) {
 			wantErr:       true,
 			errorContains: "date-time",
 		},
-		{
-			name: "missing required group fields",
-			data: `{
-				"version": "1.0.0",
-				"meta": {
-					"last_updated": "2024-01-15T10:30:00Z"
-				},
-				"data": {
-					"servers": [],
-					"groups": [
-						{
-							"name": "incomplete-group"
-						}
-					]
-				}
-			}`,
-			wantErr:       true,
-			errorContains: errKeyDescription,
-		},
 	}
 
 	for _, tt := range tests {
@@ -207,8 +152,7 @@ func TestValidateUpstreamRegistry_RealWorld(t *testing.T) {
 					"version": "1.0.0",
 					"title": "Test Server"
 				}
-			],
-			"groups": []
+			]
 		}
 	}`
 
@@ -736,77 +680,6 @@ func TestValidateUpstreamRegistry_WithExtensions(t *testing.T) {
 			wantErr:       true,
 			errorContains: errKeyTier,
 		},
-		{
-			name: "valid registry with extensions in groups",
-			data: `{
-				"version": "1.0.0",
-				"meta": {
-					"last_updated": "2024-01-15T10:30:00Z"
-				},
-				"data": {
-					"servers": [],
-					"groups": [
-						{
-							"name": "test-group",
-							"description": "A test group",
-							"servers": [
-								{
-									"name": "io.github.stacklok/grouped-server",
-									"description": "A grouped server",
-									"version": "1.0.0",
-									"_meta": {
-										"io.modelcontextprotocol.registry/publisher-provided": {
-											"io.github.stacklok": {
-												"ghcr.io/test/grouped:v1.0.0": {
-													"status": "active"
-												}
-											}
-										}
-									}
-								}
-							]
-						}
-					]
-				}
-			}`,
-			wantErr: false,
-		},
-		{
-			name: "invalid extensions in group server",
-			data: `{
-				"version": "1.0.0",
-				"meta": {
-					"last_updated": "2024-01-15T10:30:00Z"
-				},
-				"data": {
-					"servers": [],
-					"groups": [
-						{
-							"name": "test-group",
-							"description": "A test group",
-							"servers": [
-								{
-									"name": "io.github.stacklok/grouped-server",
-									"description": "A grouped server",
-									"version": "1.0.0",
-									"_meta": {
-										"io.modelcontextprotocol.registry/publisher-provided": {
-											"io.github.stacklok": {
-												"ghcr.io/test/grouped:v1.0.0": {
-													"status": "invalid-status"
-												}
-											}
-										}
-									}
-								}
-							]
-						}
-					]
-				}
-			}`,
-			wantErr:       true,
-			errorContains: errKeyStatus,
-		},
 	}
 
 	for _, tt := range tests {
@@ -1332,24 +1205,6 @@ func TestUpstreamRegistrySchemaVersionSync(t *testing.T) {
 			schemaPath, schemaDate, expectedDate, expectedDate, expectedDate)
 	}
 
-	// Also check groups schema if present
-	groupServerItems, ok := walkJSONObjects(schema, "properties", "data", "properties", "groups", "items", "properties", "servers", "items")
-	if ok {
-		groupRefURL, ok := groupServerItems["$ref"].(string)
-		if ok {
-			groupMatches := re.FindStringSubmatch(groupRefURL)
-			if len(groupMatches) == 2 {
-				groupSchemaDate := groupMatches[1]
-				if groupSchemaDate != expectedDate {
-					t.Errorf("Groups schema version mismatch!\n"+
-						"  Groups $ref date: %s\n"+
-						"  Expected: %s\n\n"+
-						"To fix: Update data.properties.groups.items.properties.servers.items.$ref",
-						groupSchemaDate, expectedDate)
-				}
-			}
-		}
-	}
 }
 
 // findExternalRefs recursively walks a parsed JSON value and collects all

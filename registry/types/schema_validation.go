@@ -195,31 +195,13 @@ func validateRegistryExtensions(registryData []byte) error {
 
 	var errs []string
 	if servers, ok := data["servers"].([]any); ok {
-		errs = append(errs, validateServerList(servers, "")...)
-	}
-	if groups, ok := data["groups"].([]any); ok {
-		errs = append(errs, validateGroupServers(groups)...)
+		errs = append(errs, validateServerList(servers)...)
 	}
 
 	return formatExtensionErrors(errs)
 }
 
-func validateGroupServers(groups []any) []string {
-	var errs []string
-	for _, group := range groups {
-		groupMap, ok := group.(map[string]any)
-		if !ok {
-			continue
-		}
-		groupName, _ := groupMap["name"].(string)
-		if groupServers, ok := groupMap["servers"].([]any); ok {
-			errs = append(errs, validateServerList(groupServers, groupName)...)
-		}
-	}
-	return errs
-}
-
-func validateServerList(servers []any, groupName string) []string {
+func validateServerList(servers []any) []string {
 	var errs []string
 	for i, server := range servers {
 		serverMap, ok := server.(map[string]any)
@@ -227,9 +209,6 @@ func validateServerList(servers []any, groupName string) []string {
 			continue
 		}
 		serverName := getServerName(serverMap, i)
-		if groupName != "" {
-			serverName = fmt.Sprintf("group[%s].%s", groupName, serverName)
-		}
 		if err := validateServerExtensions(serverMap, serverName); err != nil {
 			errs = append(errs, err.Error())
 		}

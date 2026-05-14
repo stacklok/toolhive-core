@@ -12,7 +12,7 @@ const UpstreamRegistrySchemaURL = "https://raw.githubusercontent.com/stacklok/to
 	"registry/types/data/upstream-registry.schema.json"
 
 // UpstreamRegistry is the unified registry format that stores servers in upstream
-// ServerJSON format with proper meta/data separation and groups support.
+// ServerJSON format with proper meta/data separation.
 type UpstreamRegistry struct {
 	// Schema is the JSON schema URL for validation
 	Schema string `json:"$schema" yaml:"$schema"`
@@ -33,26 +33,11 @@ type UpstreamMeta struct {
 	LastUpdated string `json:"last_updated" yaml:"last_updated"`
 }
 
-// UpstreamData contains the actual registry content (servers, groups, and skills)
+// UpstreamData contains the actual registry content (servers and skills)
 type UpstreamData struct {
 	// Servers contains the server definitions in upstream MCP format
 	Servers []upstreamv0.ServerJSON `json:"servers" yaml:"servers"`
 
-	// Groups contains grouped collections of servers (optional, for future use)
-	Groups []UpstreamGroup `json:"groups,omitempty" yaml:"groups,omitempty"`
-
 	// Skills contains the skill definitions
 	Skills []Skill `json:"skills,omitempty" yaml:"skills,omitempty"`
-}
-
-// UpstreamGroup represents a named collection of related MCP servers
-type UpstreamGroup struct {
-	// Name is the unique identifier for the group
-	Name string `json:"name" yaml:"name"`
-
-	// Description explains the purpose of this group
-	Description string `json:"description" yaml:"description"`
-
-	// Servers contains the server definitions in this group
-	Servers []upstreamv0.ServerJSON `json:"servers" yaml:"servers"`
 }

@@ -24,7 +24,6 @@ func TestUpstreamRegistry_JSONSerialization(t *testing.T) {
 		},
 		Data: UpstreamData{
 			Servers: []upstreamv0.ServerJSON{},
-			Groups:  []UpstreamGroup{},
 		},
 	}
 
@@ -54,7 +53,6 @@ func TestUpstreamRegistry_YAMLSerialization(t *testing.T) {
 		},
 		Data: UpstreamData{
 			Servers: []upstreamv0.ServerJSON{},
-			Groups:  []UpstreamGroup{},
 		},
 	}
 
@@ -72,36 +70,6 @@ func TestUpstreamRegistry_YAMLSerialization(t *testing.T) {
 	assert.Equal(t, registry.Meta.LastUpdated, decoded.Meta.LastUpdated)
 }
 
-func TestUpstreamRegistry_WithGroups(t *testing.T) {
-	t.Parallel()
-	registry := &UpstreamRegistry{
-		Schema:  UpstreamRegistrySchemaURL,
-		Version: testVersion,
-		Meta: UpstreamMeta{
-			LastUpdated: time.Now().Format(time.RFC3339),
-		},
-		Data: UpstreamData{
-			Servers: []upstreamv0.ServerJSON{},
-			Groups: []UpstreamGroup{
-				{
-					Name:        "test-group",
-					Description: "Test group for testing",
-					Servers:     []upstreamv0.ServerJSON{},
-				},
-			},
-		},
-	}
-
-	jsonData, err := json.Marshal(registry)
-	require.NoError(t, err)
-
-	var decoded UpstreamRegistry
-	err = json.Unmarshal(jsonData, &decoded)
-	require.NoError(t, err)
-	assert.Len(t, decoded.Data.Groups, 1)
-	assert.Equal(t, "test-group", decoded.Data.Groups[0].Name)
-}
-
 func TestUpstreamRegistry_SchemaField(t *testing.T) {
 	t.Parallel()
 
@@ -113,7 +81,6 @@ func TestUpstreamRegistry_SchemaField(t *testing.T) {
 		},
 		Data: UpstreamData{
 			Servers: []upstreamv0.ServerJSON{},
-			Groups:  []UpstreamGroup{},
 		},
 	}
 
@@ -155,7 +122,7 @@ func TestRegistryMeta_TimeFormat(t *testing.T) {
 func TestRegistryData_EmptyOptionalFields(t *testing.T) {
 	t.Parallel()
 
-	// Test that groups and skills can be omitted (omitempty)
+	// Test that skills can be omitted (omitempty)
 	data := UpstreamData{
 		Servers: []upstreamv0.ServerJSON{},
 	}
@@ -163,18 +130,15 @@ func TestRegistryData_EmptyOptionalFields(t *testing.T) {
 	jsonData, err := json.Marshal(data)
 	require.NoError(t, err)
 
-	// Groups and skills should not appear in JSON when nil (omitempty behavior)
-	assert.NotContains(t, string(jsonData), "groups")
+	// Skills should not appear in JSON when nil (omitempty behavior)
 	assert.NotContains(t, string(jsonData), "skills")
 
-	// Test with empty slices - also omitted due to omitempty
-	data.Groups = []UpstreamGroup{}
+	// Test with empty slice - also omitted due to omitempty
 	data.Skills = []Skill{}
 	jsonData, err = json.Marshal(data)
 	require.NoError(t, err)
 
 	// Empty arrays are also omitted with omitempty
-	assert.NotContains(t, string(jsonData), "groups")
 	assert.NotContains(t, string(jsonData), "skills")
 }
 
@@ -218,31 +182,4 @@ func TestUpstreamRegistry_WithSkills(t *testing.T) {
 	assert.Equal(t, testVersion, decoded.Data.Skills[0].Version)
 	require.Len(t, decoded.Data.Skills[0].Packages, 1)
 	assert.Equal(t, "oci", decoded.Data.Skills[0].Packages[0].RegistryType)
-}
-
-func TestRegistryGroup_Structure(t *testing.T) {
-	t.Parallel()
-
-	group := UpstreamGroup{
-		Name:        "test-group",
-		Description: "A test group for testing purposes",
-		Servers: []upstreamv0.ServerJSON{
-			{
-				Name:        "io.test/server1",
-				Description: "Test server 1",
-				Version:     testVersion,
-			},
-		},
-	}
-
-	jsonData, err := json.Marshal(group)
-	require.NoError(t, err)
-
-	var decoded UpstreamGroup
-	err = json.Unmarshal(jsonData, &decoded)
-	require.NoError(t, err)
-	assert.Equal(t, group.Name, decoded.Name)
-	assert.Equal(t, group.Description, decoded.Description)
-	assert.Len(t, decoded.Servers, 1)
-	assert.Equal(t, "io.test/server1", decoded.Servers[0].Name)
 }
