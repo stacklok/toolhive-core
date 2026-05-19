@@ -13,4 +13,5 @@ const (
 	testErrRegionMissing    = "AWS RDS IAM region is not configured"
 	testErrRegionConfigured = "dynamicAuth.awsRdsIam.region is required"
 	testDatabase            = "appdb"
+	testRegion              = "us-east-1"
 )

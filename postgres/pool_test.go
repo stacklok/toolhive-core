@@ -44,6 +44,28 @@ func TestNewPool_DynamicAuthMisconfigured(t *testing.T) {
 	assert.Contains(t, err.Error(), "dynamicAuth.awsRdsIam.region is required")
 }
 
+// TestNewPool_DynamicAuthAndBeforeConnectAreMutuallyExclusive verifies that
+// NewPool refuses the ambiguous combination rather than silently dropping
+// one hook. The failure mode of a silently-replaced auth hook — production
+// tokens expiring ~15 minutes after deploy — is severe enough that we want
+// a loud rejection at construction time.
+func TestNewPool_DynamicAuthAndBeforeConnectAreMutuallyExclusive(t *testing.T) {
+	t.Parallel()
+
+	cfg := validConfig()
+	cfg.SSLMode = testSSLModeDisable
+	cfg.DynamicAuth = &DynamicAuthConfig{
+		AWSRDSIAM: &DynamicAuthAWSRDSIAM{Region: testRegion},
+	}
+
+	pool, err := NewPool(t.Context(), cfg,
+		WithBeforeConnect(func(context.Context, *pgx.ConnConfig) error { return nil }),
+	)
+	require.Error(t, err)
+	assert.Nil(t, pool)
+	assert.Contains(t, err.Error(), "mutually exclusive")
+}
+
 // TestNewPool_LazyConnect verifies that NewPool returns successfully even
 // when the database is unreachable — pgxpool establishes connections
 // lazily on first Acquire, not at construction time. Dial errors surface

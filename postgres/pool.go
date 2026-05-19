@@ -30,9 +30,13 @@ type options struct {
 }
 
 // WithBeforeConnect installs a hook that runs immediately before pgx dials.
-// It overrides the BeforeConnect hook that NewPool would otherwise install
-// from cfg.DynamicAuth — callers that need to layer their own logic should
-// invoke NewDynamicAuthFunc explicitly and combine the results.
+//
+// NewPool rejects a combination of WithBeforeConnect and cfg.DynamicAuth — a
+// silently-replaced auth hook would leave production tokens to expire 15
+// minutes after deploy. Callers that need both must call NewDynamicAuthFunc
+// explicitly, compose the two hooks themselves in the order they want, and
+// pass the composed result via WithBeforeConnect (with cfg.DynamicAuth left
+// nil so this package does not also try to install an auth hook).
 func WithBeforeConnect(fn BeforeConnectFn) Option {
 	return func(o *options) { o.beforeConnect = fn }
 }
@@ -50,9 +54,15 @@ func WithLogger(logger *slog.Logger) Option {
 	return func(o *options) { o.logger = logger }
 }
 
-// NewPool creates a *pgxpool.Pool from cfg. When cfg.DynamicAuth is set and
-// the caller does not supply WithBeforeConnect, NewPool installs the
-// appropriate dynamic-auth hook automatically.
+// NewPool creates a *pgxpool.Pool from cfg. When cfg.DynamicAuth is set,
+// NewPool installs the appropriate dynamic-auth hook on BeforeConnect.
+//
+// Passing both cfg.DynamicAuth and WithBeforeConnect is an error — the
+// failure mode of a silently-replaced auth hook (tokens expiring 15 min
+// after deploy) is severe enough to refuse the ambiguity. Callers that
+// genuinely want to layer logic on top of dynamic auth should call
+// NewDynamicAuthFunc, compose the hooks themselves, and pass the
+// composition via WithBeforeConnect with cfg.DynamicAuth left nil.
 //
 // cfg is validated; cfg is not mutated.
 func NewPool(ctx context.Context, cfg *Config, opts ...Option) (*pgxpool.Pool, error) {
@@ -72,6 +82,12 @@ func NewPool(ctx context.Context, cfg *Config, opts ...Option) (*pgxpool.Pool, e
 		logger = slog.Default()
 	}
 
+	if cfg.DynamicAuth != nil && o.beforeConnect != nil {
+		return nil, errors.New("cfg.DynamicAuth and WithBeforeConnect are mutually exclusive; " +
+			"to layer hooks, call NewDynamicAuthFunc, compose with your hook, " +
+			"and pass the composition via WithBeforeConnect with cfg.DynamicAuth = nil")
+	}
+
 	poolConfig, err := buildPoolConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -80,7 +96,7 @@ func NewPool(ctx context.Context, cfg *Config, opts ...Option) (*pgxpool.Pool, e
 	applyPoolTuning(poolConfig, cfg)
 
 	beforeConnect := o.beforeConnect
-	if beforeConnect == nil && cfg.DynamicAuth != nil {
+	if cfg.DynamicAuth != nil {
 		beforeConnect, err = NewDynamicAuthFunc(ctx, cfg, cfg.User)
 		if err != nil {
 			return nil, err

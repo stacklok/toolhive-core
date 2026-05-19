@@ -104,7 +104,7 @@ func TestConfig_Validate(t *testing.T) {
 			cfg: &Config{
 				Host: "h", Port: 5432, User: "u", Database: "d",
 				DynamicAuth: &DynamicAuthConfig{
-					AWSRDSIAM: &DynamicAuthAWSRDSIAM{Region: "us-east-1"},
+					AWSRDSIAM: &DynamicAuthAWSRDSIAM{Region: testRegion},
 				},
 			},
 		},
@@ -198,7 +198,7 @@ func TestConfig_LogValueRedactsSecrets(t *testing.T) {
 		MigrationPassword: "should-not-appear-either",
 		Database:          "appdb",
 		SSLMode:           "require",
-		DynamicAuth:       &DynamicAuthConfig{AWSRDSIAM: &DynamicAuthAWSRDSIAM{Region: "us-east-1"}},
+		DynamicAuth:       &DynamicAuthConfig{AWSRDSIAM: &DynamicAuthAWSRDSIAM{Region: testRegion}},
 	}
 
 	var buf bytes.Buffer
