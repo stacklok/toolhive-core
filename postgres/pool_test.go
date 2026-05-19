@@ -78,6 +78,44 @@ func TestNewPool_OptionsArePopulated(t *testing.T) {
 	assert.NotNil(t, o.logger)
 }
 
+// TestBuildPoolConfig_AssignsFieldsStructurally verifies the structural
+// override path: caller-supplied Host and Database land verbatim on the pgx
+// ConnConfig instead of going through URL parsing. This is the test guard
+// against the DSN-injection class flagged in code review — a `@` in Host or
+// a `?` in Database is preserved as-is and never reinterpreted by url.Parse.
+func TestBuildPoolConfig_AssignsFieldsStructurally(t *testing.T) {
+	t.Parallel()
+
+	cfg := &Config{
+		Host:     "db-1.cluster.example.com",
+		Port:     5433,
+		User:     "appuser",
+		Password: "s3cret",
+		Database: testDatabase,
+		SSLMode:  "require",
+	}
+
+	pc, err := buildPoolConfig(cfg)
+	require.NoError(t, err)
+	assert.Equal(t, "db-1.cluster.example.com", pc.ConnConfig.Host)
+	assert.Equal(t, uint16(5433), pc.ConnConfig.Port)
+	assert.Equal(t, "appuser", pc.ConnConfig.User)
+	assert.Equal(t, "s3cret", pc.ConnConfig.Password)
+	assert.Equal(t, "appdb", pc.ConnConfig.Database)
+	assert.NotNil(t, pc.ConnConfig.TLSConfig, "sslmode=require must produce a non-nil tls.Config")
+}
+
+func TestBuildPoolConfig_SSLModeDisableLeavesTLSUnset(t *testing.T) {
+	t.Parallel()
+
+	cfg := validConfig()
+	cfg.SSLMode = testSSLModeDisable
+
+	pc, err := buildPoolConfig(cfg)
+	require.NoError(t, err)
+	assert.Nil(t, pc.ConnConfig.TLSConfig, "sslmode=disable must produce a nil tls.Config")
+}
+
 func TestApplyPoolTuning(t *testing.T) {
 	t.Parallel()
 

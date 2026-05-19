@@ -8,7 +8,17 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strings"
 	"time"
+)
+
+// Characters rejected in Host and Database to prevent DSN-string injection
+// when these values flow into a libpq URL. Host disallows the URL
+// delimiters that could shift the authority section; Database disallows
+// the delimiters that could shift the query section.
+const (
+	hostForbiddenChars     = "@/?#"
+	databaseForbiddenChars = "?#/"
 )
 
 // DefaultSSLMode is applied by BuildConnectionStringWithAuth when Config.SSLMode
@@ -95,14 +105,20 @@ func (c *Config) Validate() error {
 	if c.Host == "" {
 		return errors.New("host is required")
 	}
-	if c.Port == 0 {
-		return errors.New("port is required")
+	if strings.ContainsAny(c.Host, hostForbiddenChars) || strings.ContainsAny(c.Host, " \t\r\n") {
+		return fmt.Errorf("host must not contain any of %q or whitespace", hostForbiddenChars)
+	}
+	if c.Port <= 0 || c.Port > 65535 {
+		return errors.New("port must be between 1 and 65535")
 	}
 	if c.User == "" {
 		return errors.New("user is required")
 	}
 	if c.Database == "" {
 		return errors.New("database is required")
+	}
+	if strings.ContainsAny(c.Database, databaseForbiddenChars) || strings.ContainsAny(c.Database, " \t\r\n") {
+		return fmt.Errorf("database must not contain any of %q or whitespace", databaseForbiddenChars)
 	}
 	if c.DynamicAuth != nil {
 		if c.DynamicAuth.AWSRDSIAM == nil {

@@ -45,7 +45,27 @@ func TestConfig_Validate(t *testing.T) {
 		{
 			name:    "missing port",
 			cfg:     &Config{Host: "h", User: "u", Database: "d"},
-			wantErr: "port is required",
+			wantErr: "port must be between 1 and 65535",
+		},
+		{
+			name:    "port out of range",
+			cfg:     &Config{Host: "h", Port: 65536, User: "u", Database: "d"},
+			wantErr: "port must be between 1 and 65535",
+		},
+		{
+			name:    "host contains @ rejected",
+			cfg:     &Config{Host: "good.rds@evil.example.com", Port: 5432, User: "u", Database: "d"},
+			wantErr: `host must not contain any of "@/?#"`,
+		},
+		{
+			name:    "host contains whitespace rejected",
+			cfg:     &Config{Host: "rds .example.com", Port: 5432, User: "u", Database: "d"},
+			wantErr: "host must not contain",
+		},
+		{
+			name:    "database contains ? rejected",
+			cfg:     &Config{Host: "h", Port: 5432, User: "u", Database: "appdb?sslmode=disable"},
+			wantErr: `database must not contain any of "?#/"`,
 		},
 		{
 			name:    "missing user",

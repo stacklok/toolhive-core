@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -71,9 +72,9 @@ func NewPool(ctx context.Context, cfg *Config, opts ...Option) (*pgxpool.Pool, e
 		logger = slog.Default()
 	}
 
-	poolConfig, err := pgxpool.ParseConfig(cfg.ConnectionString())
+	poolConfig, err := buildPoolConfig(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse connection string: %w", err)
+		return nil, err
 	}
 
 	applyPoolTuning(poolConfig, cfg)
@@ -99,6 +100,35 @@ func NewPool(ctx context.Context, cfg *Config, opts ...Option) (*pgxpool.Pool, e
 
 	logger.LogAttrs(ctx, slog.LevelInfo, "postgres connection pool created", slog.Any("config", cfg))
 	return pool, nil
+}
+
+// buildPoolConfig assembles a *pgxpool.Config without exposing
+// caller-controlled fields to URL parsing. SSL configuration is bootstrapped
+// from a minimal DSN — sslmode is the one field that pgx must translate into
+// a *tls.Config — and the connection target is then assigned structurally.
+// This eliminates the DSN-injection paths that would otherwise let a `@` in
+// Host or a `?` in Database shift the authority or query section of the URL.
+func buildPoolConfig(cfg *Config) (*pgxpool.Config, error) {
+	sslMode := cfg.SSLMode
+	if sslMode == "" {
+		sslMode = DefaultSSLMode
+	}
+
+	// SSLMode values are constrained by pgx (disable/allow/prefer/require/
+	// verify-ca/verify-full); url.QueryEscape is belt-and-suspenders.
+	bootDSN := "postgres://localhost?sslmode=" + url.QueryEscape(sslMode)
+	pc, err := pgxpool.ParseConfig(bootDSN)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize pool config: %w", err)
+	}
+
+	pc.ConnConfig.Host = cfg.Host
+	pc.ConnConfig.Port = uint16(cfg.Port) //nolint:gosec // G115: Port is bounded by Validate (1..65535).
+	pc.ConnConfig.User = cfg.User
+	pc.ConnConfig.Password = cfg.Password
+	pc.ConnConfig.Database = cfg.Database
+
+	return pc, nil
 }
 
 // applyPoolTuning copies pool-sizing knobs from cfg onto poolConfig, leaving
