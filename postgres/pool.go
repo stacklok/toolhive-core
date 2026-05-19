@@ -137,8 +137,8 @@ func applyPoolTuning(poolConfig *pgxpool.Config, cfg *Config) {
 	if cfg.MaxOpenConns > 0 {
 		poolConfig.MaxConns = cfg.MaxOpenConns
 	}
-	if cfg.MaxIdleConns > 0 {
-		poolConfig.MinConns = cfg.MaxIdleConns
+	if cfg.MinConns > 0 {
+		poolConfig.MinConns = cfg.MinConns
 	}
 	if cfg.ConnMaxLifetime > 0 {
 		poolConfig.MaxConnLifetime = cfg.ConnMaxLifetime

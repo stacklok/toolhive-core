@@ -121,7 +121,7 @@ func TestApplyPoolTuning(t *testing.T) {
 
 	cfg := validConfig()
 	cfg.MaxOpenConns = 17
-	cfg.MaxIdleConns = 3
+	cfg.MinConns = 3
 	cfg.ConnMaxLifetime = 42 * time.Minute
 
 	pc, err := pgxpool.ParseConfig(cfg.ConnectionString())

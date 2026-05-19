@@ -73,9 +73,16 @@ type Config struct {
 	// zero, pgxpool's default is used.
 	MaxOpenConns int32
 
-	// MaxIdleConns sets the minimum number of idle connections the pool tries
-	// to maintain. When zero, pgxpool's default is used.
-	MaxIdleConns int32
+	// MinConns is the minimum number of connections pgxpool actively
+	// maintains in the pool — the pool keeps this many connections open
+	// even when the application is idle. When zero, pgxpool's default is
+	// used.
+	//
+	// Note for readers used to database/sql: this is the opposite of
+	// database/sql's MaxIdleConns (which is a ceiling on idle
+	// connections). pgxpool has no idle-ceiling concept; the floor is the
+	// only knob.
+	MinConns int32
 
 	// ConnMaxLifetime is the maximum lifetime of a connection. When zero,
 	// pgxpool's default is used.
