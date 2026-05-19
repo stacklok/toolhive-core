@@ -62,9 +62,26 @@ PostgreSQL enum array types defined in the caller's schema):
 	    }),
 	)
 
-WithBeforeConnect overrides the auto-installed dynamic-auth hook. Callers
-that need to layer additional logic on top should call NewDynamicAuthFunc
-explicitly and compose the result.
+WithBeforeConnect installs a BeforeConnect hook directly. It is mutually
+exclusive with Config.DynamicAuth — NewPool refuses both, because silently
+dropping one would leave production tokens to expire ~15 minutes after
+deploy. Callers that genuinely need both should call NewDynamicAuthFunc,
+compose with their hook, and pass the composition via WithBeforeConnect
+with Config.DynamicAuth left nil.
+
+# TLS and SSL Mode
+
+DefaultSSLMode is "require", which mandates an encrypted connection but
+does not verify the server certificate against a CA. This defends against
+passive eavesdropping; it does not defend against an active attacker that
+can present a forged certificate. For production deployments against cloud
+Postgres services that publish a CA bundle (for example AWS RDS, Google
+Cloud SQL, Azure Database for PostgreSQL), set SSLMode to "verify-full" and
+configure pgx with the appropriate CA roots — typically by placing the
+bundle on disk and setting PGSSLROOTCERT, or by attaching a *tls.Config via
+WithAfterConnect. "require" is kept as the package default because tighter
+modes break self-signed and dev environments out of the box; production
+callers should opt up explicitly.
 
 # Logging
 

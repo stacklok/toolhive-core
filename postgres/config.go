@@ -21,10 +21,11 @@ const (
 	databaseForbiddenChars = "?#/"
 )
 
-// DefaultSSLMode is applied by BuildConnectionStringWithAuth when Config.SSLMode
-// is empty. "require" is the safe production default: encryption is mandatory
-// but the server certificate is not validated against a CA. Callers that need
-// stricter behavior should set SSLMode to "verify-ca" or "verify-full".
+// DefaultSSLMode is applied when Config.SSLMode is empty. It mandates an
+// encrypted connection but does not verify the server certificate against a
+// CA — encryption-only, not authentication. Use "verify-ca" or "verify-full"
+// when the deployment provides a CA bundle (for example, cloud Postgres
+// services); see the package overview for production guidance.
 const DefaultSSLMode = "require"
 
 // Config configures a PostgreSQL connection pool. Password fields are
