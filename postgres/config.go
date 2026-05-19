@@ -131,7 +131,7 @@ func (c *Config) Validate() error {
 		if c.DynamicAuth.AWSRDSIAM == nil {
 			return errors.New("dynamicAuth is set but no supported auth method (e.g., awsRdsIam) is configured")
 		}
-		if c.DynamicAuth.AWSRDSIAM != nil && c.DynamicAuth.AWSRDSIAM.Region == "" {
+		if c.DynamicAuth.AWSRDSIAM.Region == "" {
 			return errors.New("dynamicAuth.awsRdsIam.region is required")
 		}
 	}
