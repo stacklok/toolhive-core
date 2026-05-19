@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+// Stability: Alpha
+
 /*
 Package postgres provides a shared PostgreSQL connection layer for the
 ToolHive ecosystem. It wraps github.com/jackc/pgx/v5/pgxpool with a single

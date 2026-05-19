@@ -73,6 +73,7 @@ task license-fix   # Add missing license headers
 | `httperr` | Wrap errors with HTTP status codes; use `WithCode()`, `Code()`, `New()` |
 | `logging` | Pre-configured `*slog.Logger` factory with consistent ToolHive defaults (Alpha) |
 | `oci/skills` | OCI artifact types, media types, and registry operations for ToolHive skills (Alpha) |
+| `postgres` | PostgreSQL connection pool with optional AWS RDS IAM dynamic auth (Alpha) |
 | `recovery` | HTTP panic recovery middleware (Beta) |
 | `validation/http` | RFC 7230/8707 compliant HTTP header and URI validation |
 | `validation/group` | Group name validation (lowercase alphanumeric, underscore, dash, space) |
