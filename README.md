@@ -27,6 +27,7 @@ The ToolHive ecosystem spans multiple Go repositories, and several of these proj
 | `httperr` | Stable | Wrap errors with HTTP status codes |
 | `logging` | Alpha | Pre-configured `*slog.Logger` factory with consistent ToolHive defaults |
 | `oci/skills` | Alpha | OCI artifact types, media types, and registry operations for skills |
+| `postgres` | Alpha | PostgreSQL connection pool with optional AWS RDS IAM dynamic auth |
 | `recovery` | Beta | HTTP panic recovery middleware |
 | `validation/http` | Stable | RFC 7230/8707 compliant HTTP header and URI validation |
 | `validation/group` | Stable | Group name validation |
