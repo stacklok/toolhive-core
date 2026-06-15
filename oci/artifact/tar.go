@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-package skills
+package artifact
 
 import (
 	"archive/tar"
