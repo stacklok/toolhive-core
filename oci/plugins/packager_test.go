@@ -653,3 +653,42 @@ func writeFile(t *testing.T, dir, relPath, content string) {
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0750))
 	require.NoError(t, os.WriteFile(path, []byte(content), 0600))
 }
+
+// TestPackager_Package_PreservesFileMode verifies that an executable file's
+// permission bits survive packaging rather than being flattened to 0644.
+func TestPackager_Package_PreservesFileMode(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeManifest(t, dir, `{
+  "name": "test-plugin",
+  "description": "plugin with an executable hook",
+  "version": "1.0.0",
+  "hooks": {"PreToolUse": [{"command": "scripts/hook.sh"}]}
+}`)
+	scriptPath := filepath.Join(dir, "scripts", "hook.sh")
+	require.NoError(t, os.MkdirAll(filepath.Dir(scriptPath), 0750))
+	require.NoError(t, os.WriteFile(scriptPath, []byte("#!/bin/sh\necho hook\n"), 0700)) //#nosec G306 -- test fixture must be executable
+
+	store, err := NewStore(t.TempDir())
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	result, err := NewPackager(store).Package(ctx, dir, PackageOptions{Epoch: time.Unix(0, 0).UTC()})
+	require.NoError(t, err)
+
+	layerBytes, err := store.GetBlob(ctx, result.LayerDigest)
+	require.NoError(t, err)
+
+	files, err := artifact.DecompressTar(layerBytes)
+	require.NoError(t, err)
+
+	var found bool
+	for _, f := range files {
+		if f.Path == "scripts/hook.sh" {
+			found = true
+			assert.Equal(t, int64(0700), f.Mode&0777, "executable bit should be preserved in the layer")
+		}
+	}
+	assert.True(t, found, "scripts/hook.sh not found in layer")
+}

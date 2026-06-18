@@ -35,8 +35,10 @@ const (
 	maxPluginFiles = 1_000
 
 	// maxPluginTotalSize limits the total aggregate size of all files in a plugin
-	// directory to prevent memory exhaustion during packaging (100 MB).
-	maxPluginTotalSize int64 = 100 * 1024 * 1024
+	// directory to prevent memory exhaustion during packaging. Kept below
+	// artifact.MaxDecompressedSize (100 MB) so that per-file tar header overhead
+	// cannot push a packaged artifact past the limit enforced on extraction.
+	maxPluginTotalSize int64 = 95 * 1024 * 1024
 
 	pluginLayerAnnotation = "plugin.tar.gz"
 )
@@ -68,11 +70,18 @@ type pluginManifest struct {
 	Requires     json.RawMessage `json:"requires,omitempty"`
 }
 
+// pluginFile is a regular file collected from a plugin directory, retaining its
+// permission bits so executable scripts survive a package/extract round-trip.
+type pluginFile struct {
+	content []byte
+	mode    int64
+}
+
 // pluginDirContent holds the raw files and parsed metadata from a plugin directory.
 type pluginDirContent struct {
 	manifest []byte
-	// files maps relative paths (e.g., "commands/foo.md") to content.
-	files map[string][]byte
+	// files maps relative paths (e.g., "commands/foo.md") to file content and mode.
+	files map[string]pluginFile
 	// pm is the parsed manifest.
 	pm *pluginManifest
 }
@@ -110,6 +119,12 @@ func DefaultPackageOptions() PackageOptions {
 func (p *Packager) Package(ctx context.Context, pluginDir string, opts PackageOptions) (*PackageResult, error) {
 	if len(opts.Platforms) == 0 {
 		opts.Platforms = artifact.DefaultPlatforms
+	}
+	// Normalize a zero epoch so the OCI config (which marshals opts.Epoch as-is)
+	// agrees with the tar/gzip layers (which default a zero epoch to Unix 0)
+	// when callers pass a bare PackageOptions{}.
+	if opts.Epoch.IsZero() {
+		opts.Epoch = time.Unix(0, 0).UTC()
 	}
 
 	content, err := readPluginDirectory(pluginDir)
@@ -192,7 +207,26 @@ func readPluginDirectory(dir string) (*pluginDirContent, error) {
 	}
 
 	manifestPath := filepath.Join(dir, ManifestFileName)
-	manifest, err := os.ReadFile(manifestPath) //#nosec G304 -- path constructed from user-provided plugin directory
+
+	// Lstat and size-check before reading: reject a symlinked manifest (TOCTOU
+	// race against validatePluginDir) and avoid allocating an oversized file
+	// before parseManifest's size check would reject it.
+	fi, err := os.Lstat(manifestPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%s not found in plugin directory: %w", ManifestFileName, ErrPluginManifestMissing)
+		}
+		return nil, fmt.Errorf("checking %s: %w", ManifestFileName, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s must be a regular file: %w", ManifestFileName, ErrInvalidPluginFile)
+	}
+	if fi.Size() > maxManifestSize {
+		return nil, fmt.Errorf("manifest file size %d exceeds maximum of %d bytes: %w",
+			fi.Size(), maxManifestSize, ErrInvalidPluginManifest)
+	}
+
+	manifest, err := os.ReadFile(manifestPath) //#nosec G304 -- validated dir; Lstat guard above rejects symlinks
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("%s not found in plugin directory: %w", ManifestFileName, ErrPluginManifestMissing)
@@ -234,9 +268,12 @@ func validatePluginDir(dir string) error {
 		return fmt.Errorf("path is not a directory: %s: %w", dir, ErrInvalidPluginDir)
 	}
 
+	// filepath.Clean resolves ".." segments, so a substring check for ".." is
+	// ineffective against a traversal that resolves to a valid path. Require an
+	// absolute path instead; relative inputs are rejected up front.
 	cleanDir := filepath.Clean(dir)
-	if strings.Contains(cleanDir, "..") {
-		return fmt.Errorf("invalid path: contains path traversal: %w", ErrInvalidPluginDir)
+	if !filepath.IsAbs(cleanDir) {
+		return fmt.Errorf("plugin directory must be an absolute path: %s: %w", dir, ErrInvalidPluginDir)
 	}
 
 	return nil
@@ -245,8 +282,8 @@ func validatePluginDir(dir string) error {
 // collectPluginFiles walks a plugin directory and returns all regular files
 // (excluding hidden files except .claude-plugin/plugin.json). It enforces limits
 // on file count and total aggregate size to prevent memory exhaustion.
-func collectPluginFiles(dir string) (map[string][]byte, error) {
-	files := make(map[string][]byte)
+func collectPluginFiles(dir string) (map[string]pluginFile, error) {
+	files := make(map[string]pluginFile)
 	var totalSize int64
 	if err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -262,7 +299,7 @@ func collectPluginFiles(dir string) (map[string][]byte, error) {
 	return files, nil
 }
 
-func collectPluginFile(dir, path string, d fs.DirEntry, files map[string][]byte, totalSize *int64) error {
+func collectPluginFile(dir, path string, d fs.DirEntry, files map[string]pluginFile, totalSize *int64) error {
 	relPath, err := filepath.Rel(dir, path)
 	if err != nil {
 		return fmt.Errorf("getting relative path: %w", err)
@@ -280,7 +317,8 @@ func collectPluginFile(dir, path string, d fs.DirEntry, files map[string][]byte,
 		return nil
 	}
 
-	if err := validatePluginFile(path, relPath); err != nil {
+	fileInfo, err := validatePluginFile(path, relPath)
+	if err != nil {
 		return err
 	}
 
@@ -306,23 +344,24 @@ func collectPluginFile(dir, path string, d fs.DirEntry, files map[string][]byte,
 		return fmt.Errorf("plugin directory exceeds maximum total size of %d bytes: %w", maxPluginTotalSize, ErrPluginTooLarge)
 	}
 
-	files[relPath] = content
+	files[relPath] = pluginFile{content: content, mode: int64(fileInfo.Mode().Perm())}
 	return nil
 }
 
-// validatePluginFile checks that a file in the plugin directory is safe to include.
-func validatePluginFile(absPath, relPath string) error {
+// validatePluginFile checks that a file in the plugin directory is safe to
+// include and returns its FileInfo so the caller can preserve the file mode.
+func validatePluginFile(absPath, relPath string) (os.FileInfo, error) {
 	fileInfo, err := os.Lstat(absPath)
 	if err != nil {
-		return fmt.Errorf("checking file type for %s: %w", relPath, err)
+		return nil, fmt.Errorf("checking file type for %s: %w", relPath, err)
 	}
 	if fileInfo.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("symlinks not allowed in plugin directory: %s: %w", relPath, ErrInvalidPluginFile)
+		return nil, fmt.Errorf("symlinks not allowed in plugin directory: %s: %w", relPath, ErrInvalidPluginFile)
 	}
 	if !fileInfo.Mode().IsRegular() {
-		return fmt.Errorf("non-regular file not allowed in plugin directory: %s: %w", relPath, ErrInvalidPluginFile)
+		return nil, fmt.Errorf("non-regular file not allowed in plugin directory: %s: %w", relPath, ErrInvalidPluginFile)
 	}
-	return nil
+	return fileInfo, nil
 }
 
 func isHiddenPath(relPath string) bool {
@@ -371,14 +410,19 @@ func createContentLayer(content *pluginDirContent, opts PackageOptions) (compres
 	slices.Sort(sortedPaths)
 
 	for _, p := range sortedPaths {
+		f := content.files[p]
 		files = append(files, artifact.FileEntry{
 			Path:    p,
-			Content: content.files[p],
+			Content: f.content,
+			Mode:    f.mode,
 		})
 	}
 
 	tarOpts := artifact.TarOptions{Epoch: opts.Epoch}
 	gzipOpts := artifact.DefaultGzipOptions()
+	// Honour the package epoch in the gzip member header too, so the timestamp a
+	// consumer reads from the gzip header agrees with the tar and OCI metadata.
+	gzipOpts.Epoch = opts.Epoch
 
 	uncompressed, err = artifact.CreateTar(files, tarOpts)
 	if err != nil {
@@ -402,10 +446,6 @@ func createOCIConfig(
 ) (*ocispec.Image, *PluginConfig) {
 	cfg := pluginConfig(content)
 
-	filesJSON, _ := json.Marshal(cfg.Files)
-	componentsJSON, _ := json.Marshal(cfg.Components)
-	requiresJSON, _ := json.Marshal(cfg.Requires)
-
 	epoch := opts.Epoch
 	ociConfig := &ocispec.Image{
 		Created:  &epoch,
@@ -416,9 +456,9 @@ func createOCIConfig(
 				LabelPluginDescription: cfg.Description,
 				LabelPluginVersion:     cfg.Version,
 				LabelPluginLicense:     cfg.License,
-				LabelPluginFiles:       string(filesJSON),
-				LabelPluginComponents:  string(componentsJSON),
-				LabelPluginRequires:    string(requiresJSON),
+				LabelPluginFiles:       mustMarshalJSON("files", cfg.Files),
+				LabelPluginComponents:  mustMarshalJSON("components", cfg.Components),
+				LabelPluginRequires:    mustMarshalJSON("requires", cfg.Requires),
 			},
 		},
 		RootFS: ocispec.RootFS{
@@ -527,6 +567,17 @@ func stringArray(raw json.RawMessage) []string {
 	return nil
 }
 
+// mustMarshalJSON marshals v for embedding in an OCI label/annotation. The
+// values passed here ([]string, map[string]int) cannot fail to marshal; a panic
+// guards against a future type change silently producing a broken artifact.
+func mustMarshalJSON(field string, v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("plugins: marshal %s: %v", field, err))
+	}
+	return string(b)
+}
+
 // createManifest creates the OCI manifest.
 func createManifest(
 	configBytes []byte,
@@ -536,19 +587,15 @@ func createManifest(
 	cfg *PluginConfig,
 	opts PackageOptions,
 ) *ocispec.Manifest {
-	filesJSON, _ := json.Marshal(cfg.Files)
-	componentsJSON, _ := json.Marshal(cfg.Components)
-	requiresJSON, _ := json.Marshal(cfg.Requires)
-
 	annotations := map[string]string{
 		ocispec.AnnotationCreated:     opts.Epoch.Format(time.RFC3339),
 		AnnotationPluginName:          cfg.Name,
 		AnnotationPluginDescription:   cfg.Description,
 		AnnotationPluginVersion:       cfg.Version,
 		AnnotationPluginLicense:       cfg.License,
-		AnnotationPluginFiles:         string(filesJSON),
-		AnnotationPluginComponents:    string(componentsJSON),
-		AnnotationPluginRequires:      string(requiresJSON),
+		AnnotationPluginFiles:         mustMarshalJSON("files", cfg.Files),
+		AnnotationPluginComponents:    mustMarshalJSON("components", cfg.Components),
+		AnnotationPluginRequires:      mustMarshalJSON("requires", cfg.Requires),
 		ocispec.AnnotationVersion:     cfg.Version,
 		ocispec.AnnotationLicenses:    cfg.License,
 		ocispec.AnnotationTitle:       cfg.Name,

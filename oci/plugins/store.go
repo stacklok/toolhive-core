@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/adrg/xdg"
 	"github.com/opencontainers/go-digest"
@@ -22,6 +24,7 @@ import (
 	"oras.land/oras-go/v2/errdef"
 
 	"github.com/stacklok/toolhive-core/httperr"
+	"github.com/stacklok/toolhive-core/oci/artifact"
 )
 
 const mediaTypeOctetStream = "application/octet-stream"
@@ -30,6 +33,10 @@ const mediaTypeOctetStream = "application/octet-stream"
 type Store struct {
 	root  string
 	inner *oci.Store
+
+	// mu serializes tag mutation and blob deletion so a DeleteBuild cannot race
+	// a concurrent Tag and delete blobs the newly-added tag now references.
+	mu sync.Mutex
 }
 
 // NewStore creates a new local OCI store at the given root directory.
@@ -122,6 +129,13 @@ func (s *Store) GetManifest(ctx context.Context, d digest.Digest) ([]byte, error
 
 // Tag associates a tag with a manifest digest.
 func (s *Store) Tag(ctx context.Context, d digest.Digest, tag string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tagLocked(ctx, d, tag)
+}
+
+// tagLocked is the body of Tag. Callers must hold s.mu.
+func (s *Store) tagLocked(ctx context.Context, d digest.Digest, tag string) error {
 	// Resolve the digest to get the full descriptor (manifests are auto-tagged by digest on Push).
 	desc, err := s.inner.Resolve(ctx, d.String())
 	if err != nil {
@@ -137,6 +151,13 @@ func (s *Store) Tag(ctx context.Context, d digest.Digest, tag string) error {
 
 // DeleteTag removes a tag from the store index without deleting the underlying blobs.
 func (s *Store) DeleteTag(ctx context.Context, tag string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleteTagLocked(ctx, tag)
+}
+
+// deleteTagLocked is the body of DeleteTag. Callers must hold s.mu.
+func (s *Store) deleteTagLocked(ctx context.Context, tag string) error {
 	if err := s.inner.Untag(ctx, tag); err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			return httperr.WithCode(
@@ -153,6 +174,9 @@ func (s *Store) DeleteTag(ctx context.Context, tag string) error {
 // deletes all associated blobs (config, layers, manifest, and index if applicable).
 // Use DeleteTag when tag-only removal is desired and blob cleanup is not needed.
 func (s *Store) DeleteBuild(ctx context.Context, tag string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	d, err := s.Resolve(ctx, tag)
 	if err != nil {
 		return httperr.WithCode(
@@ -161,7 +185,7 @@ func (s *Store) DeleteBuild(ctx context.Context, tag string) error {
 		)
 	}
 
-	if err := s.DeleteTag(ctx, tag); err != nil {
+	if err := s.deleteTagLocked(ctx, tag); err != nil {
 		return err
 	}
 
@@ -248,9 +272,14 @@ func (s *Store) fetchContent(ctx context.Context, d digest.Digest) ([]byte, erro
 	}
 	defer func() { _ = rc.Close() }()
 
-	data, err := io.ReadAll(rc)
+	// Bound local reads the same way ValidatingTarget bounds incoming pulls: a
+	// corrupted or tampered local layout must not trigger an unbounded allocation.
+	data, err := io.ReadAll(io.LimitReader(rc, artifact.MaxBlobSize+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(data)) > artifact.MaxBlobSize {
+		return nil, fmt.Errorf("blob %s exceeds local fetch size limit of %d bytes", d, artifact.MaxBlobSize)
 	}
 
 	return data, nil
@@ -330,7 +359,18 @@ func (s *Store) deleteManifestBlobs(ctx context.Context, d digest.Digest) error 
 // deleteBlob removes the blob file for d from the local OCI layout.
 // A missing file is treated as success (idempotent).
 func (s *Store) deleteBlob(d digest.Digest) error {
-	path := filepath.Join(s.root, "blobs", d.Algorithm().String(), d.Encoded())
+	// digest.Digest is an unvalidated string typedef; the components below feed
+	// directly into a filesystem path. Validate before use so a crafted digest
+	// (e.g. "sha256:../../etc/passwd") cannot escape the store root.
+	if err := d.Validate(); err != nil {
+		return fmt.Errorf("deleting blob: invalid digest %q: %w", d, err)
+	}
+	blobRoot := filepath.Join(s.root, "blobs")
+	path := filepath.Join(blobRoot, d.Algorithm().String(), d.Encoded())
+	if !strings.HasPrefix(filepath.Clean(path)+string(filepath.Separator),
+		filepath.Clean(blobRoot)+string(filepath.Separator)) {
+		return fmt.Errorf("deleting blob: path escapes store root: %s", path)
+	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("deleting blob %s: %w", d, err)
 	}

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/adrg/xdg"
 	"github.com/opencontainers/go-digest"
@@ -22,6 +23,7 @@ import (
 	"oras.land/oras-go/v2/errdef"
 
 	"github.com/stacklok/toolhive-core/httperr"
+	"github.com/stacklok/toolhive-core/oci/artifact"
 )
 
 const mediaTypeOctetStream = "application/octet-stream"
@@ -248,9 +250,14 @@ func (s *Store) fetchContent(ctx context.Context, d digest.Digest) ([]byte, erro
 	}
 	defer func() { _ = rc.Close() }()
 
-	data, err := io.ReadAll(rc)
+	// Bound local reads the same way ValidatingTarget bounds incoming pulls: a
+	// corrupted or tampered local layout must not trigger an unbounded allocation.
+	data, err := io.ReadAll(io.LimitReader(rc, artifact.MaxBlobSize+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(data)) > artifact.MaxBlobSize {
+		return nil, fmt.Errorf("blob %s exceeds local fetch size limit of %d bytes", d, artifact.MaxBlobSize)
 	}
 
 	return data, nil
@@ -330,7 +337,18 @@ func (s *Store) deleteManifestBlobs(ctx context.Context, d digest.Digest) error 
 // deleteBlob removes the blob file for d from the local OCI layout.
 // A missing file is treated as success (idempotent).
 func (s *Store) deleteBlob(d digest.Digest) error {
-	path := filepath.Join(s.root, "blobs", d.Algorithm().String(), d.Encoded())
+	// digest.Digest is an unvalidated string typedef; the components below feed
+	// directly into a filesystem path. Validate before use so a crafted digest
+	// (e.g. "sha256:../../etc/passwd") cannot escape the store root.
+	if err := d.Validate(); err != nil {
+		return fmt.Errorf("deleting blob: invalid digest %q: %w", d, err)
+	}
+	blobRoot := filepath.Join(s.root, "blobs")
+	path := filepath.Join(blobRoot, d.Algorithm().String(), d.Encoded())
+	if !strings.HasPrefix(filepath.Clean(path)+string(filepath.Separator),
+		filepath.Clean(blobRoot)+string(filepath.Separator)) {
+		return fmt.Errorf("deleting blob: path escapes store root: %s", path)
+	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("deleting blob %s: %w", d, err)
 	}

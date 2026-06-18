@@ -13,6 +13,7 @@ import (
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/credentials"
+	"oras.land/oras-go/v2/registry/remote/retry"
 
 	"github.com/stacklok/toolhive-core/oci/artifact"
 )
@@ -120,18 +121,15 @@ func (r *Registry) Pull(ctx context.Context, store *Store, ref string) (digest.D
 
 	validated := artifact.NewValidatingTarget(store.Target())
 
-	// Copy from remote to the validated local store.
+	// Copy from remote to the validated local store, tagging locally under the
+	// full OCI reference. The local store is shared across all plugins, so using
+	// the bare tag (e.g. "v1.0.0") as the destination would let one plugin's
+	// pull silently overwrite another plugin's identically-tagged entry.
 	desc, err := oras.Copy(
-		ctx, target, parsedRef.Reference, validated, parsedRef.Reference, oras.DefaultCopyOptions,
+		ctx, target, parsedRef.Reference, validated, ref, oras.DefaultCopyOptions,
 	)
 	if err != nil {
 		return "", fmt.Errorf("pulling from registry: %w", err)
-	}
-
-	// oras.Copy already tagged with the short reference (parsedRef.Reference, e.g. "v1.0.0").
-	// Additionally tag with the full OCI reference for local resolution.
-	if err := store.Tag(ctx, desc.Digest, ref); err != nil {
-		return "", fmt.Errorf("tagging locally: %w", err)
 	}
 
 	return desc.Digest, nil
@@ -159,6 +157,7 @@ func (r *Registry) defaultNewTarget(ref registry.Reference) (oras.Target, error)
 	}
 
 	repo.Client = &auth.Client{
+		Client:     retry.DefaultClient,
 		Credential: credentials.Credential(r.credStore),
 	}
 	repo.PlainHTTP = r.plainHTTP

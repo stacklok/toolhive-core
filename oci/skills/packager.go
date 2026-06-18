@@ -107,8 +107,10 @@ const maxFrontmatterSize = 64 * 1024
 const maxSkillFiles = 1_000
 
 // maxSkillTotalSize limits the total aggregate size of all files in a skill
-// directory to prevent memory exhaustion during packaging (100 MB).
-const maxSkillTotalSize int64 = 100 * 1024 * 1024
+// directory to prevent memory exhaustion during packaging. Kept below
+// artifact.MaxDecompressedSize (100 MB) so that per-file tar header overhead
+// cannot push a packaged artifact past the limit enforced on extraction.
+const maxSkillTotalSize int64 = 95 * 1024 * 1024
 
 // Compile-time assertion that Packager implements SkillPackager.
 var _ SkillPackager = (*Packager)(nil)
@@ -422,6 +424,9 @@ func createContentLayer(content *skillDirContent, opts PackageOptions) (compress
 
 	tarOpts := artifact.TarOptions{Epoch: opts.Epoch}
 	gzipOpts := artifact.DefaultGzipOptions()
+	// Honour the package epoch in the gzip member header too, so the timestamp a
+	// consumer reads from the gzip header agrees with the tar and OCI metadata.
+	gzipOpts.Epoch = opts.Epoch
 
 	uncompressed, err = artifact.CreateTar(files, tarOpts)
 	if err != nil {
