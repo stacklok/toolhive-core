@@ -478,7 +478,7 @@ license: MIT
 				Name:         testSkillMySkill,
 				Description:  "A great skill",
 				Version:      "2.0.0",
-				AllowedTools: stringOrSlice{testToolRead, "Write"},
+				AllowedTools: stringOrSlice{testToolRead, testToolWrite},
 				License:      "MIT",
 			},
 		},

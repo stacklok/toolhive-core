@@ -13,4 +13,5 @@ const (
 	testArchARM       = "arm"
 	testToolGrep      = "Grep"
 	testToolRead      = "Read"
+	testToolWrite     = "Write"
 )

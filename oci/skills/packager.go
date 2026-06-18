@@ -20,6 +20,8 @@ import (
 	specs "github.com/opencontainers/image-spec/specs-go"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"gopkg.in/yaml.v3"
+
+	"github.com/stacklok/toolhive-core/oci/artifact"
 )
 
 // Packager creates reproducible OCI artifacts from skill directories.
@@ -133,14 +135,14 @@ func DefaultPackageOptions() PackageOptions {
 
 	return PackageOptions{
 		Epoch:     epoch,
-		Platforms: DefaultPlatforms,
+		Platforms: artifact.DefaultPlatforms,
 	}
 }
 
 // Package packages a skill directory into an OCI artifact in the local store.
 func (p *Packager) Package(ctx context.Context, skillDir string, opts PackageOptions) (*PackageResult, error) {
 	if len(opts.Platforms) == 0 {
-		opts.Platforms = DefaultPlatforms
+		opts.Platforms = artifact.DefaultPlatforms
 	}
 
 	// Read and validate skill directory
@@ -167,7 +169,7 @@ func (p *Packager) Package(ctx context.Context, skillDir string, opts PackageOpt
 	var manifestAnnotations map[string]string
 
 	for i, platform := range opts.Platforms {
-		platformStr := PlatformString(platform)
+		platformStr := artifact.PlatformString(platform)
 
 		ociConfig, cfg := createOCIConfig(content, uncompressedTar, platform, opts)
 		configBytes, err := json.Marshal(ociConfig)
@@ -396,10 +398,10 @@ func parseFrontmatter(content []byte) (*frontmatter, error) {
 // createContentLayer creates a reproducible tar.gz of the skill content.
 // Returns both compressed and uncompressed bytes (uncompressed needed for diff_id).
 func createContentLayer(content *skillDirContent, opts PackageOptions) (compressed, uncompressed []byte, err error) {
-	var files []FileEntry
+	var files []artifact.FileEntry
 
 	// Add SKILL.md first
-	files = append(files, FileEntry{
+	files = append(files, artifact.FileEntry{
 		Path:    SkillFileName,
 		Content: content.skillMD,
 	})
@@ -412,21 +414,21 @@ func createContentLayer(content *skillDirContent, opts PackageOptions) (compress
 	slices.Sort(sortedPaths)
 
 	for _, p := range sortedPaths {
-		files = append(files, FileEntry{
+		files = append(files, artifact.FileEntry{
 			Path:    p,
 			Content: content.files[p],
 		})
 	}
 
-	tarOpts := TarOptions{Epoch: opts.Epoch}
-	gzipOpts := DefaultGzipOptions()
+	tarOpts := artifact.TarOptions{Epoch: opts.Epoch}
+	gzipOpts := artifact.DefaultGzipOptions()
 
-	uncompressed, err = CreateTar(files, tarOpts)
+	uncompressed, err = artifact.CreateTar(files, tarOpts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating tar: %w", err)
 	}
 
-	compressed, err = Compress(uncompressed, gzipOpts)
+	compressed, err = artifact.Compress(uncompressed, gzipOpts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("compressing tar: %w", err)
 	}
@@ -558,7 +560,7 @@ func (p *Packager) createIndex(
 ) (digest.Digest, error) {
 	manifests := make([]ocispec.Descriptor, 0, len(opts.Platforms))
 	for _, platform := range opts.Platforms {
-		platformStr := PlatformString(platform)
+		platformStr := artifact.PlatformString(platform)
 		info, ok := platformManifests[platformStr]
 		if !ok {
 			return "", fmt.Errorf("missing manifest for platform %s", platformStr)
