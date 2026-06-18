@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-package skills
+package plugins
 
 import (
 	"context"
@@ -21,7 +21,7 @@ import (
 // Compile-time interface check.
 var _ RegistryClient = (*Registry)(nil)
 
-// Registry provides operations for pushing and pulling skills from OCI registries.
+// Registry provides operations for pushing and pulling plugins from OCI registries.
 type Registry struct {
 	credStore credentials.Store
 	plainHTTP bool
@@ -74,7 +74,7 @@ func NewRegistry(opts ...RegistryOption) (*Registry, error) {
 	return r, nil
 }
 
-// Push pushes a skill artifact from the local store to a remote registry.
+// Push pushes a plugin artifact from the local store to a remote registry.
 // The digest can be either an index digest or a manifest digest.
 func (r *Registry) Push(ctx context.Context, store *Store, artifactDigest digest.Digest, ref string) error {
 	parsedRef, err := parseReference(ref)
@@ -93,12 +93,12 @@ func (r *Registry) Push(ctx context.Context, store *Store, artifactDigest digest
 		return fmt.Errorf("getting repository: %w", err)
 	}
 
-	// Copy the content graph (blobs → manifests → index) to the remote
+	// Copy the content graph (blobs → manifests → index) to the remote.
 	if err := oras.CopyGraph(ctx, store.Target(), target, desc, oras.DefaultCopyGraphOptions); err != nil {
 		return fmt.Errorf("pushing to registry: %w", err)
 	}
 
-	// Tag on the remote with the requested reference
+	// Tag on the remote with the requested reference.
 	if err := target.Tag(ctx, desc, parsedRef.Reference); err != nil {
 		return fmt.Errorf("tagging remote: %w", err)
 	}
@@ -106,7 +106,7 @@ func (r *Registry) Push(ctx context.Context, store *Store, artifactDigest digest
 	return nil
 }
 
-// Pull pulls a skill artifact from a remote registry to the local store.
+// Pull pulls a plugin artifact from a remote registry to the local store.
 // Returns the digest of the pulled artifact (index or manifest).
 func (r *Registry) Pull(ctx context.Context, store *Store, ref string) (digest.Digest, error) {
 	parsedRef, err := parseReference(ref)
@@ -122,9 +122,9 @@ func (r *Registry) Pull(ctx context.Context, store *Store, ref string) (digest.D
 	validated := artifact.NewValidatingTarget(store.Target())
 
 	// Copy from remote to the validated local store, tagging locally under the
-	// full OCI reference. The local store is shared across all skills, so using
-	// the bare tag (e.g. "v1.0.0") as the destination would let one skill's pull
-	// silently overwrite another skill's identically-tagged entry.
+	// full OCI reference. The local store is shared across all plugins, so using
+	// the bare tag (e.g. "v1.0.0") as the destination would let one plugin's
+	// pull silently overwrite another plugin's identically-tagged entry.
 	desc, err := oras.Copy(
 		ctx, target, parsedRef.Reference, validated, ref, oras.DefaultCopyOptions,
 	)

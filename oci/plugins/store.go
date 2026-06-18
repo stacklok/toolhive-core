@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-package skills
+package plugins
 
 import (
 	"bytes"
@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/adrg/xdg"
 	"github.com/opencontainers/go-digest"
@@ -32,6 +33,10 @@ const mediaTypeOctetStream = "application/octet-stream"
 type Store struct {
 	root  string
 	inner *oci.Store
+
+	// mu serializes tag mutation and blob deletion so a DeleteBuild cannot race
+	// a concurrent Tag and delete blobs the newly-added tag now references.
+	mu sync.Mutex
 }
 
 // NewStore creates a new local OCI store at the given root directory.
@@ -45,10 +50,10 @@ func NewStore(root string) (*Store, error) {
 	return &Store{root: root, inner: inner}, nil
 }
 
-// StoreRoot returns the skills store root within the given data home directory.
+// StoreRoot returns the plugins store root within the given data home directory.
 // This is the injectable, testable form. For the standard XDG location, use DefaultStoreRoot.
 func StoreRoot(dataHome string) string {
-	return filepath.Join(dataHome, "toolhive", "skills")
+	return filepath.Join(dataHome, "toolhive", "plugins")
 }
 
 // DefaultStoreRoot returns the default store root directory using XDG base directory conventions.
@@ -124,6 +129,13 @@ func (s *Store) GetManifest(ctx context.Context, d digest.Digest) ([]byte, error
 
 // Tag associates a tag with a manifest digest.
 func (s *Store) Tag(ctx context.Context, d digest.Digest, tag string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tagLocked(ctx, d, tag)
+}
+
+// tagLocked is the body of Tag. Callers must hold s.mu.
+func (s *Store) tagLocked(ctx context.Context, d digest.Digest, tag string) error {
 	// Resolve the digest to get the full descriptor (manifests are auto-tagged by digest on Push).
 	desc, err := s.inner.Resolve(ctx, d.String())
 	if err != nil {
@@ -139,6 +151,13 @@ func (s *Store) Tag(ctx context.Context, d digest.Digest, tag string) error {
 
 // DeleteTag removes a tag from the store index without deleting the underlying blobs.
 func (s *Store) DeleteTag(ctx context.Context, tag string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleteTagLocked(ctx, tag)
+}
+
+// deleteTagLocked is the body of DeleteTag. Callers must hold s.mu.
+func (s *Store) deleteTagLocked(ctx context.Context, tag string) error {
 	if err := s.inner.Untag(ctx, tag); err != nil {
 		if errors.Is(err, errdef.ErrNotFound) {
 			return httperr.WithCode(
@@ -155,6 +174,9 @@ func (s *Store) DeleteTag(ctx context.Context, tag string) error {
 // deletes all associated blobs (config, layers, manifest, and index if applicable).
 // Use DeleteTag when tag-only removal is desired and blob cleanup is not needed.
 func (s *Store) DeleteBuild(ctx context.Context, tag string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	d, err := s.Resolve(ctx, tag)
 	if err != nil {
 		return httperr.WithCode(
@@ -163,7 +185,7 @@ func (s *Store) DeleteBuild(ctx context.Context, tag string) error {
 		)
 	}
 
-	if err := s.DeleteTag(ctx, tag); err != nil {
+	if err := s.deleteTagLocked(ctx, tag); err != nil {
 		return err
 	}
 
