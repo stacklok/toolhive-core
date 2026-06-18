@@ -35,7 +35,7 @@ func TestIsManifestMediaType(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			assert.Equal(t, tt.want, IsManifestMediaType(tt.mediaType))
+			assert.Equal(t, tt.want, isManifestMediaType(tt.mediaType))
 		})
 	}
 }
@@ -198,7 +198,7 @@ func TestValidateManifestCounts(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			err := ValidateManifestCounts(tt.mediaType, tt.data)
+			err := validateManifestCounts(tt.mediaType, tt.data)
 			if tt.wantErr {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.errSubstr)

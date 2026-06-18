@@ -112,7 +112,8 @@ func ExtractTarWithLimit(data []byte, maxFileSize int64) ([]FileEntry, error) {
 		}
 
 		// Reject path traversal
-		if err := validateTarPath(hdr.Name); err != nil {
+		cleanedPath, err := validateTarPath(hdr.Name)
+		if err != nil {
 			return nil, err
 		}
 
@@ -148,7 +149,7 @@ func ExtractTarWithLimit(data []byte, maxFileSize int64) ([]FileEntry, error) {
 		}
 
 		files = append(files, FileEntry{
-			Path:    hdr.Name,
+			Path:    cleanedPath,
 			Content: content,
 			Mode:    hdr.Mode,
 		})
@@ -157,16 +158,20 @@ func ExtractTarWithLimit(data []byte, maxFileSize int64) ([]FileEntry, error) {
 	return files, nil
 }
 
-// validateTarPath checks that a tar entry path is safe.
-func validateTarPath(p string) error {
+// validateTarPath checks that a tar entry path is safe and returns its cleaned path.
+func validateTarPath(p string) (string, error) {
+	if strings.Contains(p, `\\`) {
+		return "", fmt.Errorf("backslash path separators not allowed in archive: %s", p)
+	}
+
 	// path.Clean resolves all ".." segments; any remaining leading ".."
 	// means the path escapes the archive root.
 	cleaned := path.Clean(p)
-	if strings.HasPrefix(cleaned, "..") {
-		return fmt.Errorf("path traversal detected in archive: %s", p)
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", fmt.Errorf("path traversal detected in archive: %s", p)
 	}
 	if path.IsAbs(cleaned) {
-		return fmt.Errorf("absolute path not allowed in archive: %s", p)
+		return "", fmt.Errorf("absolute path not allowed in archive: %s", p)
 	}
-	return nil
+	return cleaned, nil
 }

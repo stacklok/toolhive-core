@@ -205,6 +205,7 @@ func TestExtractTar_RejectsPathTraversal(t *testing.T) {
 		{name: "dotdot prefix", path: "../etc/passwd"},
 		{name: "dotdot in middle", path: "foo/../../etc/passwd"},
 		{name: "absolute path", path: "/etc/passwd"},
+		{name: "windows traversal", path: `foo\\..\\..\\etc\\passwd`},
 	}
 
 	for _, tt := range tests {
@@ -229,6 +230,30 @@ func TestExtractTar_RejectsPathTraversal(t *testing.T) {
 			assert.Error(t, err)
 		})
 	}
+}
+
+func TestExtractTar_CleansPath(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+
+	content := []byte("test")
+	require.NoError(t, tw.WriteHeader(&tar.Header{
+		Name:     "foo/./bar.txt",
+		Size:     int64(len(content)),
+		Typeflag: tar.TypeReg,
+		Mode:     0644,
+	}))
+	_, err := tw.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, tw.Close())
+
+	files, err := ExtractTar(buf.Bytes())
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	assert.Equal(t, "foo/bar.txt", files[0].Path)
+	assert.Equal(t, content, files[0].Content)
 }
 
 func TestExtractTarWithLimit_RejectsOversized(t *testing.T) {

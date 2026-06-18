@@ -66,7 +66,7 @@ func (v *ValidatingTarget) Tag(ctx context.Context, desc ocispec.Descriptor, ref
 // Push validates size and structure limits before delegating to the inner target.
 func (v *ValidatingTarget) Push(ctx context.Context, desc ocispec.Descriptor, content io.Reader) error {
 	maxSize := MaxBlobSize
-	if IsManifestMediaType(desc.MediaType) {
+	if isManifestMediaType(desc.MediaType) {
 		maxSize = MaxManifestSize
 	}
 
@@ -101,20 +101,20 @@ func (v *ValidatingTarget) Push(ctx context.Context, desc ocispec.Descriptor, co
 	}
 
 	// Validate manifest/index structure limits
-	if err := ValidateManifestCounts(desc.MediaType, data); err != nil {
+	if err := validateManifestCounts(desc.MediaType, data); err != nil {
 		return err
 	}
 
 	return v.inner.Push(ctx, desc, bytes.NewReader(data))
 }
 
-// ValidateManifestCounts checks layer/manifest counts for resource exhaustion prevention.
+// validateManifestCounts checks layer/manifest counts for resource exhaustion prevention.
 //
 // It only inspects media types it recognizes (image index and image manifest).
 // For any other media type it returns nil without examining the data. A nil
 // return therefore means "no count violation was detected", not "this manifest
 // is safe" — callers must not treat a nil return as a general safety guarantee.
-func ValidateManifestCounts(mediaType string, data []byte) error {
+func validateManifestCounts(mediaType string, data []byte) error {
 	switch mediaType {
 	case ocispec.MediaTypeImageIndex:
 		var index ocispec.Index
@@ -142,8 +142,8 @@ func ValidateManifestCounts(mediaType string, data []byte) error {
 	return nil
 }
 
-// IsManifestMediaType returns true if the media type is a manifest or index type.
-func IsManifestMediaType(mediaType string) bool {
+// isManifestMediaType returns true if the media type is a manifest or index type.
+func isManifestMediaType(mediaType string) bool {
 	switch mediaType {
 	case ocispec.MediaTypeImageManifest, ocispec.MediaTypeImageIndex,
 		"application/vnd.docker.distribution.manifest.v2+json",
