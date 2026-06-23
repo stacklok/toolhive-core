@@ -184,6 +184,16 @@ func TestConstants(t *testing.T) {
 		t.Parallel()
 		assert.Equal(t, "toolhive-api", ComponentToolHive)
 	})
+
+	t.Run("audit level", func(t *testing.T) {
+		t.Parallel()
+		// Value must stay between Info and Warn so audit events can be
+		// filtered independently. Changing it is a breaking change for
+		// consumers that hardcode the numeric level.
+		assert.Equal(t, slog.Level(2), LevelAudit)
+		assert.Greater(t, LevelAudit, slog.LevelInfo)
+		assert.Less(t, LevelAudit, slog.LevelWarn)
+	})
 }
 
 func TestEventMetadataExtra(t *testing.T) {
@@ -249,8 +259,7 @@ func TestAuditEventLogTo(t *testing.T) {
 		"transport":   "sse",
 	}
 
-	customLevel := slog.Level(2)
-	event.LogTo(context.Background(), logger, customLevel)
+	event.LogTo(context.Background(), logger, LevelAudit)
 
 	logOutput := buf.String()
 	require.NotEmpty(t, logOutput)
