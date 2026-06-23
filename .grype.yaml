@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+ignore:
+  # GO-2026-4610: Windows-only local privilege escalation in docker/cli CLI plugins
+  # via uncontrolled search path. The OSV record marks this fixed in 29.2.0+incompatible;
+  # we run 29.6.0+incompatible which is past the fix. Grype incorrectly flags it due to
+  # semver comparison issues with the +incompatible suffix.
+  - vulnerability: GO-2026-4610
+    package:
+      name: github.com/docker/cli
+      type: go-module
