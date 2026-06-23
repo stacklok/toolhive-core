@@ -145,6 +145,14 @@ func (e *AuditEvent) WithDataFromString(data string) *AuditEvent {
 	return e.WithData(&rawMsg)
 }
 
+// LevelAudit is a custom slog level for audit events, sitting between
+// [slog.LevelInfo] (0) and [slog.LevelWarn] (4). Logging audit events at this
+// dedicated level lets log infrastructure filter them independently from
+// regular application logs. Pass it as the level argument to [AuditEvent.LogTo]
+// and as the Level in a handler's [slog.HandlerOptions] so all ToolHive
+// components share one definition rather than hardcoding the numeric value.
+const LevelAudit = slog.Level(2)
+
 // LogTo logs the audit event to the provided slog.Logger using the custom audit level.
 func (e *AuditEvent) LogTo(ctx context.Context, logger *slog.Logger, level slog.Level) {
 	// Create slog attributes for the audit event
