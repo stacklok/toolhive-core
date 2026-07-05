@@ -23,6 +23,11 @@ import (
 //nolint:revive,staticcheck // name intentionally matches mcp-go for drop-in compatibility.
 const LATEST_PROTOCOL_VERSION = mcpgo.LATEST_PROTOCOL_VERSION
 
+// JSONRPC_VERSION is the JSON-RPC version used by MCP ("2.0").
+//
+//nolint:revive,staticcheck // name intentionally matches mcp-go for drop-in compatibility.
+const JSONRPC_VERSION = mcpgo.JSONRPC_VERSION
+
 // MCP method names.
 const (
 	MethodInitialize        = mcpgo.MethodInitialize
