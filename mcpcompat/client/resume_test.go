@@ -69,17 +69,26 @@ func TestClientResumeWithoutInitialize(t *testing.T) {
 	t.Parallel()
 
 	mgr := newSharedSessionManager()
-	mcpSrv := server.NewMCPServer("srv", "1.0.0")
-	mcpSrv.AddTool(mcp.NewTool("greet", mcp.WithDescription("greets")),
-		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			return mcp.NewToolResultText("hello"), nil
-		})
-	streamable := server.NewStreamableHTTPServer(mcpSrv, server.WithSessionIdManager(mgr))
-	ts := httptest.NewServer(streamable)
-	defer ts.Close()
 
-	// Client 1: normal initialize, capture the session ID and tools.
-	client1, err := mcpclient.NewStreamableHttpClient(ts.URL)
+	newReplica := func(name string) *httptest.Server {
+		s := server.NewMCPServer(name, "1.0.0")
+		s.AddTool(mcp.NewTool("greet", mcp.WithDescription("greets")),
+			func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return mcp.NewToolResultText("hello"), nil
+			})
+		ts := httptest.NewServer(server.NewStreamableHTTPServer(s, server.WithSessionIdManager(mgr)))
+		return ts
+	}
+
+	// Replica A handles initialize; replica B (separate instance sharing the
+	// session manager) is where the client resumes — the real cross-replica flow.
+	tsA := newReplica("A")
+	defer tsA.Close()
+	tsB := newReplica("B")
+	defer tsB.Close()
+
+	// Client 1: normal initialize on A, capture the session ID and tools.
+	client1, err := mcpclient.NewStreamableHttpClient(tsA.URL)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -93,8 +102,8 @@ func TestClientResumeWithoutInitialize(t *testing.T) {
 	require.Len(t, tools1.Tools, 1)
 	defer func() { _ = client1.Close() }()
 
-	// Client 2: resume with the SAME session ID, NO Initialize.
-	client2, err := mcpclient.NewStreamableHttpClient(ts.URL, transport.WithSession(sid))
+	// Client 2: resume with the SAME session ID against replica B, NO Initialize.
+	client2, err := mcpclient.NewStreamableHttpClient(tsB.URL, transport.WithSession(sid))
 	require.NoError(t, err)
 	require.NoError(t, client2.Start(ctx))
 	defer func() { _ = client2.Close() }()
@@ -115,4 +124,13 @@ func TestClientResumeWithoutInitialize(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Len(t, res.Content, 1)
+
+	// Terminate the session in the shared store; the resumed client's next request
+	// must surface transport.ErrSessionTerminated (the 404 -> sentinel mapping
+	// ToolHive relies on to detect cross-replica lazy eviction).
+	_, _ = mgr.Terminate(sid)
+	_, err = client2.ListTools(ctx, mcp.ListToolsRequest{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, transport.ErrSessionTerminated,
+		"resumed client must report ErrSessionTerminated after the session is terminated")
 }

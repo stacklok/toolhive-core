@@ -8,11 +8,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
+
+	"github.com/stacklok/toolhive-core/mcpcompat/client/transport"
 )
 
 // resumeProtocolVersion is the MCP protocol version header sent on resumed
@@ -90,7 +93,14 @@ func (c *Client) resumeCall(ctx context.Context, method string, params, out any)
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return fmt.Errorf("resumed session %q not found or terminated", sessionID)
+		// A 404 means the server no longer recognizes the session (terminated or
+		// expired in the shared store). Surface transport.ErrSessionTerminated so
+		// callers that errors.Is(err, transport.ErrSessionTerminated) — as ToolHive
+		// does to detect cross-replica lazy eviction — keep working.
+		return transport.NewError(errors.Join(
+			transport.ErrSessionTerminated,
+			fmt.Errorf("resumed session %q terminated (404)", sessionID),
+		))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
