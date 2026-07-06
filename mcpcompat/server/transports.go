@@ -226,17 +226,24 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 // through a locally-reconstructed session, matching mcp-go's behavior where any
 // replica sharing the manager's backing store accepts the session.
 func (s *StreamableHTTPServer) serveRehydrated(w http.ResponseWriter, r *http.Request, sid string) {
+	// Validate on EVERY request (as mcp-go does), not just on cache miss. This is
+	// what implements lazy eviction: a session terminated on another replica is
+	// marked terminated in the shared store, and the next request here must reject
+	// it and drop any locally-cached reconstruction rather than serving it.
+	isTerminated, err := s.sessionIDMgr.Validate(sid)
+	if err != nil {
+		s.deleteRehydrated(sid)
+		http.Error(w, "Invalid session ID", http.StatusNotFound)
+		return
+	}
+	if isTerminated {
+		s.deleteRehydrated(sid)
+		http.Error(w, "Session terminated", http.StatusNotFound)
+		return
+	}
+
 	rt := s.getRehydrated(sid)
 	if rt == nil {
-		isTerminated, err := s.sessionIDMgr.Validate(sid)
-		if err != nil {
-			http.Error(w, "Invalid session ID", http.StatusNotFound)
-			return
-		}
-		if isTerminated {
-			http.Error(w, "Session terminated", http.StatusNotFound)
-			return
-		}
 		rt, err = s.rehydrate(r, sid)
 		if err != nil {
 			if s.mcp.logger != nil {

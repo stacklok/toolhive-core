@@ -283,6 +283,45 @@ func TestRehydrationRejectsUnknownAndTerminated(t *testing.T) {
 	_ = resp2.Body.Close()
 }
 
+// TestRehydratedSessionEvictedAfterTermination verifies lazy eviction across
+// replicas: once replica B has rehydrated AND cached a session, terminating it
+// in the shared store must cause B to reject the NEXT request rather than serve
+// the cached session. This is the cross-replica termination path — the handler
+// must validate every request, not only on cache miss.
+func TestRehydratedSessionEvictedAfterTermination(t *testing.T) {
+	t.Parallel()
+	mgr := newSharedSessionManager()
+
+	streamA := server.NewMCPServer("A", "1.0.0")
+	addGreetTool(streamA)
+	sA := server.NewStreamableHTTPServer(streamA, server.WithSessionIdManager(mgr))
+	tsA := httptest.NewServer(sA)
+	defer tsA.Close()
+
+	streamB := server.NewMCPServer("B", "1.0.0")
+	addGreetTool(streamB)
+	sB := server.NewStreamableHTTPServer(streamB, server.WithSessionIdManager(mgr))
+	tsB := httptest.NewServer(sB)
+	defer tsB.Close()
+
+	sid := initSession(t, tsA.URL)
+
+	// First request on B rehydrates and caches the session.
+	require.Contains(t, listToolNames(t, tsB.URL, sid), "greet")
+
+	// Terminate the session in the shared store (as a DELETE on replica A does).
+	_, _ = mgr.Terminate(sid)
+
+	// The next request on B must be rejected via lazy eviction, not served from
+	// the cached rehydrated session.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp := postRPC(ctx, t, tsB.URL, sid, `{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}`)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"replica B must reject a session terminated in the shared store")
+	_ = resp.Body.Close()
+}
+
 // TestRehydratedSessionElicitation proves a rehydrated session is a full,
 // stateful session (NOT stateless): a tool handler on the rehydrating replica
 // performs a server->client elicitation, and the client responds over the same
