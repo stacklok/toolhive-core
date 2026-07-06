@@ -184,6 +184,26 @@ func (s *SSEServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.handler.ServeHTTP(w, r)
 }
 
+// SSEHandler returns the http.Handler for the SSE (stream) endpoint. It mirrors
+// mcp-go's SSEServer.SSEHandler, allowing the endpoint to be mounted on a custom
+// router.
+//
+// go-sdk backing and limitation: the go-sdk serves SSE and message delivery
+// through a single unified handler keyed off the request method and a session
+// query parameter, whereas mcp-go splits them across two paths. Both SSEHandler
+// and MessageHandler therefore return the same underlying go-sdk handler; when
+// mounting them on separate paths, mount both under a common base path so the
+// go-sdk handler can correlate the stream and its message posts.
+func (s *SSEServer) SSEHandler() http.Handler {
+	return http.HandlerFunc(s.ServeHTTP)
+}
+
+// MessageHandler returns the http.Handler for the message (POST) endpoint. See
+// SSEHandler for the go-sdk backing and the shared-handler limitation.
+func (s *SSEServer) MessageHandler() http.Handler {
+	return http.HandlerFunc(s.ServeHTTP)
+}
+
 // Start serves on addr until Shutdown is called.
 func (s *SSEServer) Start(addr string) error {
 	s.httpSrv = &http.Server{Addr: addr, Handler: s, ReadHeaderTimeout: 10 * time.Second}

@@ -22,12 +22,15 @@ type echoInput struct {
 	Message string `json:"message"`
 }
 
+// echoToolName is the shared tool name used across the client tests.
+const echoToolName = "echo"
+
 // newTestServer stands up a real go-sdk MCP server exposing a single "echo"
 // tool, served over Streamable HTTP via httptest.
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := gosdk.NewServer(&gosdk.Implementation{Name: "testserver", Version: "9.9.9"}, nil)
-	gosdk.AddTool(srv, &gosdk.Tool{Name: "echo", Description: "echo the message"},
+	gosdk.AddTool(srv, &gosdk.Tool{Name: echoToolName, Description: "echo the message"},
 		func(_ context.Context, _ *gosdk.CallToolRequest, in echoInput) (*gosdk.CallToolResult, any, error) {
 			return &gosdk.CallToolResult{
 				Content: []gosdk.Content{&gosdk.TextContent{Text: "echo: " + in.Message}},
@@ -66,11 +69,11 @@ func TestStreamableClient_EndToEnd(t *testing.T) {
 	tools, err := c.ListTools(ctx, mcp.ListToolsRequest{})
 	require.NoError(t, err)
 	require.Len(t, tools.Tools, 1)
-	assert.Equal(t, "echo", tools.Tools[0].Name)
+	assert.Equal(t, echoToolName, tools.Tools[0].Name)
 
 	callRes, err := c.CallTool(ctx, mcp.CallToolRequest{
 		Params: mcp.CallToolParams{
-			Name:      "echo",
+			Name:      echoToolName,
 			Arguments: map[string]any{"message": "hi"},
 		},
 	})

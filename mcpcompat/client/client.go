@@ -41,6 +41,10 @@ type Client struct {
 	session  *gosdk.ClientSession
 	notifyMu sync.Mutex
 	notify   []func(mcp.JSONRPCNotification)
+
+	connLostMu   sync.Mutex
+	connLost     func(error)
+	watchStarted bool
 }
 
 // NewStreamableHttpClient creates a Streamable HTTP MCP client for baseURL. Like
@@ -108,6 +112,7 @@ func (c *Client) Initialize(ctx context.Context, request mcp.InitializeRequest) 
 	if c.streamable != nil {
 		c.streamable.SetSessionID(session.ID())
 	}
+	c.maybeStartConnLostWatch(session)
 
 	result := &mcp.InitializeResult{}
 	if err := jsonConvert(session.InitializeResult(), result); err != nil {
@@ -121,14 +126,16 @@ func (c *Client) buildTransport() (gosdk.Transport, error) {
 	switch {
 	case c.streamable != nil:
 		return &gosdk.StreamableClientTransport{
-			Endpoint:             c.streamable.Endpoint(),
-			HTTPClient:           buildHTTPClient(c.streamable.HTTPClient(), c.streamable.Headers(), c.streamable.Timeout()),
+			Endpoint: c.streamable.Endpoint(),
+			HTTPClient: buildHTTPClient(
+				c.streamable.HTTPClient(), c.streamable.Headers(), c.streamable.HeaderFunc(), c.streamable.Timeout(),
+			),
 			DisableStandaloneSSE: !c.streamable.ContinuousListening(),
 		}, nil
 	case c.sse != nil:
 		return &gosdk.SSEClientTransport{
 			Endpoint:   c.sse.Endpoint(),
-			HTTPClient: buildHTTPClient(c.sse.HTTPClient(), c.sse.Headers(), 0),
+			HTTPClient: buildHTTPClient(c.sse.HTTPClient(), c.sse.Headers(), nil, 0),
 		}, nil
 	default:
 		return nil, fmt.Errorf("no transport configured")
@@ -291,6 +298,45 @@ func (c *Client) installNotificationHandlers(opts *gosdk.ClientOptions) {
 	}
 }
 
+// OnConnectionLost registers a handler invoked when the connection to the
+// server is lost. It mirrors mcp-go's client.Client.OnConnectionLost, which is
+// used to handle transport-level disconnections (e.g. an HTTP/2 idle timeout)
+// that should not be treated as fatal errors.
+//
+// The go-sdk signals a dropped connection by having ClientSession.Wait return.
+// The handler is invoked once, with the error Wait reports (nil on a clean
+// close). If registered before Initialize, the watch starts once the session
+// connects; if registered after, it starts immediately.
+func (c *Client) OnConnectionLost(handler func(error)) {
+	c.connLostMu.Lock()
+	c.connLost = handler
+	c.connLostMu.Unlock()
+
+	c.mu.Lock()
+	session := c.session
+	c.mu.Unlock()
+	if session != nil {
+		c.maybeStartConnLostWatch(session)
+	}
+}
+
+// maybeStartConnLostWatch starts, at most once, a goroutine that blocks on the
+// session's Wait and invokes the registered connection-lost handler when the
+// connection drops.
+func (c *Client) maybeStartConnLostWatch(session *gosdk.ClientSession) {
+	c.connLostMu.Lock()
+	defer c.connLostMu.Unlock()
+	if c.connLost == nil || c.watchStarted {
+		return
+	}
+	c.watchStarted = true
+	handler := c.connLost
+	go func() {
+		err := session.Wait()
+		handler(err)
+	}()
+}
+
 // GetTransport returns the transport handle. For a Streamable HTTP client the
 // dynamic type is *transport.StreamableHTTP (as ToolHive expects); otherwise it
 // is nil.
@@ -352,15 +398,21 @@ func isZeroCapabilities(c mcp.ClientCapabilities) bool {
 	return err == nil && string(b) == "{}"
 }
 
-// headerRoundTripper injects static headers on every request.
+// headerRoundTripper injects static and/or per-request headers on every request.
 type headerRoundTripper struct {
-	headers map[string]string
-	base    http.RoundTripper
+	headers    map[string]string
+	headerFunc transport.HTTPHeaderFunc
+	base       http.RoundTripper
 }
 
 func (h *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	for k, v := range h.headers {
 		req.Header.Set(k, v)
+	}
+	if h.headerFunc != nil {
+		for k, v := range h.headerFunc(req.Context()) {
+			req.Header.Set(k, v)
+		}
 	}
 	base := h.base
 	if base == nil {
@@ -370,10 +422,12 @@ func (h *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 }
 
 // buildHTTPClient returns an *http.Client honoring the given base client, static
-// headers and timeout. It returns nil when no customization is needed so the
-// go-sdk uses its default client.
-func buildHTTPClient(base *http.Client, headers map[string]string, timeout time.Duration) *http.Client {
-	if base == nil && len(headers) == 0 && timeout == 0 {
+// headers, per-request header function and timeout. It returns nil when no
+// customization is needed so the go-sdk uses its default client.
+func buildHTTPClient(
+	base *http.Client, headers map[string]string, headerFunc transport.HTTPHeaderFunc, timeout time.Duration,
+) *http.Client {
+	if base == nil && len(headers) == 0 && headerFunc == nil && timeout == 0 {
 		return nil
 	}
 	hc := &http.Client{}
@@ -383,8 +437,8 @@ func buildHTTPClient(base *http.Client, headers map[string]string, timeout time.
 	if timeout > 0 {
 		hc.Timeout = timeout
 	}
-	if len(headers) > 0 {
-		hc.Transport = &headerRoundTripper{headers: headers, base: hc.Transport}
+	if len(headers) > 0 || headerFunc != nil {
+		hc.Transport = &headerRoundTripper{headers: headers, headerFunc: headerFunc, base: hc.Transport}
 	}
 	return hc
 }

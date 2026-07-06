@@ -4,15 +4,39 @@
 package transport_test
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/stacklok/toolhive-core/mcpcompat/client/transport"
 )
+
+func TestWithHTTPHeaderFunc(t *testing.T) {
+	t.Parallel()
+
+	// No header func by default.
+	sh := transport.NewStreamableHTTP("https://example.test/mcp")
+	assert.Nil(t, sh.HeaderFunc())
+
+	// WithHTTPHeaderFunc records a per-request header function.
+	const hdrKey = "X-Test"
+	called := false
+	fn := func(context.Context) map[string]string {
+		called = true
+		return map[string]string{hdrKey: "v"}
+	}
+	sh = transport.NewStreamableHTTP("https://example.test/mcp", transport.WithHTTPHeaderFunc(fn))
+	got := sh.HeaderFunc()
+	require.NotNil(t, got)
+	hdrs := got(context.Background())
+	assert.True(t, called)
+	assert.Equal(t, "v", hdrs[hdrKey])
+}
 
 func TestStreamableHTTPOptions(t *testing.T) {
 	t.Parallel()

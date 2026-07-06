@@ -30,17 +30,21 @@ const JSONRPC_VERSION = mcpgo.JSONRPC_VERSION
 
 // MCP method names.
 const (
-	MethodInitialize        = mcpgo.MethodInitialize
-	MethodToolsList         = mcpgo.MethodToolsList
-	MethodToolsCall         = mcpgo.MethodToolsCall
-	MethodResourcesList     = mcpgo.MethodResourcesList
-	MethodResourcesRead     = mcpgo.MethodResourcesRead
-	MethodPromptsList       = mcpgo.MethodPromptsList
-	MethodPromptsGet        = mcpgo.MethodPromptsGet
-	MethodListRoots         = mcpgo.MethodListRoots
-	MethodSetLogLevel       = mcpgo.MethodSetLogLevel
-	MethodPing              = mcpgo.MethodPing
-	MethodElicitationCreate = mcpgo.MethodElicitationCreate
+	MethodInitialize             = mcpgo.MethodInitialize
+	MethodToolsList              = mcpgo.MethodToolsList
+	MethodToolsCall              = mcpgo.MethodToolsCall
+	MethodResourcesList          = mcpgo.MethodResourcesList
+	MethodResourcesTemplatesList = mcpgo.MethodResourcesTemplatesList
+	MethodResourcesRead          = mcpgo.MethodResourcesRead
+	MethodPromptsList            = mcpgo.MethodPromptsList
+	MethodPromptsGet             = mcpgo.MethodPromptsGet
+	MethodListRoots              = mcpgo.MethodListRoots
+	MethodSetLogLevel            = mcpgo.MethodSetLogLevel
+	MethodPing                   = mcpgo.MethodPing
+	MethodElicitationCreate      = mcpgo.MethodElicitationCreate
+
+	// MethodNotificationInitialized indicates the client finished initialization.
+	MethodNotificationInitialized = mcpgo.MethodNotificationInitialized
 )
 
 // JSON-RPC / MCP error codes.
@@ -92,6 +96,34 @@ type (
 	JSONRPCNotification = mcpgo.JSONRPCNotification
 	// JSONRPCMessage is any JSON-RPC request/response/notification/error.
 	JSONRPCMessage = mcpgo.JSONRPCMessage
+	// JSONRPCResponse is a successful JSON-RPC response.
+	JSONRPCResponse = mcpgo.JSONRPCResponse
+	// JSONRPCError is a JSON-RPC error response.
+	JSONRPCError = mcpgo.JSONRPCError
+	// JSONRPCErrorDetails carries the code/message/data of a JSON-RPC error.
+	JSONRPCErrorDetails = mcpgo.JSONRPCErrorDetails
+	// RequestId is a JSON-RPC request identifier.
+	RequestId = mcpgo.RequestId //nolint:revive // name intentionally matches mcp-go for drop-in compatibility.
+
+	// Notification is the base of a JSON-RPC notification (method + params).
+	Notification = mcpgo.Notification
+	// NotificationParams carries a notification's params.
+	NotificationParams = mcpgo.NotificationParams
+
+	// EmptyResult is an empty MCP result (e.g. the response to ping).
+	EmptyResult = mcpgo.EmptyResult
+	// PingRequest is a ping request.
+	PingRequest = mcpgo.PingRequest
+)
+
+// JSON-RPC message constructors.
+var (
+	// NewRequestId wraps a raw id value in a RequestId.
+	NewRequestId = mcpgo.NewRequestId //nolint:revive // name intentionally matches mcp-go for drop-in compatibility.
+	// NewJSONRPCErrorDetails builds a JSONRPCErrorDetails value.
+	NewJSONRPCErrorDetails = mcpgo.NewJSONRPCErrorDetails
+	// NewJSONRPCResultResponse builds a successful JSONRPCResponse.
+	NewJSONRPCResultResponse = mcpgo.NewJSONRPCResultResponse
 )
 
 // ----------------------------------------------------------------------------
@@ -210,6 +242,7 @@ var (
 	WithDescription      = mcpgo.WithDescription
 	WithString           = mcpgo.WithString
 	Required             = mcpgo.Required
+	Description          = mcpgo.Description
 
 	NewToolResultText           = mcpgo.NewToolResultText
 	NewToolResultError          = mcpgo.NewToolResultError

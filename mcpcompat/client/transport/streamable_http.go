@@ -12,10 +12,16 @@
 package transport
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"time"
 )
+
+// HTTPHeaderFunc returns headers to attach to each Streamable HTTP request. It
+// mirrors mcp-go's transport.HTTPHeaderFunc and is evaluated per request, so it
+// can return values that change over the lifetime of the connection.
+type HTTPHeaderFunc func(context.Context) map[string]string
 
 // Interface is the transport handle returned by client.GetTransport. It mirrors
 // mcp-go's transport.Interface for the subset ToolHive uses (type-asserting to
@@ -33,6 +39,7 @@ type StreamableHTTP struct {
 	endpoint            string
 	httpClient          *http.Client
 	headers             map[string]string
+	headerFunc          HTTPHeaderFunc
 	timeout             time.Duration
 	logger              *slog.Logger
 	continuousListening bool
@@ -66,6 +73,9 @@ func (s *StreamableHTTP) HTTPClient() *http.Client { return s.httpClient }
 // Headers returns the configured static headers.
 func (s *StreamableHTTP) Headers() map[string]string { return s.headers }
 
+// HeaderFunc returns the configured per-request header function, or nil.
+func (s *StreamableHTTP) HeaderFunc() HTTPHeaderFunc { return s.headerFunc }
+
 // Timeout returns the configured HTTP timeout (0 if unset).
 func (s *StreamableHTTP) Timeout() time.Duration { return s.timeout }
 
@@ -92,6 +102,13 @@ func WithHTTPBasicClient(client *http.Client) StreamableHTTPCOption {
 // WithHTTPHeaders sets static headers sent on each request.
 func WithHTTPHeaders(headers map[string]string) StreamableHTTPCOption {
 	return func(s *StreamableHTTP) { s.headers = headers }
+}
+
+// WithHTTPHeaderFunc sets a function that returns headers for each Streamable
+// HTTP request. It mirrors mcp-go's transport.WithHTTPHeaderFunc; the function
+// is evaluated per request, so its returned headers may vary over time.
+func WithHTTPHeaderFunc(headerFunc HTTPHeaderFunc) StreamableHTTPCOption {
+	return func(s *StreamableHTTP) { s.headerFunc = headerFunc }
 }
 
 // WithSession sets an initial session ID (for resuming a session).
