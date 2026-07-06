@@ -192,6 +192,10 @@ func (s *MCPServer) registerAndSync(ctx context.Context, ss *gosdk.ServerSession
 	cs.goSession.Store(ss)
 	cs.owner = s
 	cs.boundServer.Store(srv)
+	// Mark the session local: it was initialized on this instance, so the go-sdk
+	// StreamableHTTPHandler owns it and subsequent requests must route there
+	// rather than through the cross-replica rehydration path.
+	s.localSessions.Store(ss.ID(), struct{}{})
 	if !cs.registered.CompareAndSwap(false, true) {
 		return
 	}
@@ -246,6 +250,39 @@ func (s *MCPServer) syncSessionResources(srv *gosdk.Server, cs *clientSession) {
 		}
 		srv.AddResource(gr, s.wrapResourceHandler(sr.Handler))
 	}
+}
+
+// isLocalSession reports whether the session ID was initialized on this server
+// instance (see MCPServer.localSessions).
+func (s *MCPServer) isLocalSession(id string) bool {
+	_, ok := s.localSessions.Load(id)
+	return ok
+}
+
+// forgetSession drops all local bookkeeping for a session ID. It is called when
+// a session is terminated (DELETE) so a later request with the same ID is not
+// mistaken for a live local session.
+func (s *MCPServer) forgetSession(id string) {
+	s.localSessions.Delete(id)
+	s.sessions.Delete(id)
+	s.pendingReqCtx.Delete(id)
+}
+
+// bindRehydratedSession binds the clientSession for a session that was created
+// on another replica and is being rehydrated here (see StreamableHTTPServer's
+// rehydration path). Unlike registerAndSync it does NOT fire OnRegisterSession
+// and does NOT mark the session local: a rehydrated session skips the
+// initialize handshake (and therefore ToolHive's Generate/CreateSession
+// two-phase creation), and cross-replica capability projection is driven by the
+// before-list/before-call hooks (ToolHive's lazy per-session tool injection),
+// not by OnRegisterSession. Binding owner+boundServer here lets those hooks'
+// SetSessionTools/SetSessionResources reconcile the overlay onto srv.
+func (s *MCPServer) bindRehydratedSession(id string, ss *gosdk.ServerSession, srv *gosdk.Server) {
+	cs := s.sessionFor(id)
+	cs.goSession.Store(ss)
+	cs.owner = s
+	cs.boundServer.Store(srv)
+	cs.Initialize()
 }
 
 // ClientSessionFromContext returns the ClientSession stored in ctx, or nil.

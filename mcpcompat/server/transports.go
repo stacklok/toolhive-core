@@ -88,7 +88,33 @@ type StreamableHTTPServer struct {
 	handler  http.Handler
 	buildErr error
 	httpSrv  *http.Server
+
+	// rehydrated holds sessions that were created on another replica and
+	// reconstructed here (see the rehydration path in ServeHTTP). Guarded by
+	// rehydratedMu. These use a custom StreamableServerTransport (SSE responses)
+	// rather than the go-sdk StreamableHTTPHandler, because the handler 404s any
+	// session ID it did not create itself.
+	rehydratedMu sync.Mutex
+	rehydrated   map[string]*rehydratedSession
 }
+
+// rehydratedSession is a session reconstructed from cross-replica shared state
+// (validated via the SessionIdManager) and served by a per-session go-sdk
+// StreamableServerTransport.
+type rehydratedSession struct {
+	transport *gosdk.StreamableServerTransport
+	session   *gosdk.ServerSession
+}
+
+// defaultRehydratedProtocolVersion is the MCP protocol version seeded into a
+// rehydrated session when the request carries no MCP-Protocol-Version header. It
+// matches a widely-supported spec revision; clients that resumed a session send
+// the negotiated version header, which takes precedence.
+const defaultRehydratedProtocolVersion = "2025-06-18"
+
+// mcpProtocolVersionHeader is the HTTP header carrying the negotiated MCP
+// protocol version on subsequent (post-initialize) requests.
+const mcpProtocolVersionHeader = "MCP-Protocol-Version"
 
 // NewStreamableHTTPServer creates a Streamable HTTP server for the MCP server.
 func NewStreamableHTTPServer(server *MCPServer, opts ...StreamableHTTPOption) *StreamableHTTPServer {
@@ -171,16 +197,131 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	// map. Rewrite the status to 200 for compatibility and forward the termination
 	// to the manager so ToolHive's session storage is cleaned up in lockstep.
 	if r.Method == http.MethodDelete {
+		sid := r.Header.Get("Mcp-Session-Id")
+		s.deleteRehydrated(sid)
+		s.mcp.forgetSession(sid)
 		rw := &statusRewriter{ResponseWriter: w, from: http.StatusNoContent, to: http.StatusOK}
 		s.handler.ServeHTTP(rw, r)
-		if s.sessionIDMgr != nil {
-			if sid := r.Header.Get("Mcp-Session-Id"); sid != "" {
-				_, _ = s.sessionIDMgr.Terminate(sid)
-			}
+		if s.sessionIDMgr != nil && sid != "" {
+			_, _ = s.sessionIDMgr.Terminate(sid)
 		}
 		return
 	}
+
+	// Cross-replica routing: a request carrying a session ID that was NOT
+	// initialized on this instance (its initialize handshake happened on another
+	// replica) cannot be served by the go-sdk StreamableHTTPHandler, which 404s
+	// any session ID it did not create. Validate it against the shared
+	// SessionIdManager and, if valid, rehydrate a local session for it.
+	if sid := r.Header.Get("Mcp-Session-Id"); sid != "" && s.sessionIDMgr != nil && !s.mcp.isLocalSession(sid) {
+		s.serveRehydrated(w, r, sid)
+		return
+	}
+
 	s.handler.ServeHTTP(w, r)
+}
+
+// serveRehydrated routes a request for a session created on another replica.
+// It validates the session ID against the shared SessionIdManager and serves it
+// through a locally-reconstructed session, matching mcp-go's behavior where any
+// replica sharing the manager's backing store accepts the session.
+func (s *StreamableHTTPServer) serveRehydrated(w http.ResponseWriter, r *http.Request, sid string) {
+	rt := s.getRehydrated(sid)
+	if rt == nil {
+		isTerminated, err := s.sessionIDMgr.Validate(sid)
+		if err != nil {
+			http.Error(w, "Invalid session ID", http.StatusNotFound)
+			return
+		}
+		if isTerminated {
+			http.Error(w, "Session terminated", http.StatusNotFound)
+			return
+		}
+		rt, err = s.rehydrate(r, sid)
+		if err != nil {
+			if s.mcp.logger != nil {
+				s.mcp.logger.Error("rehydrating cross-replica session", "session_id", sid, "error", err)
+			}
+			http.Error(w, "failed to rehydrate session", http.StatusInternalServerError)
+			return
+		}
+	}
+	rt.transport.ServeHTTP(w, r)
+}
+
+// getRehydrated returns the reconstructed session for sid, or nil.
+func (s *StreamableHTTPServer) getRehydrated(sid string) *rehydratedSession {
+	s.rehydratedMu.Lock()
+	defer s.rehydratedMu.Unlock()
+	return s.rehydrated[sid]
+}
+
+// deleteRehydrated closes and drops a reconstructed session, if present.
+func (s *StreamableHTTPServer) deleteRehydrated(sid string) {
+	if sid == "" {
+		return
+	}
+	s.rehydratedMu.Lock()
+	rt := s.rehydrated[sid]
+	delete(s.rehydrated, sid)
+	s.rehydratedMu.Unlock()
+	if rt != nil {
+		_ = rt.session.Close()
+	}
+}
+
+// rehydrate reconstructs a session that was created on another replica: it
+// builds a fresh per-session go-sdk server (carrying this instance's tools plus
+// the before-hook lazy-injection path), connects a StreamableServerTransport
+// seeded with an already-initialized state (so it accepts non-initialize
+// requests and can perform server->client calls such as elicitation), binds the
+// clientSession so the before-hooks can reconcile the per-session overlay, and
+// caches it keyed by session ID.
+func (s *StreamableHTTPServer) rehydrate(r *http.Request, sid string) (*rehydratedSession, error) {
+	s.rehydratedMu.Lock()
+	defer s.rehydratedMu.Unlock()
+	// Double-check under the lock in case a concurrent request rehydrated first.
+	if rt, ok := s.rehydrated[sid]; ok {
+		return rt, nil
+	}
+
+	srv, err := s.mcp.buildServer(nil)
+	if err != nil {
+		return nil, err
+	}
+
+	protocolVersion := r.Header.Get(mcpProtocolVersionHeader)
+	if protocolVersion == "" {
+		protocolVersion = defaultRehydratedProtocolVersion
+	}
+
+	transport := &gosdk.StreamableServerTransport{SessionID: sid, Stateless: false}
+	state := &gosdk.ServerSessionState{
+		InitializeParams: &gosdk.InitializeParams{
+			ProtocolVersion: protocolVersion,
+			// Seed the elicitation capability so a server->client elicitation on a
+			// rehydrated session passes go-sdk's capability gate. A stateless
+			// session cannot do this; this is what proves the rehydrated session is
+			// a full, stateful session.
+			Capabilities: &gosdk.ClientCapabilities{Elicitation: &gosdk.ElicitationCapabilities{}},
+		},
+		InitializedParams: &gosdk.InitializedParams{},
+		LogLevel:          "info",
+	}
+	// Detach from the request context: this session outlives the request that
+	// created it (subsequent requests on other HTTP connections reuse it).
+	session, err := srv.Connect(context.WithoutCancel(r.Context()), transport, &gosdk.ServerSessionOptions{State: state})
+	if err != nil {
+		return nil, err
+	}
+	s.mcp.bindRehydratedSession(sid, session, srv)
+
+	rt := &rehydratedSession{transport: transport, session: session}
+	if s.rehydrated == nil {
+		s.rehydrated = make(map[string]*rehydratedSession)
+	}
+	s.rehydrated[sid] = rt
+	return rt, nil
 }
 
 // statusRewriter is an http.ResponseWriter that rewrites a single status code on

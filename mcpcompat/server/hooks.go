@@ -53,7 +53,6 @@ func (c *Hooks) beforeCallTool(ctx context.Context, id any, message *mcp.CallToo
 	}
 }
 
-//nolint:unused // fired from the tools/list path once list interception is wired.
 func (c *Hooks) beforeListTools(ctx context.Context, id any, message *mcp.ListToolsRequest) {
 	for _, h := range c.listToolsHooks {
 		h(ctx, id, message)

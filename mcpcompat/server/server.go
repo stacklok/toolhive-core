@@ -119,6 +119,15 @@ type MCPServer struct {
 
 	sessions sync.Map // sessionID -> *clientSession
 
+	// localSessions records the IDs of sessions that were initialized on THIS
+	// server instance (i.e. the initialize handshake was handled here by the
+	// go-sdk StreamableHTTPHandler). The Streamable HTTP transport uses it to
+	// decide, for a request carrying an existing session ID, whether the session
+	// is local (route to the go-sdk handler, which owns its session map) or was
+	// created on another replica (rehydrate; see StreamableHTTPServer). Populated
+	// in registerAndSync (which only fires on this instance's initialize path).
+	localSessions sync.Map // sessionID -> struct{}
+
 	// pendingReqCtx maps an in-flight request's session ID to the HTTP request
 	// context, so the dispatch middleware can bridge per-request context values
 	// (identity, audit BackendInfo, telemetry) into the handler context. The
