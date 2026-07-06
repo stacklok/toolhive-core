@@ -444,6 +444,16 @@ func (s *MCPServer) wrapToolHandler(h ToolHandlerFunc) gosdk.ToolHandler {
 		mreq := mcp.CallToolRequest{}
 		mreq.Params.Name = req.Params.Name
 		mreq.Params.Arguments = args
+		// Preserve the request _meta so ToolHive can propagate metadata through
+		// vMCP to backends. go-sdk's Meta is map[string]any; mcp-go's *Meta has a
+		// custom (un)marshaler, so convert via JSON.
+		if len(req.Params.Meta) > 0 {
+			meta := &mcp.Meta{}
+			if err := jsonConvert(req.Params.Meta, meta); err != nil {
+				return nil, fmt.Errorf("converting call meta: %w", err)
+			}
+			mreq.Params.Meta = meta
+		}
 
 		// Note: the before-call hook fires in sessionDispatchMiddleware, ahead of
 		// the SDK's dispatch, so per-session tool injection happens before the SDK

@@ -203,6 +203,16 @@ func (c *Client) CallTool(ctx context.Context, request mcp.CallToolRequest) (*mc
 		Name:      request.Params.Name,
 		Arguments: request.Params.Arguments,
 	}
+	// Preserve the request _meta (ToolHive propagates metadata through vMCP to
+	// backends via this field). mcp-go's *Meta flattens its AdditionalFields to
+	// top-level _meta keys, so convert via JSON into go-sdk's Meta (map[string]any).
+	if request.Params.Meta != nil {
+		m := gosdk.Meta{}
+		if err := jsonConvert(request.Params.Meta, &m); err != nil {
+			return nil, fmt.Errorf("converting call meta: %w", err)
+		}
+		params.Meta = m
+	}
 	res, err := s.CallTool(ctx, params)
 	if err != nil {
 		return nil, mapCallError(err)
