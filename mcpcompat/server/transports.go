@@ -6,12 +6,48 @@ package server
 import (
 	"context"
 	"fmt"
+	"mime"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	gosdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// bothAcceptMediaTypes is the Accept header value the go-sdk Streamable HTTP and
+// SSE handlers require on a POST. mcp-go's server ignored Accept entirely, so
+// clients such as ToolHive's tests that POST with only Content-Type set (no
+// Accept) must be tolerated; the shim injects this value when either required
+// media type is absent to restore that leniency.
+const bothAcceptMediaTypes = "application/json, text/event-stream"
+
+// ensureAcceptMediaTypes restores mcp-go's Accept-header leniency: the go-sdk
+// handlers reject a request whose Accept header does not advertise both
+// application/json and text/event-stream. When either is missing this sets the
+// Accept header to advertise both so the request is accepted, matching mcp-go.
+func ensureAcceptMediaTypes(r *http.Request) {
+	var jsonOK, streamOK bool
+	for _, value := range r.Header.Values("Accept") {
+		for _, part := range strings.Split(value, ",") {
+			mediaType, _, err := mime.ParseMediaType(part)
+			if err != nil {
+				continue
+			}
+			switch mediaType {
+			case "application/json", "application/*", "*/*":
+				jsonOK = true
+			}
+			switch mediaType {
+			case "text/event-stream", "text/*", "*/*":
+				streamOK = true
+			}
+		}
+	}
+	if !jsonOK || !streamOK {
+		r.Header.Set("Accept", bothAcceptMediaTypes)
+	}
+}
 
 // --- stdio -----------------------------------------------------------------
 
@@ -23,7 +59,7 @@ type stdioConfig struct{}
 // ServeStdio runs the MCP server over stdio until the context is done. It
 // mirrors mcp-go's server.ServeStdio.
 func ServeStdio(server *MCPServer, _ ...StdioOption) error {
-	srv, err := server.buildServer("")
+	srv, err := server.buildServer(nil)
 	if err != nil {
 		return err
 	}
@@ -88,13 +124,24 @@ func WithHTTPContextFunc(fn HTTPContextFunc) StreamableHTTPOption {
 
 func (s *StreamableHTTPServer) build() {
 	s.once.Do(func() {
-		srv, err := s.mcp.buildServer("")
-		if err != nil {
+		var gen func() string
+		if s.sessionIDMgr != nil {
+			gen = s.sessionIDMgr.Generate
+		}
+		// Validate the server configuration once up-front so a bad registration
+		// surfaces as a clean 500 rather than a per-request nil.
+		if _, err := s.mcp.buildServer(gen); err != nil {
 			s.buildErr = err
 			return
 		}
-		opts := &gosdk.StreamableHTTPOptions{}
-		s.handler = gosdk.NewStreamableHTTPHandler(func(*http.Request) *gosdk.Server { return srv }, opts)
+		// JSONResponse makes the handler reply with application/json rather than
+		// text/event-stream for request/response exchanges, matching mcp-go's
+		// server so callers that json.Decode the response body keep working.
+		opts := &gosdk.StreamableHTTPOptions{JSONResponse: true}
+		// A fresh go-sdk server per client session lets each session carry its own
+		// tool/resource overlay (mcp-go's per-session projection), synced by the
+		// registration middleware buildServer installs.
+		s.handler = gosdk.NewStreamableHTTPHandler(s.mcp.getServerFunc(gen), opts)
 	})
 }
 
@@ -105,10 +152,49 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		http.Error(w, fmt.Sprintf("building server: %v", s.buildErr), http.StatusInternalServerError)
 		return
 	}
+	ensureAcceptMediaTypes(r)
 	if s.contextFunc != nil {
 		r = r.WithContext(s.contextFunc(r.Context(), r))
 	}
+	// Record the request context so the dispatch middleware can bridge its values
+	// into the handler running on go-sdk's detached session goroutine. Keyed by
+	// the client-supplied session ID; the initialize request (no session ID yet)
+	// carries no per-request values that the handler needs. This POST is handled
+	// synchronously (JSONResponse), so the entry is valid for the handler's whole
+	// lifetime and cleared when ServeHTTP returns.
+	if sid := r.Header.Get("Mcp-Session-Id"); sid != "" {
+		s.mcp.setPendingRequestContext(r.Context(), sid)
+		defer s.mcp.clearPendingRequestContext(sid)
+	}
+	// DELETE terminates the session. mcp-go answered 200 and drove the supplied
+	// SessionIdManager's Terminate; go-sdk answers 204 and manages its own session
+	// map. Rewrite the status to 200 for compatibility and forward the termination
+	// to the manager so ToolHive's session storage is cleaned up in lockstep.
+	if r.Method == http.MethodDelete {
+		rw := &statusRewriter{ResponseWriter: w, from: http.StatusNoContent, to: http.StatusOK}
+		s.handler.ServeHTTP(rw, r)
+		if s.sessionIDMgr != nil {
+			if sid := r.Header.Get("Mcp-Session-Id"); sid != "" {
+				_, _ = s.sessionIDMgr.Terminate(sid)
+			}
+		}
+		return
+	}
 	s.handler.ServeHTTP(w, r)
+}
+
+// statusRewriter is an http.ResponseWriter that rewrites a single status code on
+// WriteHeader (used to translate go-sdk's 204 DELETE response to mcp-go's 200).
+type statusRewriter struct {
+	http.ResponseWriter
+	from, to int
+}
+
+func (s *statusRewriter) WriteHeader(code int) {
+	if code == s.from {
+		code = s.to
+	}
+	s.ResponseWriter.WriteHeader(code)
 }
 
 // Start serves on addr until Shutdown is called.
@@ -165,12 +251,11 @@ func WithMessageEndpoint(endpoint string) SSEOption {
 
 func (s *SSEServer) build() {
 	s.once.Do(func() {
-		srv, err := s.mcp.buildServer("")
-		if err != nil {
+		if _, err := s.mcp.buildServer(nil); err != nil {
 			s.buildErr = err
 			return
 		}
-		s.handler = gosdk.NewSSEHandler(func(*http.Request) *gosdk.Server { return srv }, nil)
+		s.handler = gosdk.NewSSEHandler(s.mcp.getServerFunc(nil), nil)
 	})
 }
 
@@ -180,6 +265,19 @@ func (s *SSEServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if s.buildErr != nil {
 		http.Error(w, fmt.Sprintf("building server: %v", s.buildErr), http.StatusInternalServerError)
 		return
+	}
+	ensureAcceptMediaTypes(r)
+	// mcp-go advertised a distinct message endpoint for client POSTs, whereas
+	// go-sdk derives the endpoint it advertises in the SSE "endpoint" event from
+	// the SSE (GET) request's own path plus a sessionid query. Rewrite the GET
+	// request path to the configured message endpoint so the advertised POST
+	// target matches mcp-go's split-path model (and any middleware mounted on the
+	// message path). The stream itself is already served on this connection, so
+	// the path change only affects the advertised endpoint. POSTs are dispatched
+	// by sessionid and are path-independent.
+	if r.Method == http.MethodGet && s.messageEndpoint != "" && r.URL.Path != s.messageEndpoint {
+		r = r.Clone(r.Context())
+		r.URL.Path = s.messageEndpoint
 	}
 	s.handler.ServeHTTP(w, r)
 }

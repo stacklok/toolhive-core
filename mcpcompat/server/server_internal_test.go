@@ -73,31 +73,44 @@ func TestHooks_Fire(t *testing.T) {
 	assert.True(t, listFired)
 }
 
-func TestBuildServer_MergesSessionTools(t *testing.T) {
+func TestBuildServer_GlobalAndSessionTools(t *testing.T) {
 	t.Parallel()
 	s := NewMCPServer("s", "1")
 	s.AddTool(mcp.NewTool("global", mcp.WithDescription("g")),
 		func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) { return nil, nil })
 
-	// Register a session carrying an additional per-session tool.
+	// Building the global server (with the globally-registered tool) must succeed.
+	// Per-session overlays are no longer baked in here; they are synced onto the
+	// per-session server by syncSessionTools once the session registers.
+	srv, err := s.buildServer(nil)
+	require.NoError(t, err)
+	require.NotNil(t, srv)
+
+	// A session carrying an additional per-session tool syncs onto the server
+	// without error, including a tool that declares no input schema (mcp-go was
+	// lenient; the shim normalizes it to the empty object schema).
 	cs := s.sessionFor("sid")
 	cs.SetSessionTools(map[string]ServerTool{
 		"session-only": {
-			Tool:    mcp.NewTool("session-only", mcp.WithDescription("s")),
+			Tool:    mcp.Tool{Name: "session-only"},
 			Handler: func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) { return nil, nil },
 		},
 	})
+	assert.NotPanics(t, func() { s.syncSessionTools(srv, cs) })
+}
 
-	// Building for the session must convert both the global and the session
-	// tool without error.
-	srv, err := s.buildServer("sid")
-	require.NoError(t, err)
-	assert.NotNil(t, srv)
+func TestBuildServer_WithSessionIDGenerator(t *testing.T) {
+	t.Parallel()
+	s := NewMCPServer("s", "1")
+	called := false
+	gen := func() string { called = true; return "generated-id" }
 
-	// Building the global server (no session) must also succeed.
-	gsrv, err := s.buildServer("")
+	srv, err := s.buildServer(gen)
 	require.NoError(t, err)
-	assert.NotNil(t, gsrv)
+	require.NotNil(t, srv)
+	// The generator is installed on the server (invoked by the SDK per new
+	// session), not called at build time.
+	assert.False(t, called)
 }
 
 func TestClientSessionFromContext_Empty(t *testing.T) {

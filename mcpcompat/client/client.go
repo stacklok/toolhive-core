@@ -17,6 +17,7 @@ package client
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -203,7 +204,44 @@ func (c *Client) ReadResource(ctx context.Context, request mcp.ReadResourceReque
 	if err != nil {
 		return nil, mapCallError(err)
 	}
-	return convertResult[mcp.ReadResourceResult](res)
+	return convertReadResourceResult(res), nil
+}
+
+// convertReadResourceResult converts a go-sdk ReadResourceResult into its
+// mcp-go-shaped equivalent. mcp-go's ReadResourceResult.Contents is a slice of
+// the mcp.ResourceContents interface with no custom unmarshaler, so a JSON
+// round-trip cannot populate it; each go-sdk ResourceContents struct is mapped
+// explicitly to the concrete text/blob mcp-go type instead.
+func convertReadResourceResult(res *gosdk.ReadResourceResult) *mcp.ReadResourceResult {
+	out := &mcp.ReadResourceResult{}
+	if len(res.Meta) > 0 {
+		out.Meta = mcp.NewMetaFromMap(map[string]any(res.Meta))
+	}
+	for _, rc := range res.Contents {
+		if rc == nil {
+			continue
+		}
+		var meta map[string]any
+		if len(rc.Meta) > 0 {
+			meta = map[string]any(rc.Meta)
+		}
+		if len(rc.Blob) > 0 {
+			out.Contents = append(out.Contents, mcp.BlobResourceContents{
+				URI:      rc.URI,
+				MIMEType: rc.MIMEType,
+				Blob:     base64.StdEncoding.EncodeToString(rc.Blob),
+				Meta:     meta,
+			})
+			continue
+		}
+		out.Contents = append(out.Contents, mcp.TextResourceContents{
+			URI:      rc.URI,
+			MIMEType: rc.MIMEType,
+			Text:     rc.Text,
+			Meta:     meta,
+		})
+	}
+	return out
 }
 
 // GetPrompt gets a prompt, rendered with the provided arguments.
@@ -219,7 +257,37 @@ func (c *Client) GetPrompt(ctx context.Context, request mcp.GetPromptRequest) (*
 	if err != nil {
 		return nil, mapCallError(err)
 	}
-	return convertResult[mcp.GetPromptResult](res)
+	return convertGetPromptResult(res)
+}
+
+// convertGetPromptResult converts a go-sdk GetPromptResult into its mcp-go-shaped
+// equivalent. mcp-go's PromptMessage.Content is the mcp.Content interface with no
+// custom unmarshaler, so a JSON round-trip cannot populate it; each message's
+// content is re-marshaled and decoded via mcp.UnmarshalContent instead.
+func convertGetPromptResult(res *gosdk.GetPromptResult) (*mcp.GetPromptResult, error) {
+	out := &mcp.GetPromptResult{Description: res.Description}
+	if len(res.Meta) > 0 {
+		out.Meta = mcp.NewMetaFromMap(map[string]any(res.Meta))
+	}
+	for _, pm := range res.Messages {
+		if pm == nil {
+			continue
+		}
+		msg := mcp.PromptMessage{Role: mcp.Role(pm.Role)}
+		if pm.Content != nil {
+			cb, err := json.Marshal(pm.Content)
+			if err != nil {
+				return nil, fmt.Errorf("marshaling prompt content: %w", err)
+			}
+			content, err := mcp.UnmarshalContent(cb)
+			if err != nil {
+				return nil, fmt.Errorf("converting prompt content: %w", err)
+			}
+			msg.Content = content
+		}
+		out.Messages = append(out.Messages, msg)
+	}
+	return out, nil
 }
 
 // ListResources lists the server's resources.

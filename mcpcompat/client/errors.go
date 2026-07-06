@@ -7,7 +7,10 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+
 	"github.com/stacklok/toolhive-core/mcpcompat/client/transport"
+	mcp "github.com/stacklok/toolhive-core/mcpcompat/mcp"
 )
 
 // mapConnectError maps an error returned by the underlying go-sdk Connect call
@@ -17,8 +20,18 @@ func mapConnectError(err error) error {
 }
 
 // mapCallError maps an error returned by an underlying go-sdk request call onto
-// the transport-level sentinels ToolHive checks for.
+// the sentinels ToolHive checks for. A JSON-RPC -32601 response is surfaced as
+// mcp.ErrMethodNotFound (as mcp-go did) so callers that recover from a backend
+// lacking an optional method — e.g. resources/list or prompts/list — via
+// errors.Is(err, mcp.ErrMethodNotFound) keep working.
 func mapCallError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var wireErr *jsonrpc.Error
+	if errors.As(err, &wireErr) && wireErr.Code == jsonrpc.CodeMethodNotFound {
+		return errors.Join(mcp.ErrMethodNotFound, err)
+	}
 	return mapTransportError(err)
 }
 

@@ -69,12 +69,22 @@ type SessionIdManager interface {
 type clientSession struct {
 	id          string
 	initialized atomic.Bool
+	registered  atomic.Bool
 	notifCh     chan mcp.JSONRPCNotification
 	goSession   atomic.Pointer[gosdk.ServerSession]
+
+	// owner and boundServer are set when the session's go-sdk server is bound
+	// (at registration). They let SetSessionTools/SetSessionResources reconcile
+	// the per-session overlay onto the live go-sdk server at runtime.
+	owner       *MCPServer
+	boundServer atomic.Pointer[gosdk.Server]
 
 	mu        sync.RWMutex
 	tools     map[string]ServerTool
 	resources map[string]ServerResource
+	// sdkToolNames tracks the tool names this session has added to its go-sdk
+	// server, so a later SetSessionTools can remove the ones that went away.
+	sdkToolNames map[string]struct{}
 }
 
 func newClientSession(id string) *clientSession {
@@ -111,10 +121,14 @@ func (c *clientSession) GetSessionTools() map[string]ServerTool {
 
 func (c *clientSession) SetSessionTools(tools map[string]ServerTool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.tools = make(map[string]ServerTool, len(tools))
 	for k, v := range tools {
 		c.tools[k] = v
+	}
+	c.mu.Unlock()
+	// Reconcile the overlay onto the live go-sdk server if one is bound.
+	if srv := c.boundServer.Load(); srv != nil && c.owner != nil {
+		c.owner.syncSessionTools(srv, c)
 	}
 }
 
@@ -130,10 +144,13 @@ func (c *clientSession) GetSessionResources() map[string]ServerResource {
 
 func (c *clientSession) SetSessionResources(resources map[string]ServerResource) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.resources = make(map[string]ServerResource, len(resources))
 	for k, v := range resources {
 		c.resources[k] = v
+	}
+	c.mu.Unlock()
+	if srv := c.boundServer.Load(); srv != nil && c.owner != nil {
+		c.owner.syncSessionResources(srv, c)
 	}
 }
 
@@ -161,17 +178,73 @@ func (s *MCPServer) sessionFor(id string) *clientSession {
 	return actual.(*clientSession)
 }
 
-// onInitialized fires when a go-sdk session finishes initialization. It
-// registers the session and invokes the OnRegisterSession hooks.
-func (s *MCPServer) onInitialized(ctx context.Context, req *gosdk.InitializedRequest) {
-	if req == nil || req.Session == nil {
+// registerAndSync registers the session for the given go-sdk ServerSession,
+// firing the OnRegisterSession hooks exactly once and then reconciling any
+// per-session tool/resource overlay the hooks installed onto srv (the go-sdk
+// server bound to this session). It is invoked from the initialize dispatch
+// middleware (matching mcp-go's on-initialize timing) and, defensively, from the
+// InitializedHandler; the once-guard makes the second call a cheap no-op.
+func (s *MCPServer) registerAndSync(ctx context.Context, ss *gosdk.ServerSession, srv *gosdk.Server) {
+	if ss == nil {
 		return
 	}
-	cs := s.sessionFor(req.Session.ID())
-	cs.goSession.Store(req.Session)
+	cs := s.sessionFor(ss.ID())
+	cs.goSession.Store(ss)
+	cs.owner = s
+	cs.boundServer.Store(srv)
+	if !cs.registered.CompareAndSwap(false, true) {
+		return
+	}
 	cs.Initialize()
 	if s.hooks != nil {
 		s.hooks.registerSession(ctx, cs)
+	}
+	// The hooks may have installed per-session tools/resources via
+	// SetSessionTools/SetSessionResources; those calls reconcile onto srv
+	// themselves now that boundServer is set. Sync once more here to cover any
+	// overlay set before the server was bound.
+	s.syncSessionTools(srv, cs)
+	s.syncSessionResources(srv, cs)
+}
+
+// syncSessionTools reconciles the session's tool overlay onto its go-sdk server:
+// tools present in the overlay are added (overwriting by name) and tools that
+// were previously added for this session but are no longer present are removed.
+func (s *MCPServer) syncSessionTools(srv *gosdk.Server, cs *clientSession) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	newNames := make(map[string]struct{}, len(cs.tools))
+	for name, st := range cs.tools {
+		gt, err := toGoSDKTool(st.Tool)
+		if err != nil {
+			continue
+		}
+		srv.AddTool(gt, s.wrapToolHandler(st.Handler))
+		newNames[name] = struct{}{}
+	}
+	var removed []string
+	for name := range cs.sdkToolNames {
+		if _, ok := newNames[name]; !ok {
+			removed = append(removed, name)
+		}
+	}
+	if len(removed) > 0 {
+		srv.RemoveTools(removed...)
+	}
+	cs.sdkToolNames = newNames
+}
+
+// syncSessionResources adds the session's resource overlay onto its go-sdk
+// server. Resources are add-only here (ToolHive sets them once at registration).
+func (s *MCPServer) syncSessionResources(srv *gosdk.Server, cs *clientSession) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	for _, sr := range cs.resources {
+		gr := &gosdk.Resource{}
+		if err := jsonConvert(sr.Resource, gr); err != nil {
+			continue
+		}
+		srv.AddResource(gr, s.wrapResourceHandler(sr.Handler))
 	}
 }
 

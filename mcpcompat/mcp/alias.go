@@ -200,6 +200,12 @@ var (
 // GetTextFromContent extracts text from a content value, if any.
 var GetTextFromContent = mcpgo.GetTextFromContent
 
+// UnmarshalContent decodes a single JSON content object into the concrete
+// mcp.Content implementation (TextContent, ImageContent, ...). It is used by the
+// client shim to populate the Content interface fields of PromptMessage, which
+// mcp-go cannot unmarshal generically.
+var UnmarshalContent = mcpgo.UnmarshalContent
+
 // NewMetaFromMap builds a *Meta from a raw map.
 var NewMetaFromMap = mcpgo.NewMetaFromMap
 
