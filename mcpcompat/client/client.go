@@ -46,6 +46,11 @@ type Client struct {
 	connLostMu   sync.Mutex
 	connLost     func(error)
 	watchStarted bool
+
+	// resume holds the raw JSON-RPC-over-HTTP machinery used when the client
+	// resumes a pre-existing session (transport.WithSession) without calling
+	// Initialize. It is lazily created on the first resumed request. See resume.go.
+	resume *resumeState
 }
 
 // NewStreamableHttpClient creates a Streamable HTTP MCP client for baseURL. Like
@@ -157,6 +162,9 @@ func (c *Client) Close() error {
 
 // Ping verifies the server is responsive.
 func (c *Client) Ping(ctx context.Context) error {
+	if c.isResume() {
+		return c.resumeCall(ctx, "ping", struct{}{}, nil)
+	}
 	s, err := c.sessionFor()
 	if err != nil {
 		return err
@@ -166,6 +174,10 @@ func (c *Client) Ping(ctx context.Context) error {
 
 // ListTools lists the server's tools.
 func (c *Client) ListTools(ctx context.Context, request mcp.ListToolsRequest) (*mcp.ListToolsResult, error) {
+	if c.isResume() {
+		out := &mcp.ListToolsResult{}
+		return out, c.resumeCall(ctx, "tools/list", request.Params, out)
+	}
 	s, err := c.sessionFor()
 	if err != nil {
 		return nil, err
@@ -179,6 +191,10 @@ func (c *Client) ListTools(ctx context.Context, request mcp.ListToolsRequest) (*
 
 // CallTool invokes a tool.
 func (c *Client) CallTool(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	if c.isResume() {
+		out := &mcp.CallToolResult{}
+		return out, c.resumeCall(ctx, "tools/call", request.Params, out)
+	}
 	s, err := c.sessionFor()
 	if err != nil {
 		return nil, err
@@ -196,6 +212,13 @@ func (c *Client) CallTool(ctx context.Context, request mcp.CallToolRequest) (*mc
 
 // ReadResource reads a resource by URI.
 func (c *Client) ReadResource(ctx context.Context, request mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	if c.isResume() {
+		raw := &gosdk.ReadResourceResult{}
+		if err := c.resumeCall(ctx, "resources/read", request.Params, raw); err != nil {
+			return nil, err
+		}
+		return convertReadResourceResult(raw), nil
+	}
 	s, err := c.sessionFor()
 	if err != nil {
 		return nil, err
@@ -246,6 +269,13 @@ func convertReadResourceResult(res *gosdk.ReadResourceResult) *mcp.ReadResourceR
 
 // GetPrompt gets a prompt, rendered with the provided arguments.
 func (c *Client) GetPrompt(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+	if c.isResume() {
+		raw := &gosdk.GetPromptResult{}
+		if err := c.resumeCall(ctx, "prompts/get", request.Params, raw); err != nil {
+			return nil, err
+		}
+		return convertGetPromptResult(raw)
+	}
 	s, err := c.sessionFor()
 	if err != nil {
 		return nil, err
@@ -292,6 +322,10 @@ func convertGetPromptResult(res *gosdk.GetPromptResult) (*mcp.GetPromptResult, e
 
 // ListResources lists the server's resources.
 func (c *Client) ListResources(ctx context.Context, request mcp.ListResourcesRequest) (*mcp.ListResourcesResult, error) {
+	if c.isResume() {
+		out := &mcp.ListResourcesResult{}
+		return out, c.resumeCall(ctx, "resources/list", request.Params, out)
+	}
 	s, err := c.sessionFor()
 	if err != nil {
 		return nil, err
@@ -305,6 +339,10 @@ func (c *Client) ListResources(ctx context.Context, request mcp.ListResourcesReq
 
 // ListPrompts lists the server's prompts.
 func (c *Client) ListPrompts(ctx context.Context, request mcp.ListPromptsRequest) (*mcp.ListPromptsResult, error) {
+	if c.isResume() {
+		out := &mcp.ListPromptsResult{}
+		return out, c.resumeCall(ctx, "prompts/list", request.Params, out)
+	}
 	s, err := c.sessionFor()
 	if err != nil {
 		return nil, err
@@ -320,6 +358,10 @@ func (c *Client) ListPrompts(ctx context.Context, request mcp.ListPromptsRequest
 func (c *Client) ListResourceTemplates(
 	ctx context.Context, request mcp.ListResourceTemplatesRequest,
 ) (*mcp.ListResourceTemplatesResult, error) {
+	if c.isResume() {
+		out := &mcp.ListResourceTemplatesResult{}
+		return out, c.resumeCall(ctx, "resources/templates/list", request.Params, out)
+	}
 	s, err := c.sessionFor()
 	if err != nil {
 		return nil, err
