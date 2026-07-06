@@ -73,6 +73,7 @@ func (*Client) Start(_ context.Context) error { return nil }
 // Initialize connects the underlying go-sdk client and performs the MCP
 // initialize handshake using the supplied client info and capabilities.
 func (c *Client) Initialize(ctx context.Context, request mcp.InitializeRequest) (*mcp.InitializeResult, error) {
+	ctx = withErrCapture(ctx)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -110,7 +111,7 @@ func (c *Client) Initialize(ctx context.Context, request mcp.InitializeRequest) 
 
 	session, err := gc.Connect(ctx, tr, nil)
 	if err != nil {
-		return nil, mapConnectError(err)
+		return nil, mapConnectError(ctx, err)
 	}
 
 	c.client = gc
@@ -174,6 +175,7 @@ func (c *Client) Ping(ctx context.Context) error {
 
 // ListTools lists the server's tools.
 func (c *Client) ListTools(ctx context.Context, request mcp.ListToolsRequest) (*mcp.ListToolsResult, error) {
+	ctx = withErrCapture(ctx)
 	if c.isResume() {
 		out := &mcp.ListToolsResult{}
 		return out, c.resumeCall(ctx, "tools/list", request.Params, out)
@@ -184,13 +186,14 @@ func (c *Client) ListTools(ctx context.Context, request mcp.ListToolsRequest) (*
 	}
 	res, err := s.ListTools(ctx, &gosdk.ListToolsParams{Cursor: string(request.Params.Cursor)})
 	if err != nil {
-		return nil, mapCallError(err)
+		return nil, mapCallError(ctx, err)
 	}
 	return convertResult[mcp.ListToolsResult](res)
 }
 
 // CallTool invokes a tool.
 func (c *Client) CallTool(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ctx = withErrCapture(ctx)
 	if c.isResume() {
 		out := &mcp.CallToolResult{}
 		return out, c.resumeCall(ctx, "tools/call", request.Params, out)
@@ -215,13 +218,14 @@ func (c *Client) CallTool(ctx context.Context, request mcp.CallToolRequest) (*mc
 	}
 	res, err := s.CallTool(ctx, params)
 	if err != nil {
-		return nil, mapCallError(err)
+		return nil, mapCallError(ctx, err)
 	}
 	return convertResult[mcp.CallToolResult](res)
 }
 
 // ReadResource reads a resource by URI.
 func (c *Client) ReadResource(ctx context.Context, request mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	ctx = withErrCapture(ctx)
 	if c.isResume() {
 		raw := &gosdk.ReadResourceResult{}
 		if err := c.resumeCall(ctx, "resources/read", request.Params, raw); err != nil {
@@ -235,7 +239,7 @@ func (c *Client) ReadResource(ctx context.Context, request mcp.ReadResourceReque
 	}
 	res, err := s.ReadResource(ctx, &gosdk.ReadResourceParams{URI: request.Params.URI})
 	if err != nil {
-		return nil, mapCallError(err)
+		return nil, mapCallError(ctx, err)
 	}
 	return convertReadResourceResult(res), nil
 }
@@ -279,6 +283,7 @@ func convertReadResourceResult(res *gosdk.ReadResourceResult) *mcp.ReadResourceR
 
 // GetPrompt gets a prompt, rendered with the provided arguments.
 func (c *Client) GetPrompt(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+	ctx = withErrCapture(ctx)
 	if c.isResume() {
 		raw := &gosdk.GetPromptResult{}
 		if err := c.resumeCall(ctx, "prompts/get", request.Params, raw); err != nil {
@@ -295,7 +300,7 @@ func (c *Client) GetPrompt(ctx context.Context, request mcp.GetPromptRequest) (*
 		Arguments: request.Params.Arguments,
 	})
 	if err != nil {
-		return nil, mapCallError(err)
+		return nil, mapCallError(ctx, err)
 	}
 	return convertGetPromptResult(res)
 }
@@ -332,6 +337,7 @@ func convertGetPromptResult(res *gosdk.GetPromptResult) (*mcp.GetPromptResult, e
 
 // ListResources lists the server's resources.
 func (c *Client) ListResources(ctx context.Context, request mcp.ListResourcesRequest) (*mcp.ListResourcesResult, error) {
+	ctx = withErrCapture(ctx)
 	if c.isResume() {
 		out := &mcp.ListResourcesResult{}
 		return out, c.resumeCall(ctx, "resources/list", request.Params, out)
@@ -342,13 +348,14 @@ func (c *Client) ListResources(ctx context.Context, request mcp.ListResourcesReq
 	}
 	res, err := s.ListResources(ctx, &gosdk.ListResourcesParams{Cursor: string(request.Params.Cursor)})
 	if err != nil {
-		return nil, mapCallError(err)
+		return nil, mapCallError(ctx, err)
 	}
 	return convertResult[mcp.ListResourcesResult](res)
 }
 
 // ListPrompts lists the server's prompts.
 func (c *Client) ListPrompts(ctx context.Context, request mcp.ListPromptsRequest) (*mcp.ListPromptsResult, error) {
+	ctx = withErrCapture(ctx)
 	if c.isResume() {
 		out := &mcp.ListPromptsResult{}
 		return out, c.resumeCall(ctx, "prompts/list", request.Params, out)
@@ -359,7 +366,7 @@ func (c *Client) ListPrompts(ctx context.Context, request mcp.ListPromptsRequest
 	}
 	res, err := s.ListPrompts(ctx, &gosdk.ListPromptsParams{Cursor: string(request.Params.Cursor)})
 	if err != nil {
-		return nil, mapCallError(err)
+		return nil, mapCallError(ctx, err)
 	}
 	return convertResult[mcp.ListPromptsResult](res)
 }
@@ -368,6 +375,7 @@ func (c *Client) ListPrompts(ctx context.Context, request mcp.ListPromptsRequest
 func (c *Client) ListResourceTemplates(
 	ctx context.Context, request mcp.ListResourceTemplatesRequest,
 ) (*mcp.ListResourceTemplatesResult, error) {
+	ctx = withErrCapture(ctx)
 	if c.isResume() {
 		out := &mcp.ListResourceTemplatesResult{}
 		return out, c.resumeCall(ctx, "resources/templates/list", request.Params, out)
@@ -378,7 +386,7 @@ func (c *Client) ListResourceTemplates(
 	}
 	res, err := s.ListResourceTemplates(ctx, &gosdk.ListResourceTemplatesParams{Cursor: string(request.Params.Cursor)})
 	if err != nil {
-		return nil, mapCallError(err)
+		return nil, mapCallError(ctx, err)
 	}
 	return convertResult[mcp.ListResourceTemplatesResult](res)
 }
@@ -538,7 +546,13 @@ func (h *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	return base.RoundTrip(req)
+	resp, err := base.RoundTrip(req)
+	if err == nil {
+		// Capture non-2xx bodies so the error mappers can re-attach the server's
+		// message (go-sdk drops it). Restores resp.Body for downstream readers.
+		captureErrorBody(req, resp)
+	}
+	return resp, err
 }
 
 // buildHTTPClient returns an *http.Client honoring the given base client, static
@@ -547,9 +561,6 @@ func (h *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 func buildHTTPClient(
 	base *http.Client, headers map[string]string, headerFunc transport.HTTPHeaderFunc, timeout time.Duration,
 ) *http.Client {
-	if base == nil && len(headers) == 0 && headerFunc == nil && timeout == 0 {
-		return nil
-	}
 	hc := &http.Client{}
 	if base != nil {
 		*hc = *base
@@ -557,8 +568,8 @@ func buildHTTPClient(
 	if timeout > 0 {
 		hc.Timeout = timeout
 	}
-	if len(headers) > 0 || headerFunc != nil {
-		hc.Transport = &headerRoundTripper{headers: headers, headerFunc: headerFunc, base: hc.Transport}
-	}
+	// Always install the RoundTripper: besides applying static/dynamic headers it
+	// captures non-2xx response bodies for error enrichment (see errorbody.go).
+	hc.Transport = &headerRoundTripper{headers: headers, headerFunc: headerFunc, base: hc.Transport}
 	return hc
 }

@@ -4,7 +4,9 @@
 package client
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -13,10 +15,26 @@ import (
 	mcp "github.com/stacklok/toolhive-core/mcpcompat/mcp"
 )
 
+// enrichWithResponseBody re-attaches a captured non-2xx HTTP response body to
+// err (go-sdk reports only the status text and drops the body). Matches mcp-go's
+// "request failed with status N: <body>" so server-provided detail — e.g.
+// ToolHive's authorization middleware writing "Unauthorized" into a 403 body —
+// reaches callers. No-op when nothing was captured.
+func enrichWithResponseBody(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	h := capturedErr(ctx)
+	if h == nil || h.body == "" {
+		return err
+	}
+	return fmt.Errorf("%w: request failed with status %d: %s", err, h.status, strings.TrimSpace(h.body))
+}
+
 // mapConnectError maps an error returned by the underlying go-sdk Connect call
 // onto the transport-level sentinels ToolHive checks for.
-func mapConnectError(err error) error {
-	return mapTransportError(err)
+func mapConnectError(ctx context.Context, err error) error {
+	return mapTransportError(enrichWithResponseBody(ctx, err))
 }
 
 // mapCallError maps an error returned by an underlying go-sdk request call onto
@@ -24,10 +42,11 @@ func mapConnectError(err error) error {
 // mcp.ErrMethodNotFound (as mcp-go did) so callers that recover from a backend
 // lacking an optional method — e.g. resources/list or prompts/list — via
 // errors.Is(err, mcp.ErrMethodNotFound) keep working.
-func mapCallError(err error) error {
+func mapCallError(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
 	}
+	err = enrichWithResponseBody(ctx, err)
 	var wireErr *jsonrpc.Error
 	if errors.As(err, &wireErr) && wireErr.Code == jsonrpc.CodeMethodNotFound {
 		return errors.Join(mcp.ErrMethodNotFound, err)
