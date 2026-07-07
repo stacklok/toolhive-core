@@ -8,9 +8,9 @@ import (
 	"slices"
 	"time"
 
-	"github.com/mark3labs/mcp-go/mcp"
 	"gopkg.in/yaml.v3"
 
+	mcp "github.com/stacklok/toolhive-core/mcpcompat/mcp"
 	"github.com/stacklok/toolhive-core/permissions"
 )
 
