@@ -82,6 +82,7 @@ task license-fix   # Add missing license headers
 | `recovery` | HTTP panic recovery middleware (Beta) |
 | `validation/http` | RFC 7230/8707 compliant HTTP header and URI validation |
 | `validation/group` | Group name validation (lowercase alphanumeric, underscore, dash, space) |
+| `registry/types` | Skill/Server/Plugin catalog types + JSON-schema validation (Alpha) |
 
 ### Mock Generation
 

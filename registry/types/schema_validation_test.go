@@ -114,6 +114,60 @@ func TestValidateUpstreamRegistryBytes(t *testing.T) {
 			wantErr:       true,
 			errorContains: "date-time",
 		},
+		{
+			name: "valid registry with plugins",
+			data: `{
+				"version": "1.0.0",
+				"meta": {
+					"last_updated": "2024-01-15T10:30:00Z"
+				},
+				"data": {
+					"servers": [],
+					"plugins": [
+						{
+							"namespace": "io.github.stacklok",
+							"name": "pdf-processor",
+							"description": "Extract text and tables from PDF files",
+							"version": "1.0.0",
+							"packages": [
+								{
+									"registryType": "oci",
+									"identifier": "ghcr.io/stacklok/plugins/pdf-processor:1.0.0"
+								}
+							]
+						}
+					]
+				}
+			}`,
+			wantErr: false,
+		},
+		{
+			name: "registry with invalid plugin - missing namespace",
+			data: `{
+				"version": "1.0.0",
+				"meta": {
+					"last_updated": "2024-01-15T10:30:00Z"
+				},
+				"data": {
+					"servers": [],
+					"plugins": [
+						{
+							"name": "pdf-processor",
+							"description": "Extract text and tables from PDF files",
+							"version": "1.0.0",
+							"packages": [
+								{
+									"registryType": "oci",
+									"identifier": "ghcr.io/stacklok/plugins/pdf-processor:1.0.0"
+								}
+							]
+						}
+					]
+				}
+			}`,
+			wantErr:       true,
+			errorContains: errKeyNamespace,
+		},
 	}
 
 	for _, tt := range tests {
@@ -948,7 +1002,7 @@ func TestValidateSkillBytes(t *testing.T) {
 				"version": "1.0.0"
 			}`,
 			wantErr:       true,
-			errorContains: "namespace",
+			errorContains: errKeyNamespace,
 		},
 		{
 			name: "missing required name",
@@ -958,7 +1012,7 @@ func TestValidateSkillBytes(t *testing.T) {
 				"version": "1.0.0"
 			}`,
 			wantErr:       true,
-			errorContains: "name",
+			errorContains: errKeyName,
 		},
 		{
 			name: "missing required description",
@@ -1006,7 +1060,7 @@ func TestValidateSkillBytes(t *testing.T) {
 				]
 			}`,
 			wantErr:       true,
-			errorContains: "registryType",
+			errorContains: errKeyRegistryType,
 		},
 	}
 

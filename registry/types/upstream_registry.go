@@ -33,11 +33,14 @@ type UpstreamMeta struct {
 	LastUpdated string `json:"last_updated" yaml:"last_updated"`
 }
 
-// UpstreamData contains the actual registry content (servers and skills)
+// UpstreamData contains the actual registry content (servers, skills, and plugins)
 type UpstreamData struct {
 	// Servers contains the server definitions in upstream MCP format
 	Servers []upstreamv0.ServerJSON `json:"servers" yaml:"servers"`
 
 	// Skills contains the skill definitions
 	Skills []Skill `json:"skills,omitempty" yaml:"skills,omitempty"`
+
+	// Plugins contains the plugin definitions
+	Plugins []Plugin `json:"plugins,omitempty" yaml:"plugins,omitempty"`
 }
