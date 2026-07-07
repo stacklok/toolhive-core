@@ -13,6 +13,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mark3labs/mcp-go v0.55.1
+	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/modelcontextprotocol/registry v1.7.9
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
@@ -78,7 +79,7 @@ require (
 	github.com/go-openapi/validate v0.25.3 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/google/certificate-transparency-go v1.3.3 // indirect
-	github.com/google/jsonschema-go v0.4.2 // indirect
+	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	github.com/in-toto/attestation v1.2.0 // indirect
 	github.com/in-toto/in-toto-golang v0.11.0 // indirect
@@ -90,6 +91,8 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/secure-systems-lab/go-securesystemslib v0.11.0 // indirect
+	github.com/segmentio/asm v1.1.3 // indirect
+	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/shibumi/go-pathspec v1.3.0 // indirect
 	github.com/sigstore/rekor v1.5.2 // indirect
 	github.com/sigstore/rekor-tiles/v2 v2.2.2-0.20260601073857-5d098a2b6443 // indirect
@@ -114,6 +117,7 @@ require (
 	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/mod v0.37.0 // indirect
+	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/term v0.44.0 // indirect
