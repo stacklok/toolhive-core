@@ -29,11 +29,13 @@ type ClientSession interface {
 // SessionWithTools is a ClientSession that carries per-session tools. ToolHive's
 // vMCP layer uses this to project a per-session tool set.
 //
-// NOTE: overlays set here are stored and merged when a go-sdk server is built
-// for the session (see MCPServer.buildServer). Making per-session tool changes
-// take effect on an already-connected go-sdk session at runtime (live
-// list_changed dispatch) is the integration point that needs validation against
-// ToolHive's vMCP flow before this shim can fully replace mcp-go there.
+// Overlays set here are stored and reconciled onto the session's live go-sdk
+// server (syncSessionTools) once a server is bound to the session (at
+// registration, or immediately if already bound): added tools are registered
+// via srv.AddTool and removed tools via srv.RemoveTools, which also drives
+// go-sdk's automatic notifications/tools/list_changed emission when
+// WithToolCapabilities(true) is set. So per-session tool changes take effect
+// on an already-connected session at runtime.
 type SessionWithTools interface {
 	ClientSession
 	// GetSessionTools returns the session's tools. Thread-safe.

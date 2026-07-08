@@ -344,7 +344,7 @@ func TestRehydratedSessionElicitation(t *testing.T) {
 			res, err := srvB.RequestElicitation(ctx, mcp.ElicitationRequest{
 				Params: mcp.ElicitationParams{
 					Message:         "your name?",
-					RequestedSchema: map[string]any{"type": "object"},
+					RequestedSchema: map[string]any{schemaType: objectType},
 				},
 			})
 			if err != nil {

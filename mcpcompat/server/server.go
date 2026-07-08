@@ -16,13 +16,15 @@
 //
 // The global registration path (AddTool/AddResource/AddPrompt served over the
 // stdio and HTTP transports) is fully functional and tested. The per-session
-// interfaces (SessionWithTools, SessionWithResources, SessionIdManager) and the
-// Hooks type are implemented for source compatibility, and per-session tool
-// overlays are stored on the session objects. Wiring those overlays into
-// go-sdk's live session lifecycle so that per-session tool *dispatch* matches
-// mcp-go exactly (ToolHive's vMCP projection) is the one area that needs
-// integration validation against ToolHive before this package can fully replace
-// mcp-go for the vMCP server; see the notes on SessionWithTools.
+// interfaces (SessionWithTools, SessionWithResources, SessionWithElicitation,
+// SessionIdManager) and the Hooks type are implemented and wired: per-session
+// tool/resource overlays set via SetSessionTools/SetSessionResources are
+// reconciled onto the session's live go-sdk server (syncSessionTools/
+// syncSessionResources), and the before-list/before-call hooks fire ahead of
+// SDK dispatch so ToolHive's lazy per-session tool injection runs first.
+// Cross-replica session rehydration (Validate-driven lazy eviction) and the
+// Streamable HTTP transports are functional. See the notes on SessionWithTools
+// for the live-overlay reconciliation details.
 //
 // Stability: Alpha.
 package server
@@ -529,17 +531,10 @@ func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server) gosdk.Middlewar
 			}
 			// Fire the before-hooks ahead of the SDK's own handling so a
 			// hook that injects per-session tools does so before the SDK
-			// enumerates (tools/list) or dispatches (tools/call) them.
-			switch method {
-			case string(mcp.MethodToolsList):
-				if s.hooks != nil {
-					s.hooks.beforeListTools(ctx, nil, &mcp.ListToolsRequest{})
-				}
-			case string(mcp.MethodToolsCall):
-				if s.hooks != nil {
-					s.hooks.beforeCallTool(ctx, nil, &mcp.CallToolRequest{})
-				}
-			}
+			// enumerates (tools/list) or dispatches (tools/call) them. The
+			// hook's request object is populated from req.GetParams(); see
+			// fireBeforeHooks for the extraction and fallback behavior.
+			s.fireBeforeHooks(ctx, method, req)
 			res, err := next(ctx, method, req)
 			if err != nil && method == string(mcp.MethodToolsCall) {
 				err = translateUnknownToolError(err, req)
@@ -549,6 +544,55 @@ func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server) gosdk.Middlewar
 			}
 			return res, err
 		}
+	}
+}
+
+// fireBeforeHooks fires the before-list-tools / before-call-tool hooks ahead of
+// the SDK's own handling so a hook that injects per-session tools does so before
+// the SDK enumerates (tools/list) or dispatches (tools/call) them.
+//
+// The hook's request object is populated from req.GetParams() so a hook that
+// reads the tool name/args/cursor (any future hook) sees the actual request
+// rather than an empty value, matching mcp-go (whose hooks fired with the parsed
+// request). The go-sdk hands the params via req.GetParams(): a
+// *CallToolParamsRaw for tools/call (carrying Name and raw Arguments) and a
+// *ListToolsParams for tools/list (carrying Cursor). If extraction fails (batch,
+// unexpected type), the hook receives the empty request and a Debug log is
+// emitted — dispatch is never broken by a hook-parameter extraction failure.
+func (s *MCPServer) fireBeforeHooks(ctx context.Context, method string, req gosdk.Request) {
+	if s.hooks == nil {
+		return
+	}
+	switch method {
+	case string(mcp.MethodToolsList):
+		listReq := &mcp.ListToolsRequest{}
+		if p, ok := req.GetParams().(*gosdk.ListToolsParams); ok && p != nil {
+			listReq.Params.Cursor = mcp.Cursor(p.Cursor)
+		} else if s.logger != nil {
+			s.logger.Debug("before-list-tools hook: params not *ListToolsParams; hook receives empty request",
+				"method", method)
+		}
+		s.hooks.beforeListTools(ctx, nil, listReq)
+	case string(mcp.MethodToolsCall):
+		callReq := &mcp.CallToolRequest{}
+		if p, ok := req.GetParams().(*gosdk.CallToolParamsRaw); ok && p != nil {
+			callReq.Params.Name = p.Name
+			if len(p.Arguments) > 0 {
+				var args map[string]any
+				if err := json.Unmarshal(p.Arguments, &args); err != nil {
+					if s.logger != nil {
+						s.logger.Debug("before-call-tool hook: unmarshaling arguments failed; hook receives name only",
+							"tool", p.Name, "error", err)
+					}
+				} else {
+					callReq.Params.Arguments = args
+				}
+			}
+		} else if s.logger != nil {
+			s.logger.Debug("before-call-tool hook: params not *CallToolParamsRaw; hook receives empty request",
+				"method", method)
+		}
+		s.hooks.beforeCallTool(ctx, nil, callReq)
 	}
 }
 
@@ -728,7 +772,7 @@ func translateUnknownToolError(err error, req gosdk.Request) error {
 		return err
 	}
 	name := ""
-	if p, ok := req.GetParams().(*gosdk.CallToolParams); ok {
+	if p, ok := req.GetParams().(*gosdk.CallToolParamsRaw); ok && p != nil {
 		name = p.Name
 	}
 	return &jsonrpc.Error{Code: jerr.Code, Message: fmt.Sprintf("tool %q not found", name)}

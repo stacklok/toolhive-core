@@ -260,6 +260,8 @@ type (
 	ListToolsRequest = mcpgo.ListToolsRequest
 	// ListToolsResult is the tool list response.
 	ListToolsResult = mcpgo.ListToolsResult
+	// Cursor is an opaque pagination token.
+	Cursor = mcpgo.Cursor
 )
 
 // Tool builders and result constructors.

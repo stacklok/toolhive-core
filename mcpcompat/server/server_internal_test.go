@@ -17,9 +17,10 @@ import (
 // Compile-time interface checks: the concrete session must satisfy the
 // per-session interfaces ToolHive relies on.
 var (
-	_ ClientSession        = (*clientSession)(nil)
-	_ SessionWithTools     = (*clientSession)(nil)
-	_ SessionWithResources = (*clientSession)(nil)
+	_ ClientSession          = (*clientSession)(nil)
+	_ SessionWithTools       = (*clientSession)(nil)
+	_ SessionWithResources   = (*clientSession)(nil)
+	_ SessionWithElicitation = (*clientSession)(nil)
 )
 
 func TestClientSession_Store(t *testing.T) {

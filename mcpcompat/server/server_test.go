@@ -29,6 +29,21 @@ const (
 	testClientVersion = "1.0.0"
 )
 
+// schema fixture literals shared across the elicitation tests below; factored
+// into consts so goconst does not flag them across the test file.
+const (
+	schemaType = "type"
+	objectType = "object"
+	stringType = "string"
+	nameKey    = "name"
+	properties = "properties"
+
+	// elicitMessage and elicitToolName are reused across the elicitation tests;
+	// factored into consts so goconst does not flag them.
+	elicitMessage  = "What is your name?"
+	elicitToolName = "ask"
+)
+
 // TestGlobalServer_EndToEnd registers a tool on the compat server, serves it
 // over Streamable HTTP, and drives it with the compat client — exercising the
 // whole server->go-sdk->client path through both shims.
@@ -508,4 +523,429 @@ func TestHeartbeat_WiredToKeepAlive(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	assert.True(t, got404, "session must be evicted by keep-alive within the bounded window once the client stops responding to pings")
+}
+
+// TestBeforeCallTool_ReceivesToolNameAndArgs verifies that the before-call hook
+// fired by sessionDispatchMiddleware receives a populated mcp.CallToolRequest
+// (tool name and arguments) rather than an empty one (issue #156, item U9).
+// Before the fix the hook was fired with mcp.CallToolRequest{} (no name, no
+// args): vMCP's hooks only use ctx today, but any future hook reading the
+// request would break silently. The hook records the request it saw; after a
+// tools/call the recorded name must match and the arguments must be present.
+func TestBeforeCallTool_ReceivesToolNameAndArgs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var (
+		hookMu   sync.Mutex
+		hookName string
+		hookArgs any
+	)
+	hooks := &server.Hooks{}
+	hooks.AddBeforeCallTool(func(_ context.Context, _ any, req *mcp.CallToolRequest) {
+		hookMu.Lock()
+		defer hookMu.Unlock()
+		hookName = req.Params.Name
+		hookArgs = req.Params.Arguments
+	})
+
+	srv := server.NewMCPServer("hook-server", testClientVersion,
+		server.WithToolCapabilities(false),
+		server.WithHooks(hooks),
+	)
+	srv.AddTool(
+		mcp.NewTool("greet", mcp.WithDescription("greet"), mcp.WithString("name", mcp.Required())),
+		func(_ context.Context, r mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("hi " + r.GetString("name", "world")), nil
+		},
+	)
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	c, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = c.CallTool(ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{Name: "greet", Arguments: map[string]any{"name": "ada"}},
+	})
+	require.NoError(t, err)
+
+	hookMu.Lock()
+	defer hookMu.Unlock()
+	assert.Equal(t, "greet", hookName, "before-call hook must receive the tool name")
+	args, _ := hookArgs.(map[string]any)
+	require.Contains(t, args, "name", "before-call hook must receive the arguments")
+	assert.Equal(t, "ada", args["name"], "before-call hook must receive the argument values")
+}
+
+// TestBeforeListTools_ReceivesCursor verifies that the before-list-tools hook
+// receives the pagination cursor from the request (issue #156, item U9).
+func TestBeforeListTools_ReceivesCursor(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var (
+		hookMu     sync.Mutex
+		hookCursor string
+	)
+	hooks := &server.Hooks{}
+	hooks.AddBeforeListTools(func(_ context.Context, _ any, req *mcp.ListToolsRequest) {
+		hookMu.Lock()
+		defer hookMu.Unlock()
+		hookCursor = string(req.Params.Cursor)
+	})
+
+	srv := server.NewMCPServer("hook-server", testClientVersion,
+		server.WithToolCapabilities(false),
+		server.WithPageSize(1),
+		server.WithHooks(hooks),
+	)
+	srv.AddTool(mcp.NewTool("t0", mcp.WithDescription("d")),
+		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("ok"), nil
+		})
+	srv.AddTool(mcp.NewTool("t1", mcp.WithDescription("d")),
+		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("ok"), nil
+		})
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	c, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	first, err := c.ListTools(ctx, mcp.ListToolsRequest{})
+	require.NoError(t, err)
+	require.NotEmpty(t, first.NextCursor, "need a nextCursor to exercise the cursor path")
+
+	// Second list with the cursor: the before-list hook must see that cursor.
+	secondReq := mcp.ListToolsRequest{}
+	secondReq.Params.Cursor = first.NextCursor
+	_, err = c.ListTools(ctx, secondReq)
+	require.NoError(t, err)
+
+	hookMu.Lock()
+	defer hookMu.Unlock()
+	assert.Equal(t, string(first.NextCursor), hookCursor, "before-list-tools hook must receive the request cursor")
+}
+
+// TestElicitation_DefaultConfig verifies the elicitation delivery contract
+// (issue #156, item U4): the shim server keeps JSONResponse on, so a
+// server->client elicitation made during a tools/call is routed by go-sdk to
+// the standalone SSE stream. With transport.WithContinuousListening() the
+// client opens that stream and an installed elicitation handler answers, so
+// elicitation completes and the tool handler receives the response. Without
+// continuous listening the standalone SSE stream is absent and elicitation
+// cannot be delivered (documented separately below).
+func TestElicitation_DefaultConfig(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	srv := server.NewMCPServer("elicit-server", testClientVersion, server.WithToolCapabilities(false))
+	srv.AddTool(
+		mcp.NewTool(elicitToolName, mcp.WithDescription("elicit then answer")),
+		func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			res, err := srv.RequestElicitation(ctx, mcp.ElicitationRequest{
+				Params: mcp.ElicitationParams{
+					Message: elicitMessage,
+					RequestedSchema: map[string]any{
+						schemaType: objectType,
+						properties: map[string]any{
+							nameKey: map[string]any{schemaType: stringType},
+						},
+					},
+				},
+			})
+			if err != nil {
+				return nil, err
+			}
+			name, _ := res.Content.(map[string]any)[nameKey].(string)
+			return mcp.NewToolResultText("hello " + name), nil
+		},
+	)
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	c, err := client.NewStreamableHttpClientWithOpts(
+		ts.URL,
+		[]transport.StreamableHTTPCOption{transport.WithContinuousListening()},
+		[]client.ClientOption{client.WithElicitationHandler(client.ElicitationHandlerFunc(
+			func(_ context.Context, _ mcp.ElicitationRequest) (*mcp.ElicitationResult, error) {
+				return &mcp.ElicitationResult{
+					ElicitationResponse: mcp.ElicitationResponse{
+						Action:  mcp.ElicitationResponseActionAccept,
+						Content: map[string]any{nameKey: "grace"},
+					},
+				}, nil
+			},
+		))},
+	)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	res, err := c.CallTool(ctx, mcp.CallToolRequest{Params: mcp.CallToolParams{Name: elicitToolName}})
+	require.NoError(t, err)
+	require.False(t, res.IsError, "tool call must succeed; elicitation must complete")
+	require.Len(t, res.Content, 1)
+	txt, ok := mcp.AsTextContent(res.Content[0])
+	require.True(t, ok)
+	assert.Equal(t, "hello grace", txt.Text, "the tool handler must have received the elicited response")
+}
+
+// TestElicitation_WithoutContinuousListening_Documented documents the
+// limitation (issue #156, item U4): with the shim client's default config
+// (DisableStandaloneSSE: true, i.e. NO transport.WithContinuousListening), the
+// client never opens a standalone SSE stream. Under JSONResponse the go-sdk
+// routes a server->client elicitation request to that (absent) stream, so the
+// write is rejected and the server's Elicit call fails; the tool call surfaces
+// an error rather than completing. This asserts that expected failure so the
+// limitation is regression-tested: if a future go-sdk change made elicitation
+// work without a standalone stream, this test would start failing and the
+// decision docs would need updating.
+func TestElicitation_WithoutContinuousListening_Documented(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	srv := server.NewMCPServer("elicit-server", testClientVersion, server.WithToolCapabilities(false))
+	srv.AddTool(
+		mcp.NewTool(elicitToolName, mcp.WithDescription("elicit then answer")),
+		func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			_, err := srv.RequestElicitation(ctx, mcp.ElicitationRequest{
+				Params: mcp.ElicitationParams{
+					Message: elicitMessage,
+					RequestedSchema: map[string]any{
+						schemaType: objectType,
+						properties: map[string]any{
+							nameKey: map[string]any{schemaType: stringType},
+						},
+					},
+				},
+			})
+			if err != nil {
+				return nil, err
+			}
+			return mcp.NewToolResultText("ok"), nil
+		},
+	)
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	// Default config: no WithContinuousListening, so DisableStandaloneSSE is
+	// true and no standalone SSE stream is opened. An elicitation handler is
+	// still installed so the capability is declared (otherwise the failure
+	// would be "client does not support elicitation" rather than the
+	// stream-delivery failure this test documents).
+	c, err := client.NewStreamableHttpClientWithOpts(
+		ts.URL,
+		nil,
+		[]client.ClientOption{client.WithElicitationHandler(client.ElicitationHandlerFunc(
+			func(_ context.Context, _ mcp.ElicitationRequest) (*mcp.ElicitationResult, error) {
+				return &mcp.ElicitationResult{
+					ElicitationResponse: mcp.ElicitationResponse{
+						Action:  mcp.ElicitationResponseActionAccept,
+						Content: map[string]any{nameKey: "grace"},
+					},
+				}, nil
+			},
+		))},
+	)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = c.CallTool(ctx, mcp.CallToolRequest{Params: mcp.CallToolParams{Name: elicitToolName}})
+	require.Error(t, err, "elicitation must fail without a standalone SSE stream (documented limitation)")
+	// Distinguish "elicitation was rejected" from "the test timed out": a
+	// context.DeadlineExceeded would mean elicitation hung rather than failed,
+	// and a future go-sdk change making elicitation silently succeed (no error)
+	// is already caught by the require.Error above. This guard catches the
+	// inverse regression where the failure masquerades as a timeout.
+	require.NotErrorIs(t, err, context.DeadlineExceeded,
+		"elicitation must be rejected, not surface as a context timeout")
+}
+
+// TestElicitation_HandlerReturnsError verifies the error-return path of
+// elicitation: when the client's elicitation handler returns an error, the
+// server's RequestElicitation surfaces it and the surrounding tools/call fails
+// wrapping that error. go-sdk carries the elicitation handler's error back to
+// the server-side Elicit call, so the tool handler returns it and the
+// CallTool result carries it.
+func TestElicitation_HandlerReturnsError(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	srv := server.NewMCPServer("elicit-err-server", testClientVersion, server.WithToolCapabilities(false))
+	srv.AddTool(
+		mcp.NewTool(elicitToolName, mcp.WithDescription("elicit then answer")),
+		func(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			_, err := srv.RequestElicitation(ctx, mcp.ElicitationRequest{
+				Params: mcp.ElicitationParams{
+					Message: elicitMessage,
+					RequestedSchema: map[string]any{
+						schemaType: objectType,
+						properties: map[string]any{
+							nameKey: map[string]any{schemaType: stringType},
+						},
+					},
+				},
+			})
+			if err != nil {
+				return nil, err
+			}
+			return mcp.NewToolResultText("ok"), nil
+		},
+	)
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	c, err := client.NewStreamableHttpClientWithOpts(
+		ts.URL,
+		[]transport.StreamableHTTPCOption{transport.WithContinuousListening()},
+		[]client.ClientOption{client.WithElicitationHandler(client.ElicitationHandlerFunc(
+			func(_ context.Context, _ mcp.ElicitationRequest) (*mcp.ElicitationResult, error) {
+				return nil, fmt.Errorf("declined")
+			},
+		))},
+	)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = c.CallTool(ctx, mcp.CallToolRequest{Params: mcp.CallToolParams{Name: elicitToolName}})
+	require.Error(t, err, "tool call must fail when the elicitation handler returns an error")
+	assert.Contains(t, err.Error(), "declined", "the CallTool error must wrap the handler's error")
+}
+
+// TestCallUnknownTool_ErrorContainsToolName is a regression test for the
+// translateUnknownToolError fix: calling a tool that does not exist over the
+// Streamable HTTP transport must surface an error naming the missing tool
+// (e.g. `tool "nope" not found`), NOT the empty-name `tool "" not found`.
+// The fix changed the type assertion in translateUnknownToolError from
+// *gosdk.CallToolParams to *gosdk.CallToolParamsRaw so the tool name is
+// populated; the HandleMessage path (request_handler_test.go) does not exercise
+// translateUnknownToolError, so this drives it end-to-end through the HTTP
+// transport and the go-sdk dispatch middleware.
+func TestCallUnknownTool_ErrorContainsToolName(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	srv := server.NewMCPServer("unk-tool-server", testClientVersion, server.WithToolCapabilities(false))
+	srv.AddTool(
+		mcp.NewTool("greet", mcp.WithDescription("greet")),
+		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("hi"), nil
+		},
+	)
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	c, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = c.CallTool(ctx, mcp.CallToolRequest{Params: mcp.CallToolParams{Name: "nope"}})
+	require.Error(t, err, "calling an unknown tool must error")
+	// The translated error must carry the requested tool name, proving the
+	// *CallToolParamsRaw assertion populated it (rather than leaving it "").
+	assert.Contains(t, err.Error(), `tool "nope" not found`,
+		"unknown-tool error must name the requested tool, not the empty name")
+	assert.NotContains(t, err.Error(), `tool "" not found`,
+		"unknown-tool error must not carry the empty tool name")
+}
+
+// TestRequestElicitation_NoActiveSession is a fast unit-level test (no HTTP
+// server) exercising the ErrNoActiveSession guard: calling RequestElicitation
+// outside any session's request context returns ErrNoActiveSession.
+func TestRequestElicitation_NoActiveSession(t *testing.T) {
+	t.Parallel()
+	srv := server.NewMCPServer("elicit-unit", testClientVersion)
+	_, err := srv.RequestElicitation(context.Background(), mcp.ElicitationRequest{
+		Params: mcp.ElicitationParams{Message: "hi"},
+	})
+	require.ErrorIs(t, err, server.ErrNoActiveSession)
+}
+
+// TestRequestElicitation_SessionWithoutElicitationSupport is a fast unit-level
+// test exercising the ErrElicitationNotSupported guard: a session bound via
+// WithContext that does NOT implement SessionWithElicitation causes
+// RequestElicitation to return ErrElicitationNotSupported (not a nil-panic or
+// a silent success).
+func TestRequestElicitation_SessionWithoutElicitationSupport(t *testing.T) {
+	t.Parallel()
+	srv := server.NewMCPServer("elicit-unit", testClientVersion)
+	// fakeSession implements ClientSession but NOT SessionWithElicitation.
+	ctx := srv.WithContext(context.Background(), &fakeSession{id: "sess-no-elicit"})
+	_, err := srv.RequestElicitation(ctx, mcp.ElicitationRequest{
+		Params: mcp.ElicitationParams{Message: "hi"},
+	})
+	require.ErrorIs(t, err, server.ErrElicitationNotSupported)
 }

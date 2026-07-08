@@ -136,10 +136,25 @@ func WithEndpointPath(endpointPath string) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.endpointPath = endpointPath }
 }
 
-// WithSessionIdManager supplies a session ID manager.
+// WithSessionIdManager supplies a session ID manager that drives cross-replica
+// session lifecycle.
 //
-// NOTE: the go-sdk manages MCP session IDs internally; the supplied manager is
-// retained for API compatibility but does not yet drive the SDK's ID lifecycle.
+// The manager IS wired into the SDK's session lifecycle:
+//   - Generate is installed as the go-sdk Server's GetSessionID (buildServer),
+//     so the SDK mints session IDs through it — this is where ToolHive's manager
+//     creates the placeholder session record that OnRegisterSession later
+//     promotes.
+//   - Validate is called on EVERY request carrying a session ID: for local
+//     sessions (initialized on this instance) it is validated per-request so a
+//     session terminated in the shared store (e.g. via a DELETE on another
+//     replica) is rejected here and its local bookkeeping dropped; for
+//     cross-replica sessions it drives lazy eviction on each request.
+//   - Terminate is forwarded the session ID on a DELETE so ToolHive's shared
+//     session storage is cleaned up in lockstep with the local session.
+//
+// The single-replica fast path (no manager) is preserved: there is nothing to
+// validate against, so local sessions route straight through to the go-sdk
+// handler.
 func WithSessionIdManager(manager SessionIdManager) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.sessionIDMgr = manager }
 }
@@ -176,6 +191,29 @@ func WithHTTPContextFunc(fn HTTPContextFunc) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.contextFunc = fn }
 }
 
+// build constructs the go-sdk StreamableHTTPHandler. It is idempotent (once).
+//
+// Decision (issue #156, item U4): JSONResponse is ON by design and is NOT
+// configurable. mcp-go's server replied to POSTs with application/json, and
+// ToolHive callers json.Decode the response body, so the handler must keep
+// replying with application/json rather than text/event-stream.
+//
+// Consequence for elicitation (and any server->client request made during
+// request handling, e.g. sampling): under JSONResponse the go-sdk cannot
+// inline a server->client request on the POST response stream, so it routes
+// such messages to the standalone SSE stream (the "" stream) — see
+// streamable.go's streamableServerConn.Write: when c.jsonResponse is set and
+// the message is not a response, relatedRequest is reset to the empty id,
+// which selects c.streams[""]. If no standalone SSE stream exists (the client
+// never opened one), that stream is nil and the write is rejected
+// (ErrRejected: "write to closed stream"), so the server's Elicit call fails.
+//
+// The shim client defaults DisableStandaloneSSE to
+// !ContinuousListening(), i.e. the standalone SSE stream is OFF by default.
+// For elicitation to work the client MUST open the standalone SSE stream via
+// transport.WithContinuousListening() (and install an elicitation handler via
+// client.WithElicitationHandler). See TestElicitation_DefaultConfig for the
+// runtime verification of this contract.
 func (s *StreamableHTTPServer) build() {
 	s.once.Do(func() {
 		var gen func() string

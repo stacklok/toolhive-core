@@ -51,12 +51,87 @@ type Client struct {
 	// resumes a pre-existing session (transport.WithSession) without calling
 	// Initialize. It is lazily created on the first resumed request. See resume.go.
 	resume *resumeState
+
+	// elicitationHandler, when set, is wired into the go-sdk ClientOptions so
+	// the client declares the elicitation capability at initialize and answers
+	// server->client elicitation/create requests. It mirrors mcp-go's
+	// client.WithElicitationHandler.
+	elicitationHandler ElicitationHandler
+}
+
+// ElicitationHandler handles server->client elicitation/create requests. It
+// mirrors mcp-go's client.ElicitationHandler.
+type ElicitationHandler interface {
+	Elicit(ctx context.Context, request mcp.ElicitationRequest) (*mcp.ElicitationResult, error)
+}
+
+// ElicitationHandlerFunc is an adapter to allow the use of ordinary functions
+// as elicitation handlers. It is a shim convenience adapter not present in
+// mcp-go (mcp-go's client.WithElicitationHandler accepts a plain func), kept
+// here so the shim's ElicitationHandler interface and the func form compose.
+type ElicitationHandlerFunc func(ctx context.Context, request mcp.ElicitationRequest) (*mcp.ElicitationResult, error)
+
+// Elicit calls f(ctx, request).
+func (f ElicitationHandlerFunc) Elicit(ctx context.Context, request mcp.ElicitationRequest) (*mcp.ElicitationResult, error) {
+	return f(ctx, request)
+}
+
+// ClientOption configures a Client. It is applied at construction time via
+// NewStreamableHttpClientWithOpts (the only constructor that accepts
+// ClientOptions); NewStreamableHttpClient and NewSSEMCPClient take only
+// transport-level options.
+//
+//nolint:revive // name intentionally matches mcp-go for drop-in compatibility.
+type ClientOption func(*Client)
+
+// WithElicitationHandler installs a handler for server->client
+// elicitation/create requests. The handler must be registered before Initialize
+// so it is wired into the underlying go-sdk client, which (a) declares the
+// elicitation capability at initialize time so the server's Elicit calls pass
+// the go-sdk capability gate, and (b) dispatches incoming elicitation/create
+// requests to the handler.
+//
+// Elicitation under the Streamable HTTP transport requires the client to hold
+// an open standalone SSE stream: the shim server replies with application/json
+// (JSONResponse is on by design), so the go-sdk routes a server->client
+// elicitation request made during request handling to the standalone SSE
+// stream rather than the POST response. Configure the client with
+// transport.WithContinuousListening() to open that stream; without it
+// (DisableStandaloneSSE defaults to true) elicitation cannot be delivered and
+// the server's Elicit call is rejected. See the build() doc comment in
+// mcpcompat/server/transports.go.
+//
+// It mirrors mcp-go's client.WithElicitationHandler.
+func WithElicitationHandler(h ElicitationHandler) ClientOption {
+	return func(c *Client) { c.elicitationHandler = h }
+}
+
+// applyClientOptions applies the client-level options to c.
+func applyClientOptions(c *Client, opts []ClientOption) {
+	for _, opt := range opts {
+		opt(c)
+	}
 }
 
 // NewStreamableHttpClient creates a Streamable HTTP MCP client for baseURL. Like
 // mcp-go, the returned client is not yet connected; call Start then Initialize.
+// Transport options configure the underlying Streamable HTTP transport; client
+// options (client.WithElicitationHandler, ...) configure client-level behavior.
 func NewStreamableHttpClient(baseURL string, options ...transport.StreamableHTTPCOption) (*Client, error) {
 	return &Client{streamable: transport.NewStreamableHTTP(baseURL, options...)}, nil
+}
+
+// NewStreamableHttpClientWithOpts creates a Streamable HTTP MCP client for
+// baseURL, applying transport-level options followed by client-level options.
+// It is the entry point for options that are not transport options (e.g.
+// WithElicitationHandler); NewStreamableHttpClient remains for callers that
+// only need transport options.
+func NewStreamableHttpClientWithOpts(
+	baseURL string, transportOpts []transport.StreamableHTTPCOption, clientOpts []ClientOption,
+) (*Client, error) {
+	c := &Client{streamable: transport.NewStreamableHTTP(baseURL, transportOpts...)}
+	applyClientOptions(c, clientOpts)
+	return c, nil
 }
 
 // NewSSEMCPClient creates an SSE MCP client for baseURL. The returned client is
@@ -72,6 +147,16 @@ func (*Client) Start(_ context.Context) error { return nil }
 
 // Initialize connects the underlying go-sdk client and performs the MCP
 // initialize handshake using the supplied client info and capabilities.
+//
+// LIMITATION (issue #156, item U2): if a preset session ID was supplied via
+// transport.WithSession, Initialize does NOT honor it. Initialize always
+// negotiates a fresh, server-assigned session ID: it builds a go-sdk
+// StreamableClientTransport (buildTransport) which has no preset session-ID
+// field (go-sdk has no such field in any version, verified through v1.6.1),
+// performs the initialize handshake, and then adopts the ID the server returns
+// (overwriting any value set via WithSession). To resume a pre-existing session
+// by ID, skip Initialize and use the resume path instead (see resume.go). The
+// resume path is exercised by resume_test.go.
 func (c *Client) Initialize(ctx context.Context, request mcp.InitializeRequest) (*mcp.InitializeResult, error) {
 	ctx = withErrCapture(ctx)
 	c.mu.Lock()
@@ -101,6 +186,7 @@ func (c *Client) Initialize(ctx context.Context, request mcp.InitializeRequest) 
 		opts.Capabilities = caps
 	}
 	c.installNotificationHandlers(opts)
+	c.installElicitationHandler(opts)
 
 	gc := gosdk.NewClient(impl, opts)
 
@@ -495,6 +581,46 @@ func (c *Client) installNotificationHandlers(opts *gosdk.ClientOptions) {
 	// *LoggingMessageRequest; convert them to mcp-go's notification params
 	// (level, data, logger) and dispatch.
 	opts.LoggingMessageHandler = newLoggingMessageHandler(c.dispatch)
+}
+
+// installElicitationHandler wires the user-supplied ElicitationHandler (set via
+// WithElicitationHandler) onto the go-sdk ClientOptions. The go-sdk
+// auto-declares the elicitation capability when ElicitationHandler is non-nil
+// (see Client.capabilities), so the server's Elicit calls pass the capability
+// gate; incoming elicitation/create requests are dispatched to the handler.
+//
+// The go-sdk handler receives a *gosdk.ElicitRequest and must return a
+// *gosdk.ElicitResult. The shim converts between the go-sdk and mcp-go-shaped
+// elicitation types via JSON round-trips (both encode the identical MCP wire
+// format), so a handler registered against the mcp-go ElicitationRequest/
+// ElicitationResult types works unchanged. The go-sdk validates an accepted
+// result against the requested schema itself (in (*Client).elicit), so the
+// shim does not re-validate here.
+func (c *Client) installElicitationHandler(opts *gosdk.ClientOptions) {
+	if c.elicitationHandler == nil {
+		return
+	}
+	opts.ElicitationHandler = func(ctx context.Context, req *gosdk.ElicitRequest) (*gosdk.ElicitResult, error) {
+		mreq := mcp.ElicitationRequest{}
+		if req != nil {
+			// Reconstruct the mcp-go-shaped request from the go-sdk params. The
+			// go-sdk ElicitRequest embeds its Params; a JSON round-trip maps them
+			// onto mcp-go's ElicitationParams (mode, message, requestedSchema, url,
+			// elicitationId, _meta).
+			if err := jsonConvert(req.Params, &mreq.Params); err != nil {
+				return nil, fmt.Errorf("converting elicitation request: %w", err)
+			}
+		}
+		res, err := c.elicitationHandler.Elicit(ctx, mreq)
+		if err != nil {
+			return nil, err
+		}
+		out := &gosdk.ElicitResult{}
+		if err := jsonConvert(res, out); err != nil {
+			return nil, fmt.Errorf("converting elicitation result: %w", err)
+		}
+		return out, nil
+	}
 }
 
 // dispatchFunc is the signature of Client.dispatch, factored out so the
