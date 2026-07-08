@@ -5,6 +5,7 @@ package server
 
 import (
 	"context"
+	crand "crypto/rand"
 	"fmt"
 	"mime"
 	"net/http"
@@ -144,6 +145,12 @@ func WithHeartbeatInterval(interval time.Duration) StreamableHTTPOption {
 }
 
 // WithHTTPContextFunc installs a per-request context customizer.
+//
+// Context values injected here are applied to ALL POSTs, including the
+// initialize request (previously the nonce bridge only bridged non-initialize
+// POSTs; the contextFunc itself now runs unconditionally on every request).
+// This is harmless/desired but observable: an initialize handler that reads a
+// context value populated by contextFunc will now see it.
 func WithHTTPContextFunc(fn HTTPContextFunc) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.contextFunc = fn }
 }
@@ -182,16 +189,22 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if s.contextFunc != nil {
 		r = r.WithContext(s.contextFunc(r.Context(), r))
 	}
-	// Record the request context so the dispatch middleware can bridge its values
-	// into the handler running on go-sdk's detached session goroutine. Keyed by
-	// the client-supplied session ID; the initialize request (no session ID yet)
-	// carries no per-request values that the handler needs. This POST is handled
-	// synchronously (JSONResponse), so the entry is valid for the handler's whole
-	// lifetime and cleared when ServeHTTP returns.
-	if sid := r.Header.Get("Mcp-Session-Id"); sid != "" {
-		s.mcp.setPendingRequestContext(r.Context(), sid)
-		defer s.mcp.clearPendingRequestContext(sid)
-	}
+	// Bridge per-request context values into the handler. go-sdk does not
+	// propagate the per-POST request context into handlers for existing
+	// sessions (it handles messages on the session's connection goroutine using
+	// the initialize-time context), so values added by contextFunc (identity,
+	// audit BackendInfo, telemetry) would be lost. Store the request context
+	// keyed by a per-POST nonce and stamp the nonce as a header; the dispatch
+	// middleware reads it back via req.GetExtra().Header to bridge the values.
+	// Keying by nonce (not session ID) avoids the race where concurrent POSTs
+	// on the same session clobber each other's context (issue #156, item U3).
+	// The initialize POST (no session yet) carries no per-request values the
+	// handler needs; only non-initialize POSTs need bridging, but bridging
+	// initialize is harmless.
+	nonce := crand.Text()
+	s.mcp.setPendingRequestContext(r.Context(), nonce)
+	r.Header.Set(reqNonceHeader, nonce)
+	defer s.mcp.clearPendingRequestContext(nonce)
 	// DELETE terminates the session. mcp-go answered 200 and drove the supplied
 	// SessionIdManager's Terminate; go-sdk answers 204 and manages its own session
 	// map. Rewrite the status to 200 for compatibility and forward the termination

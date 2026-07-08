@@ -214,6 +214,17 @@ func (s *MCPServer) registerAndSync(ctx context.Context, ss *gosdk.ServerSession
 // syncSessionTools reconciles the session's tool overlay onto its go-sdk server:
 // tools present in the overlay are added (overwriting by name) and tools that
 // were previously added for this session but are no longer present are removed.
+//
+// go-sdk's AddTool panics unless the tool's input schema is non-nil with
+// top-level type "object". normalizeObjectSchema only normalizes nil/empty
+// schemas to {"type":"object"}; non-object schemas ($ref, oneOf, boolean, or an
+// object schema with type omitted) pass through verbatim to mirror mcp-go, so
+// AddTool can still panic here for a malformed overlay schema. This path runs on
+// the live session goroutine (from before-hooks during a request), so an
+// unrecovered panic would crash the session/process mid-request. Each tool is
+// therefore registered via addSessionTool, which recovers such a panic, logs it,
+// and skips the offending tool — one bad overlay schema does not take down the
+// session, and the remaining tools in the same overlay still register.
 func (s *MCPServer) syncSessionTools(srv *gosdk.Server, cs *clientSession) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -221,9 +232,17 @@ func (s *MCPServer) syncSessionTools(srv *gosdk.Server, cs *clientSession) {
 	for name, st := range cs.tools {
 		gt, err := toGoSDKTool(st.Tool)
 		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("skipping per-session tool: conversion failed", "tool", name, "error", err)
+			}
 			continue
 		}
-		srv.AddTool(gt, s.wrapToolHandler(st.Handler))
+		if !s.addSessionTool(srv, gt, st.Handler) {
+			if s.logger != nil {
+				s.logger.Warn("skipping per-session tool: AddTool rejected its schema", "tool", name)
+			}
+			continue
+		}
 		newNames[name] = struct{}{}
 	}
 	var removed []string
@@ -236,6 +255,26 @@ func (s *MCPServer) syncSessionTools(srv *gosdk.Server, cs *clientSession) {
 		srv.RemoveTools(removed...)
 	}
 	cs.sdkToolNames = newNames
+}
+
+// addSessionTool registers a tool on a per-session go-sdk server, recovering the
+// panic go-sdk's AddTool raises when a tool's input schema is non-nil but not
+// type:"object" (see normalizeObjectSchema). It returns false (and logs) when the
+// tool could not be registered, so the caller skips it rather than crashing the
+// session. This mirrors the fault-isolation recover pattern used in
+// wrapToolHandler (server.go).
+func (s *MCPServer) addSessionTool(srv *gosdk.Server, gt *gosdk.Tool, h ToolHandlerFunc) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if s.logger != nil {
+				s.logger.Error("per-session AddTool panicked; skipping tool",
+					"tool", gt.Name, "panic", r)
+			}
+			ok = false
+		}
+	}()
+	srv.AddTool(gt, s.wrapToolHandler(h))
+	return true
 }
 
 // syncSessionResources adds the session's resource overlay onto its go-sdk
@@ -265,7 +304,6 @@ func (s *MCPServer) isLocalSession(id string) bool {
 func (s *MCPServer) forgetSession(id string) {
 	s.localSessions.Delete(id)
 	s.sessions.Delete(id)
-	s.pendingReqCtx.Delete(id)
 }
 
 // bindRehydratedSession binds the clientSession for a session that was created

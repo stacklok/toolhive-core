@@ -43,6 +43,14 @@ import (
 	mcp "github.com/stacklok/toolhive-core/mcpcompat/mcp"
 )
 
+// schemaTypeObject is the empty object JSON schema ("type":"object") that
+// go-sdk's AddTool requires a tool input schema to carry. schemaTypeKey is the
+// JSON-schema "type" property name.
+const (
+	schemaTypeKey    = "type"
+	schemaTypeObject = "object"
+)
+
 // ServerOption configures an MCPServer.
 //
 //nolint:revive // name intentionally matches mcp-go for drop-in compatibility.
@@ -103,11 +111,21 @@ type MCPServer struct {
 	logger  *slog.Logger
 	hooks   *Hooks
 
-	// capability flags (informational; go-sdk infers capabilities from
-	// registered features, but these are retained for API compatibility).
+	// Capability flags set via WithToolCapabilities/WithResourceCapabilities/
+	// WithPromptCapabilities. These are wired into the go-sdk ServerOptions in
+	// buildServer (see ServerOptions.Capabilities): go-sdk otherwise infers
+	// capabilities only from registered features, so a server that registers
+	// tools per-session AFTER initialize (ToolHive's vMCP projection) would
+	// advertise no tools capability at initialize time. The *Declared flags
+	// record that the corresponding With*Capabilities option was invoked (mcp-go
+	// advertises the capability whenever the option is used, regardless of the
+	// sub-flag value); the sub-flags carry the ListChanged/Subscribe settings.
+	toolsDeclared       bool
 	toolListChanged     bool
+	resourcesDeclared   bool
 	resourceSubscribe   bool
 	resourceListChanged bool
+	promptsDeclared     bool
 	promptListChanged   bool
 	logging             bool
 
@@ -128,46 +146,60 @@ type MCPServer struct {
 	// in registerAndSync (which only fires on this instance's initialize path).
 	localSessions sync.Map // sessionID -> struct{}
 
-	// pendingReqCtx maps an in-flight request's session ID to the HTTP request
-	// context, so the dispatch middleware can bridge per-request context values
-	// (identity, audit BackendInfo, telemetry) into the handler context. The
-	// go-sdk processes messages on a detached session goroutine and does not
-	// propagate the HTTP request context the way mcp-go did; this restores it.
-	pendingReqCtx sync.Map // sessionID -> context.Context
+	// pendingReqCtx bridges per-request context values (identity, audit
+	// BackendInfo, telemetry) into handlers running on go-sdk's session
+	// goroutine. go-sdk does NOT propagate the per-POST HTTP request's context
+	// into the receiving-middleware path for subsequent requests on an existing
+	// session: messages published from servePOST are handled on the connection
+	// goroutine whose context was captured at session-creation (initialize)
+	// time, so request-scoped values added via WithHTTPContextFunc would
+	// otherwise be lost.
+	//
+	// To avoid the per-session race where two concurrent POSTs on the same
+	// session clobber each other's context (issue #156, item U3), entries are
+	// keyed by a per-POST nonce rather than the session ID. ServeHTTP generates
+	// a nonce, stores the request context under it, and sets it as the
+	// X-MCP-Req-Nonce header; the dispatch middleware reads that header off the
+	// per-request RequestExtra (req.GetExtra().Header, which go-sdk populates
+	// from the POST's headers) to look up the correct context. Entries are
+	// cleared when ServeHTTP returns.
+	pendingReqCtx sync.Map // nonce -> context.Context
 }
+
+// reqNonceHeader is the HTTP header carrying the per-POST nonce that
+// correlates a request's context (stored by ServeHTTP) with the handler
+// invocation on go-sdk's session goroutine.
+const reqNonceHeader = "X-MCP-Req-Nonce"
 
 // setPendingRequestContext records the HTTP request context for an in-flight
-// request on the given session so the dispatch middleware can bridge its values.
-func (s *MCPServer) setPendingRequestContext(ctx context.Context, sessionID string) {
-	s.pendingReqCtx.Store(sessionID, ctx)
+// POST under the given nonce so the dispatch middleware can bridge its values.
+func (s *MCPServer) setPendingRequestContext(ctx context.Context, nonce string) {
+	s.pendingReqCtx.Store(nonce, ctx)
 }
 
-// pendingRequestContext returns the recorded HTTP request context for sessionID.
-func (s *MCPServer) pendingRequestContext(sessionID string) context.Context {
-	if v, ok := s.pendingReqCtx.Load(sessionID); ok {
+// pendingRequestContext returns the recorded HTTP request context for nonce.
+func (s *MCPServer) pendingRequestContext(nonce string) context.Context {
+	if v, ok := s.pendingReqCtx.Load(nonce); ok {
 		return v.(context.Context)
 	}
 	return nil
 }
 
 // clearPendingRequestContext drops the recorded HTTP request context.
-func (s *MCPServer) clearPendingRequestContext(sessionID string) {
-	s.pendingReqCtx.Delete(sessionID)
+func (s *MCPServer) clearPendingRequestContext(nonce string) {
+	s.pendingReqCtx.Delete(nonce)
 }
 
 // valueBridgeContext bridges the originating HTTP request's context values into
-// a handler running on go-sdk's detached session goroutine. Its lifecycle
+// a handler running on go-sdk's session goroutine. Its lifecycle
 // (Deadline/Done/Err) comes from the embedded handler context; Value lookups
 // consult the per-request HTTP context (values) FIRST, then fall back to the
 // handler context.
 //
-// The per-request context must take precedence because go-sdk uses the
-// *initialize* request's context as the whole session's context. Without
-// values-first ordering, request-scoped values that the HTTP middleware chain
-// re-establishes per request (audit BackendInfo, identity, telemetry) would be
-// shadowed by the stale copies frozen at initialize time. go-sdk's own internal
-// context keys are absent from the raw HTTP request context, so they still
-// resolve via the fallback.
+// The per-request context takes precedence so request-scoped values that the
+// HTTP middleware chain re-establishes per request (audit BackendInfo,
+// identity, telemetry) are visible to the handler rather than shadowed by the
+// copies frozen onto the session context at initialize time.
 type valueBridgeContext struct {
 	context.Context
 	values context.Context
@@ -196,22 +228,64 @@ func NewMCPServer(name, version string, opts ...ServerOption) *MCPServer {
 	return s
 }
 
+// serverCapabilities translates the mcp-go capability flags declared via
+// WithToolCapabilities/WithResourceCapabilities/WithPromptCapabilities (and
+// WithLogging) into a go-sdk ServerCapabilities value for ServerOptions. A
+// capability declared via its option is advertised with its sub-flags
+// (ListChanged/Subscribe); an undeclared capability is left nil so go-sdk's
+// inference from registered features applies. See buildServer for why this
+// mapping is required (per-session tool registration after initialize).
+func (s *MCPServer) serverCapabilities() *gosdk.ServerCapabilities {
+	caps := &gosdk.ServerCapabilities{}
+	if s.toolsDeclared {
+		caps.Tools = &gosdk.ToolCapabilities{ListChanged: s.toolListChanged}
+	}
+	if s.resourcesDeclared {
+		caps.Resources = &gosdk.ResourceCapabilities{
+			Subscribe:   s.resourceSubscribe,
+			ListChanged: s.resourceListChanged,
+		}
+	}
+	if s.promptsDeclared {
+		caps.Prompts = &gosdk.PromptCapabilities{ListChanged: s.promptListChanged}
+	}
+	if s.logging {
+		caps.Logging = &gosdk.LoggingCapabilities{}
+	}
+	return caps
+}
+
 // WithToolCapabilities declares tool support (listChanged notifications).
+//
+// Invoking this option advertises the tools capability in the initialize result
+// regardless of whether any tools are registered at initialize time: vMCP
+// registers tools per-session AFTER initialize, so without this the capability
+// would be absent (go-sdk otherwise infers capabilities from registered
+// features).
 func WithToolCapabilities(listChanged bool) ServerOption {
-	return func(s *MCPServer) { s.toolListChanged = listChanged }
+	return func(s *MCPServer) { s.toolsDeclared = true; s.toolListChanged = listChanged }
 }
 
 // WithResourceCapabilities declares resource support.
+//
+// Invoking this option advertises the resources capability in the initialize
+// result regardless of whether any resources are registered at initialize time
+// (see WithToolCapabilities for the per-session registration rationale).
 func WithResourceCapabilities(subscribe, listChanged bool) ServerOption {
 	return func(s *MCPServer) {
+		s.resourcesDeclared = true
 		s.resourceSubscribe = subscribe
 		s.resourceListChanged = listChanged
 	}
 }
 
 // WithPromptCapabilities declares prompt support.
+//
+// Invoking this option advertises the prompts capability in the initialize
+// result regardless of whether any prompts are registered at initialize time
+// (see WithToolCapabilities for the per-session registration rationale).
 func WithPromptCapabilities(listChanged bool) ServerOption {
-	return func(s *MCPServer) { s.promptListChanged = listChanged }
+	return func(s *MCPServer) { s.promptsDeclared = true; s.promptListChanged = listChanged }
 }
 
 // WithLogging enables logging capability.
@@ -325,6 +399,19 @@ func (s *MCPServer) buildServer(genSessionID func() string) (*gosdk.Server, erro
 			s.registerAndSync(ctx, req.Session, srv)
 		},
 	}
+	// Map the mcp-go capability flags to go-sdk's ServerCapabilities. go-sdk
+	// otherwise infers capabilities solely from registered features (see
+	// (*Server).capabilities): a server that registers tools per-session AFTER
+	// initialize — ToolHive's vMCP projection, where go-sdk has zero tools at
+	// initialize time — would advertise no tools capability, and spec-compliant
+	// clients that gate tools/list on capabilities.tools would see no tools.
+	// WithToolCapabilities/WithResourceCapabilities/WithPromptCapabilities
+	// declare those capabilities up front, mirroring mcp-go. The non-deprecated
+	// ServerOptions.Capabilities field is used (HasTools/HasResources/HasPrompts
+	// exist but are deprecated). Setting a capability to a non-nil value forces
+	// it to be advertised regardless of registered features; a nil entry leaves
+	// go-sdk's inference (from registered features) in place.
+	opts.Capabilities = s.serverCapabilities()
 	// When a SessionIdManager is supplied (WithSessionIdManager), drive the SDK's
 	// session-ID generation through it: mcp-go called Generate() to mint the ID,
 	// which is where ToolHive's manager creates the placeholder session record
@@ -391,10 +478,21 @@ func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server) gosdk.Middlewar
 			ss, _ := req.GetSession().(*gosdk.ServerSession)
 			if ss != nil {
 				ctx = s.contextWithSession(ctx, ss)
-				// Bridge the originating HTTP request's context values (identity,
-				// audit BackendInfo, telemetry) into the handler context.
-				if reqCtx := s.pendingRequestContext(ss.ID()); reqCtx != nil {
-					ctx = &valueBridgeContext{Context: ctx, values: reqCtx}
+			}
+			// Bridge the originating HTTP request's context values (identity,
+			// audit BackendInfo, telemetry) into the handler context. go-sdk
+			// does not propagate the per-POST request context into the handler
+			// for existing sessions, so ServeHTTP stored it keyed by a per-POST
+			// nonce (X-MCP-Req-Nonce). The nonce is read off the per-request
+			// RequestExtra.Header — which go-sdk populates from the POST's
+			// headers — so concurrent POSTs on the same session each resolve
+			// their OWN context (issue #156, item U3: per-request, not per
+			// session).
+			if re := req.GetExtra(); re != nil {
+				if nonce := re.Header.Get(reqNonceHeader); nonce != "" {
+					if reqCtx := s.pendingRequestContext(nonce); reqCtx != nil {
+						ctx = &valueBridgeContext{Context: ctx, values: reqCtx}
+					}
 				}
 			}
 			// Fire the before-hooks ahead of the SDK's own handling so a
@@ -520,10 +618,13 @@ func (s *MCPServer) wrapPromptHandler(h PromptHandlerFunc) gosdk.PromptHandler {
 // the same MCP wire JSON (including the outputSchema derived from
 // RawOutputSchema), so a JSON round-trip is a faithful conversion.
 //
-// go-sdk's AddTool panics unless InputSchema is a non-nil object schema, whereas
-// mcp-go tolerated a missing/empty schema. Normalize to the empty object schema
-// ({"type":"object"}) so tools with no declared input (common in ToolHive's
-// per-session vMCP projection) register cleanly, matching mcp-go's leniency.
+// mcp-go passed RawInputSchema through verbatim, tolerating a missing/empty
+// schema. go-sdk's AddTool panics unless InputSchema is non-nil (see
+// normalizeObjectSchema), so a nil/empty schema is normalized to the empty
+// object schema ({"type":"object"}). All other schemas pass through verbatim,
+// matching mcp-go's behavior; go-sdk's AddTool may still panic on a non-object
+// schema, which the per-session registration path recovers from (see
+// normalizeObjectSchema and MCPServer.addSessionTool).
 func toGoSDKTool(t mcp.Tool) (*gosdk.Tool, error) {
 	out := &gosdk.Tool{}
 	if err := jsonConvert(t, out); err != nil {
@@ -533,16 +634,56 @@ func toGoSDKTool(t mcp.Tool) (*gosdk.Tool, error) {
 	return out, nil
 }
 
-// normalizeObjectSchema ensures a JSON-schema value is a non-nil object schema
-// suitable for go-sdk's AddTool. A nil schema, or one whose "type" is not
-// "object", is replaced with the empty object schema.
+// normalizeObjectSchema ensures a tool input schema is suitable for go-sdk's
+// AddTool, which panics on a nil InputSchema. A nil schema, an empty map, an
+// empty string, or a map whose "type" is the empty string (the value mcp-go's
+// ToolInputSchema marshals to when no type is declared) is replaced with the
+// empty object schema ({"type":"object"}). Every other schema is returned
+// verbatim, mirroring mcp-go, which passed RawInputSchema through unchanged —
+// including object schemas with "type" omitted, $ref, oneOf/anyOf, and boolean
+// schemas.
+//
+// TODO(upstream): go-sdk v1.6.1 AddTool additionally panics unless the
+// schema's top-level "type" is literally "object", so a non-object schema that
+// passes through here (e.g. $ref, oneOf, a boolean schema, or an object schema
+// with type omitted) will panic at registration time. We pass such schemas
+// through verbatim (rather than silently rewriting them) so callers surface the
+// incompatibility rather than silently receiving a different schema than the one
+// they declared; mcp-go performed no validation here either. The two registration
+// paths handle the panic differently: the per-session path
+// (MCPServer.addSessionTool, used by syncSessionTools) recovers and skips the
+// offending tool so one bad overlay schema cannot crash a live session; the
+// global path (buildServer) lets the panic surface as a construction-time error
+// (a 500 at handler build).
 func normalizeObjectSchema(schema any) any {
-	if m, ok := schema.(map[string]any); ok {
-		if m["type"] == "object" {
-			return m
+	switch s := schema.(type) {
+	case nil:
+		return map[string]any{schemaTypeKey: schemaTypeObject}
+	case map[string]any:
+		if len(s) == 0 {
+			return map[string]any{schemaTypeKey: schemaTypeObject}
 		}
+		// mcp-go's ToolInputSchema always marshals a "type" field, even when
+		// unset (it serializes as ""). An empty type string is the sentinel for
+		// "no schema declared"; normalize it to "object" so AddTool accepts the
+		// tool (matching mcp-go's leniency for tools with no declared input).
+		if t, ok := s[schemaTypeKey].(string); ok && t == "" {
+			cpy := make(map[string]any, len(s))
+			for k, v := range s {
+				cpy[k] = v
+			}
+			cpy[schemaTypeKey] = schemaTypeObject
+			return cpy
+		}
+		return s
+	case string:
+		if s == "" {
+			return map[string]any{schemaTypeKey: schemaTypeObject}
+		}
+		return s
+	default:
+		return s
 	}
-	return map[string]any{"type": "object"}
 }
 
 // translateUnknownToolError rewrites go-sdk's "unknown tool" error for a
