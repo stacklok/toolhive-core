@@ -173,6 +173,23 @@ func (c *Client) Ping(ctx context.Context) error {
 	return s.Ping(ctx, nil)
 }
 
+// SetLoggingLevel sets the server's logging level. This is a renamed and
+// simplified counterpart to mcp-go's client.Client.SetLevel: rather than
+// taking an mcp.SetLevelRequest, it accepts the mcp.LoggingLevel directly.
+// The SetLevel, SetLevelRequest and SetLevelParams types from mcp-go are
+// intentionally NOT re-exported by this shim. The server only delivers
+// notifications/message notifications at or above the requested level, so this
+// must be called before the OnNotification handler will see logging
+// notifications. level is one of the MCP logging levels ("debug", "info",
+// "notice", "warning", "error", "critical", "alert", "emergency").
+func (c *Client) SetLoggingLevel(ctx context.Context, level mcp.LoggingLevel) error {
+	s, err := c.sessionFor()
+	if err != nil {
+		return err
+	}
+	return s.SetLoggingLevel(ctx, &gosdk.SetLoggingLevelParams{Level: gosdk.LoggingLevel(level)})
+}
+
 // ListTools lists the server's tools.
 func (c *Client) ListTools(ctx context.Context, request mcp.ListToolsRequest) (*mcp.ListToolsResult, error) {
 	ctx = withErrCapture(ctx)
@@ -395,34 +412,120 @@ func (c *Client) ListResourceTemplates(
 // Handlers must be registered before Initialize so they can be wired into the
 // underlying go-sdk client. The go-sdk exposes typed notification handlers
 // rather than a single catch-all, so this shim synthesizes JSONRPCNotification
-// values for the list-changed, progress and logging notifications.
+// values (method + params) for the list-changed, progress and logging
+// notifications, forwarding each to every registered handler.
+//
+// Server-initiated notifications (including the list_changed notifications,
+// which the server emits outside any in-flight request) are only delivered if
+// the client enabled continuous listening via
+// transport.WithContinuousListening(). Without it the go-sdk streamable
+// transport has no standalone SSE stream to carry such notifications and they
+// are silently dropped; no callback fires.
 func (c *Client) OnNotification(handler func(notification mcp.JSONRPCNotification)) {
 	c.notifyMu.Lock()
 	defer c.notifyMu.Unlock()
 	c.notify = append(c.notify, handler)
 }
 
-func (c *Client) dispatch(method string) {
+// dispatch fans a synthesized JSONRPCNotification out to every registered
+// OnNotification handler. params is converted into mcp-go's
+// JSONRPCNotificationParams (Meta + AdditionalFields) when non-nil, so the
+// notification carries its params as mcp-go would; nil leaves the params empty
+// (used by the list_changed notifications, which carry no params on the wire).
+func (c *Client) dispatch(method string, params any) {
 	c.notifyMu.Lock()
 	handlers := make([]func(mcp.JSONRPCNotification), len(c.notify))
 	copy(handlers, c.notify)
 	c.notifyMu.Unlock()
 	n := mcp.JSONRPCNotification{JSONRPC: mcp.JSONRPC_VERSION}
 	n.Method = method
+	if params != nil {
+		n.Params = toNotificationParams(params)
+	}
 	for _, h := range handlers {
 		h(n)
 	}
 }
 
+// toNotificationParams converts a go-sdk notification params value into the
+// mcp-go NotificationParams shape (Meta + AdditionalFields). Both encode to the
+// same MCP wire JSON, so a JSON round-trip faithfully maps the go-sdk struct's
+// fields onto mcp-go's AdditionalFields map. This mirrors the jsonConvert
+// convention used elsewhere in the shim for cross-type conversion.
+func toNotificationParams(src any) mcp.NotificationParams {
+	// Marshal the go-sdk params and unmarshal into a generic map, then split the
+	// reserved "_meta" key (if present) from the remaining fields, which become
+	// AdditionalFields.
+	b, err := json.Marshal(src)
+	if err != nil {
+		return mcp.NotificationParams{}
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		return mcp.NotificationParams{}
+	}
+	out := mcp.NotificationParams{AdditionalFields: make(map[string]any, len(m))}
+	for k, v := range m {
+		if k == "_meta" {
+			if mm, ok := v.(map[string]any); ok {
+				out.Meta = mm
+			}
+			continue
+		}
+		out.AdditionalFields[k] = v
+	}
+	return out
+}
+
 func (c *Client) installNotificationHandlers(opts *gosdk.ClientOptions) {
 	opts.ToolListChangedHandler = func(_ context.Context, _ *gosdk.ToolListChangedRequest) {
-		c.dispatch("notifications/tools/list_changed")
+		c.dispatch("notifications/tools/list_changed", nil)
 	}
 	opts.PromptListChangedHandler = func(_ context.Context, _ *gosdk.PromptListChangedRequest) {
-		c.dispatch("notifications/prompts/list_changed")
+		c.dispatch("notifications/prompts/list_changed", nil)
 	}
 	opts.ResourceListChangedHandler = func(_ context.Context, _ *gosdk.ResourceListChangedRequest) {
-		c.dispatch("notifications/resources/list_changed")
+		c.dispatch("notifications/resources/list_changed", nil)
+	}
+	// Forward server->client progress notifications. go-sdk hands the params via
+	// *ProgressNotificationClientRequest; convert them to mcp-go's notification
+	// params (progressToken, progress, total, message) and dispatch.
+	opts.ProgressNotificationHandler = newProgressNotificationHandler(c.dispatch)
+	// Forward server->client logging notifications. go-sdk hands the params via
+	// *LoggingMessageRequest; convert them to mcp-go's notification params
+	// (level, data, logger) and dispatch.
+	opts.LoggingMessageHandler = newLoggingMessageHandler(c.dispatch)
+}
+
+// dispatchFunc is the signature of Client.dispatch, factored out so the
+// notification handlers can be unit-tested in isolation without a live session.
+type dispatchFunc func(method string, params any)
+
+// newProgressNotificationHandler builds the go-sdk progress-notification
+// handler that forwards notifications/progress to the supplied dispatch func.
+// If the go-sdk request or its params are nil, dispatch is called with nil
+// params (an empty NotificationParams) rather than panicking.
+func newProgressNotificationHandler(dispatch dispatchFunc) func(context.Context, *gosdk.ProgressNotificationClientRequest) {
+	return func(_ context.Context, req *gosdk.ProgressNotificationClientRequest) {
+		if req == nil || req.Params == nil {
+			dispatch("notifications/progress", nil)
+			return
+		}
+		dispatch("notifications/progress", req.Params)
+	}
+}
+
+// newLoggingMessageHandler builds the go-sdk logging-notification handler that
+// forwards notifications/message to the supplied dispatch func. If the go-sdk
+// request or its params are nil, dispatch is called with nil params rather than
+// panicking.
+func newLoggingMessageHandler(dispatch dispatchFunc) func(context.Context, *gosdk.LoggingMessageRequest) {
+	return func(_ context.Context, req *gosdk.LoggingMessageRequest) {
+		if req == nil || req.Params == nil {
+			dispatch("notifications/message", nil)
+			return
+		}
+		dispatch("notifications/message", req.Params)
 	}
 }
 

@@ -23,12 +23,14 @@ import (
 //   - notifications/message  -> ServerSession.Log (delivered only once the
 //     client has set a logging level, per the go-sdk/spec behavior)
 //
-// The list-changed notifications (tools/prompts/resources) are emitted
-// automatically by the go-sdk server when its registered feature set changes,
-// so they cannot be re-broadcast through a public API here; they, and any other
-// unrecognized method, are dropped (logged at debug level). This is the one
-// behavioral gap versus mcp-go's raw channel-based broadcast and is documented
-// rather than silently ignored.
+// The list-changed notifications (tools/prompts/resources) are NOT re-broadcast
+// through this method: the go-sdk server emits them automatically to connected
+// clients whenever its registered feature set changes on a live session
+// (per-session srv.AddTool / srv.RemoveTools, as driven by syncSessionTools
+// when WithToolCapabilities(true) is set), so a manual broadcast would double
+// them. Any list-changed method (and any other unrecognized method) is dropped
+// here rather than forwarded. This is the one behavioral gap versus mcp-go's
+// raw channel-based broadcast and is documented rather than silently ignored.
 func (s *MCPServer) SendNotificationToAllClients(method string, params map[string]any) {
 	ctx := context.Background()
 	s.sessions.Range(func(_, v any) bool {
@@ -66,8 +68,10 @@ func (s *MCPServer) sendOneNotification(
 		_ = ss.Log(ctx, &p)
 	default:
 		// See the doc comment on SendNotificationToAllClients: go-sdk offers no
-		// public generic notification sender, so list-changed and other methods
-		// cannot be forwarded and are dropped.
+		// public generic notification sender. The list-changed notifications are
+		// emitted automatically by the go-sdk server on feature mutation, so
+		// they (and any other unrecognized method) are dropped here to avoid
+		// double-delivery.
 		if s.logger != nil {
 			s.logger.Debug("SendNotificationToAllClients: dropping unsupported notification method",
 				"method", method)

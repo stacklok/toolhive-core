@@ -210,6 +210,27 @@ var UnmarshalContent = mcpgo.UnmarshalContent
 var NewMetaFromMap = mcpgo.NewMetaFromMap
 
 // ----------------------------------------------------------------------------
+// Logging
+// ----------------------------------------------------------------------------
+
+// LoggingLevel is the severity of a server log message, mirrored from mcp-go.
+//
+//nolint:revive // name intentionally matches mcp-go for drop-in compatibility.
+type LoggingLevel = mcpgo.LoggingLevel
+
+// MCP logging levels, mirrored from mcp-go.
+const (
+	LoggingLevelDebug     = mcpgo.LoggingLevelDebug
+	LoggingLevelInfo      = mcpgo.LoggingLevelInfo
+	LoggingLevelNotice    = mcpgo.LoggingLevelNotice
+	LoggingLevelWarning   = mcpgo.LoggingLevelWarning
+	LoggingLevelError     = mcpgo.LoggingLevelError
+	LoggingLevelCritical  = mcpgo.LoggingLevelCritical
+	LoggingLevelAlert     = mcpgo.LoggingLevelAlert
+	LoggingLevelEmergency = mcpgo.LoggingLevelEmergency
+)
+
+// ----------------------------------------------------------------------------
 // Tools
 // ----------------------------------------------------------------------------
 
