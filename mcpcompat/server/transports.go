@@ -60,7 +60,7 @@ type stdioConfig struct{}
 // ServeStdio runs the MCP server over stdio until the context is done. It
 // mirrors mcp-go's server.ServeStdio.
 func ServeStdio(server *MCPServer, _ ...StdioOption) error {
-	srv, err := server.buildServer(nil)
+	srv, err := server.buildServer(nil, 0)
 	if err != nil {
 		return err
 	}
@@ -84,6 +84,11 @@ type StreamableHTTPServer struct {
 	contextFunc  HTTPContextFunc
 	sessionIDMgr SessionIdManager
 	heartbeat    time.Duration
+	// disableLocalhostProtection turns off go-sdk's DNS-rebinding/localhost
+	// protection (which 403s requests on a loopback listener with a non-localhost
+	// Host header). mcp-go had no such protection; local proxies with custom Host
+	// headers need it disabled. See WithDisableLocalhostProtection.
+	disableLocalhostProtection bool
 
 	once     sync.Once
 	handler  http.Handler
@@ -139,9 +144,25 @@ func WithSessionIdManager(manager SessionIdManager) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.sessionIDMgr = manager }
 }
 
-// WithHeartbeatInterval sets the keep-alive ping interval.
+// WithHeartbeatInterval sets the keep-alive ping interval. This option is now
+// LIVE (it was previously a no-op): it is wired to go-sdk's
+// ServerOptions.KeepAlive, so the SDK pings the peer at this interval and
+// closes the session when a ping goes unanswered. Set a small interval only if
+// you want unanswered pings to terminate the session. Applies to the Streamable
+// HTTP transport only; stdio and SSE pass 0 (no keep-alive), matching mcp-go.
 func WithHeartbeatInterval(interval time.Duration) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.heartbeat = interval }
+}
+
+// WithDisableLocalhostProtection disables go-sdk's DNS-rebinding/localhost
+// protection on the Streamable HTTP transport. go-sdk by default rejects (403)
+// requests that arrive on a loopback listener but carry a non-localhost Host
+// header; mcp-go had no such protection, so local proxies that set a custom
+// Host header must disable it. Pass true to disable the protection (restoring
+// mcp-go's behavior); pass false (or omit) to leave go-sdk's default
+// (protected) in place.
+func WithDisableLocalhostProtection(disable bool) StreamableHTTPOption {
+	return func(s *StreamableHTTPServer) { s.disableLocalhostProtection = disable }
 }
 
 // WithHTTPContextFunc installs a per-request context customizer.
@@ -163,18 +184,27 @@ func (s *StreamableHTTPServer) build() {
 		}
 		// Validate the server configuration once up-front so a bad registration
 		// surfaces as a clean 500 rather than a per-request nil.
-		if _, err := s.mcp.buildServer(gen); err != nil {
+		if _, err := s.mcp.buildServer(gen, s.heartbeat); err != nil {
 			s.buildErr = err
 			return
 		}
 		// JSONResponse makes the handler reply with application/json rather than
 		// text/event-stream for request/response exchanges, matching mcp-go's
 		// server so callers that json.Decode the response body keep working.
-		opts := &gosdk.StreamableHTTPOptions{JSONResponse: true}
+		opts := &gosdk.StreamableHTTPOptions{
+			JSONResponse: true,
+			// DisableLocalhostProtection propagates the option to go-sdk. It
+			// defaults to false (protection enabled, matching go-sdk's safe
+			// default); set it via WithDisableLocalhostProtection to turn the
+			// protection off, restoring mcp-go's acceptance of local proxies
+			// with custom Host headers.
+			DisableLocalhostProtection: s.disableLocalhostProtection,
+		}
 		// A fresh go-sdk server per client session lets each session carry its own
 		// tool/resource overlay (mcp-go's per-session projection), synced by the
-		// registration middleware buildServer installs.
-		s.handler = gosdk.NewStreamableHTTPHandler(s.mcp.getServerFunc(gen), opts)
+		// registration middleware buildServer installs. The heartbeat interval is
+		// threaded into each per-session go-sdk server's KeepAlive.
+		s.handler = gosdk.NewStreamableHTTPHandler(s.mcp.getServerFunc(gen, s.heartbeat), opts)
 	})
 }
 
@@ -229,6 +259,30 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if sid := r.Header.Get("Mcp-Session-Id"); sid != "" && s.sessionIDMgr != nil && !s.mcp.isLocalSession(sid) {
 		s.serveRehydrated(w, r, sid)
 		return
+	}
+
+	// Local-session validation (issue #156, item U5): a session initialized on
+	// THIS instance is trusted by the local go-sdk handler, but mcp-go validated
+	// every request. When a shared SessionIdManager is configured, validate local
+	// sessions on every request too, so a session terminated in the shared store
+	// (e.g. via a DELETE on another replica) is rejected here and its local
+	// bookkeeping dropped, rather than being served forever from the local
+	// handler. The single-replica fast-path (no manager) is preserved: there is
+	// nothing to validate against, so local sessions route straight through.
+	if sid := r.Header.Get("Mcp-Session-Id"); sid != "" && s.sessionIDMgr != nil && s.mcp.isLocalSession(sid) {
+		isTerminated, err := s.sessionIDMgr.Validate(sid)
+		if err != nil {
+			s.mcp.forgetSession(sid)
+			s.deleteRehydrated(sid)
+			http.Error(w, "Invalid session ID", http.StatusNotFound)
+			return
+		}
+		if isTerminated {
+			s.mcp.forgetSession(sid)
+			s.deleteRehydrated(sid)
+			http.Error(w, "Session terminated", http.StatusNotFound)
+			return
+		}
 	}
 
 	s.handler.ServeHTTP(w, r)
@@ -305,7 +359,7 @@ func (s *StreamableHTTPServer) rehydrate(r *http.Request, sid string) (*rehydrat
 		return rt, nil
 	}
 
-	srv, err := s.mcp.buildServer(nil)
+	srv, err := s.mcp.buildServer(nil, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -412,11 +466,11 @@ func WithMessageEndpoint(endpoint string) SSEOption {
 
 func (s *SSEServer) build() {
 	s.once.Do(func() {
-		if _, err := s.mcp.buildServer(nil); err != nil {
+		if _, err := s.mcp.buildServer(nil, 0); err != nil {
 			s.buildErr = err
 			return
 		}
-		s.handler = gosdk.NewSSEHandler(s.mcp.getServerFunc(nil), nil)
+		s.handler = gosdk.NewSSEHandler(s.mcp.getServerFunc(nil, 0), nil)
 	})
 }
 

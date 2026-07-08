@@ -5,8 +5,11 @@ package server_test
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -322,4 +325,187 @@ func TestPerRequestContext_NotClobberedConcurrently(t *testing.T) {
 		// times.
 		assert.ElementsMatch(t, []string{a, b}, got, "iteration %d: handlers saw clobbered values %v", i, got)
 	}
+}
+
+// TestPageSize_Configurable verifies that WithPageSize threads go-sdk's
+// ServerOptions.PageSize so tools/list is paginated at the configured size
+// (issue #156, item 6). With PageSize(2) and 3 tools, the first tools/list must
+// return at most 2 tools and a nextCursor to fetch the remaining page. go-sdk's
+// default (DefaultPageSize=1000) would otherwise return all tools in one page,
+// breaking vMCP aggregators with >1000 tools.
+func TestPageSize_Configurable(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	srv := server.NewMCPServer("page-server", testClientVersion,
+		server.WithToolCapabilities(false),
+		server.WithPageSize(2),
+	)
+	for i := 0; i < 3; i++ {
+		name := fmt.Sprintf("t%d", i)
+		srv.AddTool(mcp.NewTool(name, mcp.WithDescription("tool "+name)),
+			func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return mcp.NewToolResultText("ok"), nil
+			})
+	}
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	c, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	// First page: at most 2 tools, plus a nextCursor signalling more remain.
+	first, err := c.ListTools(ctx, mcp.ListToolsRequest{})
+	require.NoError(t, err)
+	assert.LessOrEqual(t, len(first.Tools), 2, "first page must respect the configured page size")
+	assert.NotEmpty(t, first.NextCursor, "a nextCursor must be returned when more tools remain")
+
+	// Second page: fetch the rest with the cursor; together they cover all 3.
+	secondReq := mcp.ListToolsRequest{}
+	secondReq.Params.Cursor = first.NextCursor
+	second, err := c.ListTools(ctx, secondReq)
+	require.NoError(t, err)
+	total := len(first.Tools) + len(second.Tools)
+	assert.Equal(t, 3, total, "both pages together must return all registered tools")
+}
+
+// TestDisableLocalhostProtection_PassedThrough verifies that
+// WithDisableLocalhostProtection propagates to go-sdk's
+// StreamableHTTPOptions.DisableLocalhostProtection (issue #156, item 5). go-sdk
+// by default 403s requests on a loopback listener with a non-localhost Host
+// header; with the option set, a request carrying a custom Host header must
+// proceed rather than be rejected.
+//
+// This mirrors TestDisableLocalhostProtection_DefaultRejectsNonLocalhostHost:
+// a raw http.Request with req.Host set to a non-localhost value is the only
+// way to exercise go-sdk's DNS-rebinding check (the compat client sends a
+// localhost Host header, which go-sdk never 403s). With the option disabled
+// the same request that the default-rejects test expects to 403 must instead
+// succeed (200), proving the option actually toggles the protection.
+func TestDisableLocalhostProtection_PassedThrough(t *testing.T) {
+	t.Parallel()
+
+	srv := server.NewMCPServer("host-server", testClientVersion, server.WithToolCapabilities(false))
+	srv.AddTool(mcp.NewTool("ping", mcp.WithDescription("ping")),
+		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("pong"), nil
+		})
+
+	httpSrv := server.NewStreamableHTTPServer(srv, server.WithDisableLocalhostProtection(true))
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL, strings.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	// A non-localhost Host header would trigger go-sdk's DNS-rebinding
+	// protection by default; WithDisableLocalhostProtection(true) must let it
+	// through.
+	req.Host = "evil.example.com"
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "with protection disabled a non-localhost Host must be accepted")
+}
+
+// TestDisableLocalhostProtection_DefaultRejectsNonLocalhostHost verifies that
+// WITHOUT WithDisableLocalhostProtection, go-sdk's default localhost protection
+// is in effect: a request on a loopback listener carrying a non-localhost Host
+// header is rejected with 403. This confirms the knob actually toggles the
+// protection (the default is "protected").
+func TestDisableLocalhostProtection_DefaultRejectsNonLocalhostHost(t *testing.T) {
+	t.Parallel()
+
+	srv := server.NewMCPServer("prot-server", testClientVersion, server.WithToolCapabilities(false))
+	httpSrv := server.NewStreamableHTTPServer(srv) // no disable option
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL, strings.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	// A non-localhost Host header triggers go-sdk's DNS-rebinding protection.
+	req.Host = "evil.example.com"
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode, "default localhost protection must reject a non-localhost Host")
+}
+
+// TestHeartbeat_WiredToKeepAlive verifies that WithHeartbeatInterval is wired to
+// go-sdk's per-session keep-alive (issue #156, item 2) via an e2e check: a
+// server built with a heartbeat disconnects a session whose transport stops
+// responding to pings. go-sdk pings the peer at KeepAlive and closes the session
+// when a ping goes unanswered, observable as the client's stream/sessions
+// closing. Because ServerOptions.KeepAlive is not observable directly, this is
+// an e2e test.
+//
+// We observe the wiring through the resulting server's session lifecycle: a
+// raw JSON-RPC initialize against a server configured with a short heartbeat,
+// after which the client stops reading, must lead to the session being closed
+// within a bounded window. This proves the heartbeat is no longer a no-op.
+func TestHeartbeat_WiredToKeepAlive(t *testing.T) {
+	t.Parallel()
+
+	srv := server.NewMCPServer("hb-server", testClientVersion, server.WithToolCapabilities(false))
+	srv.AddTool(mcp.NewTool("ping", mcp.WithDescription("ping")),
+		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("pong"), nil
+		})
+
+	httpSrv := server.NewStreamableHTTPServer(srv, server.WithHeartbeatInterval(150*time.Millisecond))
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	// Initialize a session via raw JSON-RPC, then stop reading the response
+	// stream entirely (abandon the connection). With KeepAlive wired, go-sdk's
+	// per-session pinger will fail to get a pong back and must close the session
+	// within a bounded window. We assert the session is gone by issuing a
+	// follow-up request with the same session id: once the SDK has evicted the
+	// dead session, it 404s the id (the go-sdk handler does not recognize it).
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	sid := initSession(t, ts.URL)
+
+	// Give the keep-alive pinger time to fire and evict the unresponsive session.
+	// The heartbeat is 150ms; allow a generous multiple for the ping timeout +
+	// eviction.
+	deadline := time.Now().Add(3 * time.Second)
+	var got404 bool
+	for time.Now().Before(deadline) {
+		resp := postRPC(ctx, t, ts.URL, sid, `{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}`)
+		sc := resp.StatusCode
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if sc == http.StatusNotFound {
+			got404 = true
+			break
+		}
+		// A 200 means the session is still alive; back off briefly and retry.
+		time.Sleep(100 * time.Millisecond)
+	}
+	assert.True(t, got404, "session must be evicted by keep-alive within the bounded window once the client stops responding to pings")
 }

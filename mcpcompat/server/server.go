@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	gosdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -128,6 +129,13 @@ type MCPServer struct {
 	promptsDeclared     bool
 	promptListChanged   bool
 	logging             bool
+
+	// pageSize is the maximum number of items returned in a single page for
+	// list methods (tools/list, resources/list, prompts/list). go-sdk defaults
+	// to DefaultPageSize (1000) when zero; mcp-go returned everything in one
+	// page. Setting it via WithPageSize lets aggregators with >1000 tools raise
+	// (or otherwise configure) the page size so tools/list is not paginated.
+	pageSize int
 
 	mu                sync.RWMutex
 	tools             map[string]ServerTool
@@ -303,6 +311,20 @@ func WithHooks(hooks *Hooks) ServerOption {
 	return func(s *MCPServer) { s.hooks = hooks }
 }
 
+// WithPageSize configures the server's list pagination page size (the maximum
+// number of items returned in a single tools/list, resources/list, or
+// prompts/list response). A value of 0 leaves go-sdk's default
+// (DefaultPageSize=1000) in place. mcp-go returned all items in one page;
+// aggregators with more than 1000 tools must raise this to avoid pagination.
+func WithPageSize(n int) ServerOption {
+	return func(s *MCPServer) {
+		if n < 0 {
+			n = 0
+		}
+		s.pageSize = n
+	}
+}
+
 // AddTool registers a tool and its handler.
 func (s *MCPServer) AddTool(tool mcp.Tool, handler ToolHandlerFunc) {
 	s.mu.Lock()
@@ -369,7 +391,7 @@ func (s *MCPServer) AddPrompt(prompt mcp.Prompt, handler PromptHandlerFunc) {
 // middleware installed by this function syncs that session's overlay tools and
 // resources onto its own server once the OnRegisterSession hooks have run. This
 // mirrors mcp-go, whose per-session tools were dispatched per connection.
-func (s *MCPServer) buildServer(genSessionID func() string) (*gosdk.Server, error) {
+func (s *MCPServer) buildServer(genSessionID func() string, keepalive time.Duration) (*gosdk.Server, error) {
 	s.mu.RLock()
 	tools := make(map[string]ServerTool, len(s.tools))
 	for k, v := range s.tools {
@@ -392,6 +414,15 @@ func (s *MCPServer) buildServer(genSessionID func() string) (*gosdk.Server, erro
 	var srv *gosdk.Server
 	opts := &gosdk.ServerOptions{
 		Logger: s.logger,
+		// PageSize configures list pagination. A zero value leaves go-sdk's
+		// DefaultPageSize (1000) in place, preserving the pre-existing behavior
+		// for callers that do not set WithPageSize.
+		PageSize: s.pageSize,
+		// KeepAlive wires WithHeartbeatInterval (streamable HTTP transport) to
+		// go-sdk's per-session keep-alive ping: the SDK pings the peer at this
+		// interval and closes the session if a ping goes unanswered. stdio/SSE
+		// pass 0 (no keep-alive), matching mcp-go.
+		KeepAlive: keepalive,
 		InitializedHandler: func(ctx context.Context, req *gosdk.InitializedRequest) {
 			if req == nil || req.Session == nil {
 				return
@@ -449,19 +480,14 @@ func (s *MCPServer) buildServer(genSessionID func() string) (*gosdk.Server, erro
 	return srv, nil
 }
 
-// sessionDispatchMiddleware wires mcp-go's per-session semantics onto a go-sdk
-// server: it registers the session (firing OnRegisterSession) when the client
-// initializes — mcp-go fired that hook on initialize, whereas go-sdk's
-// InitializedHandler only fires on the later notifications/initialized — and it
-// fires the before-list/before-call hooks so ToolHive's lazy per-session tool
-// injection runs before the SDK enumerates or dispatches tools.
 // getServerFunc returns a getServer callback for the go-sdk HTTP/SSE handlers,
 // which invoke it once per new client session. genSessionID (may be nil) is the
-// session-ID generator to install on each per-session server. On a build error
-// it logs and returns nil, which the go-sdk handler surfaces as an HTTP 400.
-func (s *MCPServer) getServerFunc(genSessionID func() string) func(*http.Request) *gosdk.Server {
+// session-ID generator to install on each per-session server; keepalive is the
+// per-session keep-alive ping interval (0 disables). On a build error it logs
+// and returns nil, which the go-sdk handler surfaces as an HTTP 400.
+func (s *MCPServer) getServerFunc(genSessionID func() string, keepalive time.Duration) func(*http.Request) *gosdk.Server {
 	return func(*http.Request) *gosdk.Server {
-		srv, err := s.buildServer(genSessionID)
+		srv, err := s.buildServer(genSessionID, keepalive)
 		if err != nil {
 			if s.logger != nil {
 				s.logger.Error("building per-session MCP server", "error", err)
@@ -472,6 +498,12 @@ func (s *MCPServer) getServerFunc(genSessionID func() string) func(*http.Request
 	}
 }
 
+// sessionDispatchMiddleware wires mcp-go's per-session semantics onto a go-sdk
+// server: it registers the session (firing OnRegisterSession) when the client
+// initializes — mcp-go fired that hook on initialize, whereas go-sdk's
+// InitializedHandler only fires on the later notifications/initialized — and it
+// fires the before-list/before-call hooks so ToolHive's lazy per-session tool
+// injection runs before the SDK enumerates or dispatches tools.
 func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server) gosdk.Middleware {
 	return func(next gosdk.MethodHandler) gosdk.MethodHandler {
 		return func(ctx context.Context, method string, req gosdk.Request) (gosdk.Result, error) {

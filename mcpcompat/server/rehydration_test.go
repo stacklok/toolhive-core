@@ -410,3 +410,67 @@ func TestRehydratedSessionElicitation(t *testing.T) {
 	}
 	assert.True(t, gotToolResult, "expected the elicited tool call to complete on the rehydrated session")
 }
+
+// TestLocalSession_ValidateEvictsWhenTerminatedInSharedStore verifies that a
+// LOCAL session (initialized on this instance) is validated against the shared
+// SessionIdManager on EVERY request (issue #156, item U5), so that a session
+// terminated in the shared store (e.g. via a DELETE on another replica, or a
+// direct manager.Terminate) is rejected here rather than served forever from
+// the local go-sdk handler. mcp-go validated every request; before the fix the
+// local fast-path trusted a local session indefinitely.
+//
+// Single server with a SessionIdManager: initialize locally, terminate the id
+// in the shared store, then issue a request with the same sid → must 404, not
+// 200.
+func TestLocalSession_ValidateEvictsWhenTerminatedInSharedStore(t *testing.T) {
+	t.Parallel()
+	mgr := newSharedSessionManager()
+
+	streamA := server.NewMCPServer("A", "1.0.0")
+	addGreetTool(streamA)
+	sA := server.NewStreamableHTTPServer(streamA, server.WithSessionIdManager(mgr))
+	tsA := httptest.NewServer(sA)
+	defer tsA.Close()
+
+	// Initialize locally on replica A — this marks the session local and hands
+	// its lifecycle to the go-sdk StreamableHTTPHandler.
+	sid := initSession(t, tsA.URL)
+	require.Contains(t, listToolNames(t, tsA.URL, sid), "greet",
+		"local session must be served before termination")
+
+	// Terminate the session in the shared store (as a DELETE on another replica
+	// would, or an explicit lifecycle operation). The local session is still
+	// cached in the go-sdk handler's map.
+	_, _ = mgr.Terminate(sid)
+
+	// The next request on A with the same sid must be rejected via per-request
+	// validation of the local session, not served from the cached local handler.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp := postRPC(ctx, t, tsA.URL, sid, `{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}`)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"local session terminated in the shared store must be rejected, not served")
+	_ = resp.Body.Close()
+}
+
+// TestLocalSession_ServedWithoutManager verifies the single-replica fast-path is
+// preserved: when NO SessionIdManager is configured, a local session is NOT
+// validated on every request (there is nothing to validate against), so a
+// request after the session exists is served normally (200, not 404). This
+// guards against the fix over-eagerly rejecting local sessions in single-replica
+// deployments.
+func TestLocalSession_ServedWithoutManager(t *testing.T) {
+	t.Parallel()
+
+	stream := server.NewMCPServer("solo", "1.0.0")
+	addGreetTool(stream)
+	// No WithSessionIdManager: single-replica, nothing to validate.
+	s := server.NewStreamableHTTPServer(stream)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	sid := initSession(t, ts.URL)
+	// A follow-up request must be served (200) from the local handler.
+	require.Contains(t, listToolNames(t, ts.URL, sid), "greet",
+		"local session must be served in single-replica mode without a manager")
+}

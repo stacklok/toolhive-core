@@ -59,7 +59,7 @@ func TestClientSession_Store(t *testing.T) {
 func TestSetSessionTools_NonObjectSchemaDoesNotPanic(t *testing.T) {
 	t.Parallel()
 	s := NewMCPServer("s", "1")
-	srv, err := s.buildServer(nil)
+	srv, err := s.buildServer(nil, 0)
 	require.NoError(t, err)
 
 	cs := s.sessionFor("sid-bad-schema")
@@ -133,7 +133,7 @@ func TestBuildServer_GlobalAndSessionTools(t *testing.T) {
 	// Building the global server (with the globally-registered tool) must succeed.
 	// Per-session overlays are no longer baked in here; they are synced onto the
 	// per-session server by syncSessionTools once the session registers.
-	srv, err := s.buildServer(nil)
+	srv, err := s.buildServer(nil, 0)
 	require.NoError(t, err)
 	require.NotNil(t, srv)
 
@@ -156,7 +156,7 @@ func TestBuildServer_WithSessionIDGenerator(t *testing.T) {
 	called := false
 	gen := func() string { called = true; return "generated-id" }
 
-	srv, err := s.buildServer(gen)
+	srv, err := s.buildServer(gen, 0)
 	require.NoError(t, err)
 	require.NotNil(t, srv)
 	// The generator is installed on the server (invoked by the SDK per new
