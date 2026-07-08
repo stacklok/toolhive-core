@@ -122,7 +122,7 @@ func TestRegistryMeta_TimeFormat(t *testing.T) {
 func TestRegistryData_EmptyOptionalFields(t *testing.T) {
 	t.Parallel()
 
-	// Test that skills can be omitted (omitempty)
+	// Test that skills and plugins can be omitted (omitempty)
 	data := UpstreamData{
 		Servers: []upstreamv0.ServerJSON{},
 	}
@@ -132,14 +132,18 @@ func TestRegistryData_EmptyOptionalFields(t *testing.T) {
 
 	// Skills should not appear in JSON when nil (omitempty behavior)
 	assert.NotContains(t, string(jsonData), "skills")
+	// Plugins should not appear in JSON when nil (omitempty behavior)
+	assert.NotContains(t, string(jsonData), "plugins")
 
 	// Test with empty slice - also omitted due to omitempty
 	data.Skills = []Skill{}
+	data.Plugins = []Plugin{}
 	jsonData, err = json.Marshal(data)
 	require.NoError(t, err)
 
 	// Empty arrays are also omitted with omitempty
 	assert.NotContains(t, string(jsonData), "skills")
+	assert.NotContains(t, string(jsonData), "plugins")
 }
 
 func TestUpstreamRegistry_WithSkills(t *testing.T) {
@@ -154,14 +158,14 @@ func TestUpstreamRegistry_WithSkills(t *testing.T) {
 			Servers: []upstreamv0.ServerJSON{},
 			Skills: []Skill{
 				{
-					Namespace:   "io.github.stacklok",
-					Name:        "pdf-processor",
-					Description: "Extract text and tables from PDF files",
+					Namespace:   testNamespace,
+					Name:        testPluginName,
+					Description: testLongDesc,
 					Version:     testVersion,
 					Status:      testStatusActive,
 					Packages: []SkillPackage{
 						{
-							RegistryType: "oci",
+							RegistryType: testRegistryType,
 							Identifier:   "ghcr.io/stacklok/skills/pdf-processor:1.0.0",
 						},
 					},
@@ -177,9 +181,51 @@ func TestUpstreamRegistry_WithSkills(t *testing.T) {
 	err = json.Unmarshal(jsonData, &decoded)
 	require.NoError(t, err)
 	require.Len(t, decoded.Data.Skills, 1)
-	assert.Equal(t, "io.github.stacklok", decoded.Data.Skills[0].Namespace)
-	assert.Equal(t, "pdf-processor", decoded.Data.Skills[0].Name)
+	assert.Equal(t, testNamespace, decoded.Data.Skills[0].Namespace)
+	assert.Equal(t, testPluginName, decoded.Data.Skills[0].Name)
 	assert.Equal(t, testVersion, decoded.Data.Skills[0].Version)
 	require.Len(t, decoded.Data.Skills[0].Packages, 1)
-	assert.Equal(t, "oci", decoded.Data.Skills[0].Packages[0].RegistryType)
+	assert.Equal(t, testRegistryType, decoded.Data.Skills[0].Packages[0].RegistryType)
+}
+
+func TestUpstreamRegistry_WithPlugins(t *testing.T) {
+	t.Parallel()
+	reg := &UpstreamRegistry{
+		Schema:  UpstreamRegistrySchemaURL,
+		Version: testVersion,
+		Meta: UpstreamMeta{
+			LastUpdated: time.Now().Format(time.RFC3339),
+		},
+		Data: UpstreamData{
+			Servers: []upstreamv0.ServerJSON{},
+			Plugins: []Plugin{
+				{
+					Namespace:   testNamespace,
+					Name:        testPluginName,
+					Description: testLongDesc,
+					Version:     testVersion,
+					Status:      testStatusActive,
+					Packages: []SkillPackage{
+						{
+							RegistryType: testRegistryType,
+							Identifier:   testPluginIdentifier,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	jsonData, err := json.Marshal(reg)
+	require.NoError(t, err)
+
+	var decoded UpstreamRegistry
+	err = json.Unmarshal(jsonData, &decoded)
+	require.NoError(t, err)
+	require.Len(t, decoded.Data.Plugins, 1)
+	assert.Equal(t, testNamespace, decoded.Data.Plugins[0].Namespace)
+	assert.Equal(t, testPluginName, decoded.Data.Plugins[0].Name)
+	assert.Equal(t, testVersion, decoded.Data.Plugins[0].Version)
+	require.Len(t, decoded.Data.Plugins[0].Packages, 1)
+	assert.Equal(t, testRegistryType, decoded.Data.Plugins[0].Packages[0].RegistryType)
 }

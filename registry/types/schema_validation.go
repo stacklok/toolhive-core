@@ -14,7 +14,7 @@ import (
 	"github.com/xeipuuv/gojsonschema"
 )
 
-//go:embed data/upstream-registry.schema.json data/publisher-provided.schema.json data/skill.schema.json data/server.schema.json
+//go:embed data/upstream-registry.schema.json data/publisher-provided.schema.json data/skill.schema.json data/server.schema.json data/plugin.schema.json
 var embeddedSchemaFS embed.FS
 
 // referencedSchemas lists embedded schema files that declare an $id matching
@@ -23,6 +23,7 @@ var embeddedSchemaFS embed.FS
 var referencedSchemas = []string{
 	"data/server.schema.json",
 	"data/skill.schema.json",
+	"data/plugin.schema.json",
 }
 
 // preloadedSchemaLoaders caches the raw bytes of each referenced schema,
@@ -82,6 +83,15 @@ func (s *Skill) Validate() error {
 	return validateAgainstSchema(data, "data/skill.schema.json", "skill schema validation failed")
 }
 
+// Validate validates the Plugin against the plugin schema.
+func (p *Plugin) Validate() error {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return fmt.Errorf("failed to serialize plugin: %w", err)
+	}
+	return validateAgainstSchema(data, "data/plugin.schema.json", "plugin schema validation failed")
+}
+
 // ValidateUpstreamRegistryBytes validates raw upstream registry JSON bytes against the upstream registry schema.
 // It also validates any publisher-provided extensions found in server definitions.
 func ValidateUpstreamRegistryBytes(registryData []byte) error {
@@ -101,6 +111,11 @@ func ValidatePublisherProvidedExtensionsBytes(extensionsData []byte) error {
 // ValidateSkillBytes validates raw skill JSON bytes against the skill schema.
 func ValidateSkillBytes(skillData []byte) error {
 	return validateAgainstSchema(skillData, "data/skill.schema.json", "skill schema validation failed")
+}
+
+// ValidatePluginBytes validates raw plugin JSON bytes against the plugin schema.
+func ValidatePluginBytes(pluginData []byte) error {
+	return validateAgainstSchema(pluginData, "data/plugin.schema.json", "plugin schema validation failed")
 }
 
 // ValidateServerJSON validates a single MCP server JSON object and optionally validates
