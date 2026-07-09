@@ -145,6 +145,19 @@ type MCPServer struct {
 	resourceTemplates map[string]ServerResourceTemplate
 	prompts           map[string]ServerPrompt
 
+	// sessions holds every clientSession created on this instance, keyed by
+	// sessionID. It is the registry consulted by contextWithSession / sessionFor
+	// and SendNotificationToAllClients.
+	//
+	// KNOWN GAP (issue #156, finding 5): entries are only removed on the DELETE
+	// path and on a Validate-failure/termination path (see forgetSession). A
+	// session whose client vanishes, or that the go-sdk handler closes internally
+	// (e.g. on a transport error), never has forgetSession called, so its entry
+	// leaks for the process lifetime and SendNotificationToAllClients iterates
+	// corpses. A reaping mechanism (e.g. a periodic sweep that drops entries
+	// whose go-sdk ServerSession is closed, or a go-sdk close callback wired into
+	// forgetSession) is needed; this is lower priority and tracked separately.
+	// Do not over-engineer here without the upstream close hook.
 	sessions sync.Map // sessionID -> *clientSession
 
 	// localSessions records the IDs of sessions that were initialized on THIS
@@ -154,6 +167,10 @@ type MCPServer struct {
 	// is local (route to the go-sdk handler, which owns its session map) or was
 	// created on another replica (rehydrate; see StreamableHTTPServer). Populated
 	// in registerAndSync (which only fires on this instance's initialize path).
+	//
+	// Shares the same unbounded-growth gap as sessions above (finding 5):
+	// entries are dropped only via forgetSession (DELETE / Validate-termination),
+	// not on a vanished client or an internal go-sdk close.
 	localSessions sync.Map // sessionID -> struct{}
 
 	// pendingReqCtx bridges per-request context values (identity, audit
@@ -393,7 +410,22 @@ func (s *MCPServer) AddPrompt(prompt mcp.Prompt, handler PromptHandlerFunc) {
 // middleware installed by this function syncs that session's overlay tools and
 // resources onto its own server once the OnRegisterSession hooks have run. This
 // mirrors mcp-go, whose per-session tools were dispatched per connection.
-func (s *MCPServer) buildServer(genSessionID func() string, keepalive time.Duration) (*gosdk.Server, error) {
+func (s *MCPServer) buildServer(genSessionID func() string, _ time.Duration) (*gosdk.Server, error) {
+	// NOTE: the keepalive parameter is intentionally unused. Wave 3 wired
+	// WithHeartbeatInterval to go-sdk's ServerOptions.KeepAlive, but go-sdk's
+	// KeepAlive sends an active ping REQUEST (server→client) each interval and
+	// session.Close()s on failure. Under JSONResponse mode that ping routes to
+	// the standalone SSE stream; a JSON-only client (no GET stream, the shim
+	// client's own default) has that stream unconnected → ping rejected →
+	// session closed on the first tick. mcp-go's heartbeat was passive (pings
+	// written only to an existing GET stream, never awaited, never
+	// terminating). Wiring KeepAlive therefore evicts every healthy JSON-only
+	// client session at the heartbeat interval. The interval is stored by
+	// WithHeartbeatInterval (see transports.go) but NOT wired to KeepAlive.
+	//
+	// TODO(issue #156): implement a passive keep-alive (SSE comment injection
+	// via a ResponseWriter wrapper around the go-sdk handler) matching
+	// mcp-go's design, rather than the active ping go-sdk's KeepAlive performs.
 	s.mu.RLock()
 	tools := make(map[string]ServerTool, len(s.tools))
 	for k, v := range s.tools {
@@ -420,11 +452,10 @@ func (s *MCPServer) buildServer(genSessionID func() string, keepalive time.Durat
 		// DefaultPageSize (1000) in place, preserving the pre-existing behavior
 		// for callers that do not set WithPageSize.
 		PageSize: s.pageSize,
-		// KeepAlive wires WithHeartbeatInterval (streamable HTTP transport) to
-		// go-sdk's per-session keep-alive ping: the SDK pings the peer at this
-		// interval and closes the session if a ping goes unanswered. stdio/SSE
-		// pass 0 (no keep-alive), matching mcp-go.
-		KeepAlive: keepalive,
+		// KeepAlive is intentionally NOT set: see the note on buildServer's
+		// keepalive parameter above. go-sdk's KeepAlive sends an active ping
+		// request that closes sessions without a connected standalone SSE
+		// stream, incompatible with JSONResponse mode + JSON-only clients.
 		InitializedHandler: func(ctx context.Context, req *gosdk.InitializedRequest) {
 			if req == nil || req.Session == nil {
 				return
@@ -456,12 +487,22 @@ func (s *MCPServer) buildServer(genSessionID func() string, keepalive time.Durat
 	}
 	srv = gosdk.NewServer(impl, opts)
 
+	// Register global tools/resources/prompts. go-sdk's AddTool/AddResource/
+	// AddPrompt panic on a malformed schema (e.g. a $ref or non-object type),
+	// and buildServer runs inside sync.Once.Do in the transports' build(): a
+	// panic here would mark Once done while buildErr stays nil and handler stays
+	// nil, so every subsequent request nil-panics forever. Recover such panics
+	// and convert them into an error so they flow into buildErr and properly
+	// poison the Once (issue #156, finding 2). This mirrors the per-session
+	// recover in addSessionTool (session.go).
 	for _, st := range tools {
 		gt, err := toGoSDKTool(st.Tool)
 		if err != nil {
 			return nil, fmt.Errorf("converting tool %q: %w", st.Tool.Name, err)
 		}
-		srv.AddTool(gt, s.wrapToolHandler(st.Handler))
+		if err := addGlobalTool(srv, gt, s.wrapToolHandler(st.Handler), st.Tool.Name); err != nil {
+			return nil, err
+		}
 	}
 	for _, sr := range resources {
 		gr := &gosdk.Resource{}
@@ -482,11 +523,29 @@ func (s *MCPServer) buildServer(genSessionID func() string, keepalive time.Durat
 	return srv, nil
 }
 
+// addGlobalTool registers a globally-declared tool on a go-sdk server, recovering
+// the panic go-sdk's AddTool raises when a tool's input schema is non-nil but not
+// top-level type:"object" (e.g. $ref, oneOf, boolean). It converts the panic
+// into a returned error so buildServer surfaces a clean construction-time error
+// (flowing into buildErr/sync.Once) rather than poisoning the server's once with
+// a nil-handler-nil-error state. Mirrors addSessionTool (session.go), which
+// recovers and skips for per-session overlays.
+func addGlobalTool(srv *gosdk.Server, gt *gosdk.Tool, h gosdk.ToolHandler, name string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("registering global tool %q: go-sdk AddTool rejected its input schema: %v", name, r)
+		}
+	}()
+	srv.AddTool(gt, h)
+	return nil
+}
+
 // getServerFunc returns a getServer callback for the go-sdk HTTP/SSE handlers,
 // which invoke it once per new client session. genSessionID (may be nil) is the
-// session-ID generator to install on each per-session server; keepalive is the
-// per-session keep-alive ping interval (0 disables). On a build error it logs
-// and returns nil, which the go-sdk handler surfaces as an HTTP 400.
+// session-ID generator to install on each per-session server. The keepalive
+// parameter is retained for signature stability but is NOT wired to go-sdk's
+// KeepAlive (see buildServer); it is effectively ignored. On a build error it
+// logs and returns nil, which the go-sdk handler surfaces as an HTTP 400.
 func (s *MCPServer) getServerFunc(genSessionID func() string, keepalive time.Duration) func(*http.Request) *gosdk.Server {
 	return func(*http.Request) *gosdk.Server {
 		srv, err := s.buildServer(genSessionID, keepalive)
@@ -711,26 +770,19 @@ func toGoSDKTool(t mcp.Tool) (*gosdk.Tool, error) {
 }
 
 // normalizeObjectSchema ensures a tool input schema is suitable for go-sdk's
-// AddTool, which panics on a nil InputSchema. A nil schema, an empty map, an
-// empty string, or a map whose "type" is the empty string (the value mcp-go's
-// ToolInputSchema marshals to when no type is declared) is replaced with the
-// empty object schema ({"type":"object"}). Every other schema is returned
-// verbatim, mirroring mcp-go, which passed RawInputSchema through unchanged —
-// including object schemas with "type" omitted, $ref, oneOf/anyOf, and boolean
-// schemas.
-//
-// TODO(upstream): go-sdk v1.6.1 AddTool additionally panics unless the
-// schema's top-level "type" is literally "object", so a non-object schema that
-// passes through here (e.g. $ref, oneOf, a boolean schema, or an object schema
-// with type omitted) will panic at registration time. We pass such schemas
-// through verbatim (rather than silently rewriting them) so callers surface the
-// incompatibility rather than silently receiving a different schema than the one
-// they declared; mcp-go performed no validation here either. The two registration
-// paths handle the panic differently: the per-session path
-// (MCPServer.addSessionTool, used by syncSessionTools) recovers and skips the
-// offending tool so one bad overlay schema cannot crash a live session; the
-// global path (buildServer) lets the panic surface as a construction-time error
-// (a 500 at handler build).
+// AddTool, which panics on a nil InputSchema and (v1.6.1) unless the schema's
+// top-level "type" is literally "object". The following are normalized to
+// {"type":"object"} (preserving any existing fields): a nil schema, an empty
+// map, an empty string, a map whose "type" is the empty string (the value
+// mcp-go's ToolInputSchema marshals to when no type is declared), and a map
+// with NO "type" key (or type:"") that DOES carry "properties" or "required" —
+// a spec-loose but common shape ({"properties":...}) that mcp-go served
+// verbatim and callable. Forcing type:"object" here makes such schemas callable
+// under go-sdk, matching mcp-go. Truly non-object schemas ($ref, oneOf, a
+// boolean schema, type:"string", type:["object","null"], etc.) pass through
+// verbatim; go-sdk's AddTool will panic on them at registration time, which the
+// registration paths recover from (addGlobalTool for globals surfaces a clean
+// construction error; addSessionTool skips the offending per-session tool).
 func normalizeObjectSchema(schema any) any {
 	switch s := schema.(type) {
 	case nil:
@@ -744,12 +796,30 @@ func normalizeObjectSchema(schema any) any {
 		// "no schema declared"; normalize it to "object" so AddTool accepts the
 		// tool (matching mcp-go's leniency for tools with no declared input).
 		if t, ok := s[schemaTypeKey].(string); ok && t == "" {
-			cpy := make(map[string]any, len(s))
-			for k, v := range s {
-				cpy[k] = v
+			// If the schema declares properties/required, this is an object
+			// schema whose type was simply omitted (spec-loose but common);
+			// normalize type to "object" preserving the other fields so the tool
+			// is callable under go-sdk. Otherwise (no properties/required) it's
+			// a truly empty-declared schema, normalized to the bare object.
+			if _, hasProps := s["properties"]; hasProps {
+				return withTypeObject(s)
 			}
-			cpy[schemaTypeKey] = schemaTypeObject
-			return cpy
+			if _, hasReq := s["required"]; hasReq {
+				return withTypeObject(s)
+			}
+			return map[string]any{schemaTypeKey: schemaTypeObject}
+		}
+		// No "type" key at all: if the schema declares properties or required,
+		// treat it as an object schema with type omitted (spec-loose but common)
+		// and add type:"object" so go-sdk's AddTool accepts it. This matches
+		// mcp-go, which served such schemas verbatim and callable.
+		if _, hasType := s[schemaTypeKey]; !hasType {
+			if _, hasProps := s["properties"]; hasProps {
+				return withTypeObject(s)
+			}
+			if _, hasReq := s["required"]; hasReq {
+				return withTypeObject(s)
+			}
 		}
 		return s
 	case string:
@@ -760,6 +830,18 @@ func normalizeObjectSchema(schema any) any {
 	default:
 		return s
 	}
+}
+
+// withTypeObject returns a copy of s with the top-level "type" set to "object",
+// preserving all other fields. Used for spec-loose object schemas whose type
+// was omitted or empty.
+func withTypeObject(s map[string]any) map[string]any {
+	cpy := make(map[string]any, len(s)+1)
+	for k, v := range s {
+		cpy[k] = v
+	}
+	cpy[schemaTypeKey] = schemaTypeObject
+	return cpy
 }
 
 // translateUnknownToolError rewrites go-sdk's "unknown tool" error for a

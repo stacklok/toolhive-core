@@ -179,11 +179,15 @@ func (fakeIDManager) Terminate(string) (bool, error) { return false, nil }
 
 var _ SessionIdManager = fakeIDManager{}
 
-// TestNormalizeObjectSchema verifies that only nil/empty input schemas are
-// normalized to {"type":"object"}; all other schemas pass through verbatim,
-// matching mcp-go (which passed RawInputSchema through unchanged). Previously
-// any schema whose top-level "type" was not "object" was clobbered, stripping
-// valid $ref/oneOf/boolean/object-with-type-omitted schemas.
+// TestNormalizeObjectSchema verifies the normalization rules in
+// normalizeObjectSchema: nil/empty/empty-type schemas become {"type":"object"};
+// a type-omitted (or empty-type) schema that carries "properties" or
+// "required" is treated as a spec-loose object schema and gets type:"object"
+// added (preserving the other fields), so it is callable under go-sdk (matching
+// mcp-go's verbatim, callable behavior). Truly non-object schemas ($ref, oneOf,
+// boolean, type:["object","null"], a map with no type and no
+// properties/required) pass through verbatim; go-sdk's AddTool will panic on
+// the non-callable ones, recovered by addGlobalTool/addSessionTool.
 //
 //nolint:goconst // test fixtures legitimately repeat schema keys
 func TestNormalizeObjectSchema(t *testing.T) {
@@ -239,17 +243,38 @@ func TestNormalizeObjectSchema(t *testing.T) {
 			},
 		},
 		{
-			name: "object schema with type omitted",
+			name: "object schema with type omitted gets type object",
 			input: map[string]any{
 				"properties": map[string]any{
 					"name": map[string]any{schemaTypeKey: "string"},
 				},
 			},
 			want: map[string]any{
+				schemaTypeKey: schemaTypeObject,
 				"properties": map[string]any{
 					"name": map[string]any{schemaTypeKey: "string"},
 				},
 			},
+		},
+		{
+			name: "object schema with type omitted and required gets type object",
+			input: map[string]any{
+				"required": []any{"name"},
+			},
+			want: map[string]any{
+				schemaTypeKey: schemaTypeObject,
+				"required":    []any{"name"},
+			},
+		},
+		{
+			name:  "type omitted with no properties/required passes through",
+			input: map[string]any{"title": "t"},
+			want:  map[string]any{"title": "t"},
+		},
+		{
+			name:  "type object null array passes through verbatim",
+			input: map[string]any{schemaTypeKey: []any{schemaTypeObject, "null"}},
+			want:  map[string]any{schemaTypeKey: []any{schemaTypeObject, "null"}},
 		},
 		{
 			name:  "$ref schema",

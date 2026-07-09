@@ -159,12 +159,20 @@ func WithSessionIdManager(manager SessionIdManager) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.sessionIDMgr = manager }
 }
 
-// WithHeartbeatInterval sets the keep-alive ping interval. This option is now
-// LIVE (it was previously a no-op): it is wired to go-sdk's
-// ServerOptions.KeepAlive, so the SDK pings the peer at this interval and
-// closes the session when a ping goes unanswered. Set a small interval only if
-// you want unanswered pings to terminate the session. Applies to the Streamable
-// HTTP transport only; stdio and SSE pass 0 (no keep-alive), matching mcp-go.
+// WithHeartbeatInterval sets the keep-alive ping interval. This option is
+// currently a NO-OP: it stores the interval but does NOT wire it to go-sdk's
+// ServerOptions.KeepAlive. go-sdk's KeepAlive sends an active ping REQUEST
+// (server→client) each interval and session.Close()s on failure; under
+// JSONResponse mode that ping routes to the standalone SSE stream, and a
+// JSON-only client (no GET stream, the shim client's own default) has that
+// stream unconnected → ping rejected → session closed on the first tick. That
+// would evict every healthy JSON-only client session at the interval. mcp-go's
+// heartbeat was passive (pings written only to an existing GET stream, never
+// awaited, never terminating).
+//
+// TODO(issue #156): implement a passive keep-alive (SSE comment injection via
+// a ResponseWriter wrapper around the go-sdk handler) matching mcp-go's design
+// and wire this option to it. Until then the value is stored but unused.
 func WithHeartbeatInterval(interval time.Duration) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.heartbeat = interval }
 }
@@ -221,8 +229,9 @@ func (s *StreamableHTTPServer) build() {
 			gen = s.sessionIDMgr.Generate
 		}
 		// Validate the server configuration once up-front so a bad registration
-		// surfaces as a clean 500 rather than a per-request nil.
-		if _, err := s.mcp.buildServer(gen, s.heartbeat); err != nil {
+		// surfaces as a clean 500 rather than a per-request nil. Pass 0 for
+		// keepalive: WithHeartbeatInterval is a documented no-op (see its doc).
+		if _, err := s.mcp.buildServer(gen, 0); err != nil {
 			s.buildErr = err
 			return
 		}
@@ -240,9 +249,9 @@ func (s *StreamableHTTPServer) build() {
 		}
 		// A fresh go-sdk server per client session lets each session carry its own
 		// tool/resource overlay (mcp-go's per-session projection), synced by the
-		// registration middleware buildServer installs. The heartbeat interval is
-		// threaded into each per-session go-sdk server's KeepAlive.
-		s.handler = gosdk.NewStreamableHTTPHandler(s.mcp.getServerFunc(gen, s.heartbeat), opts)
+		// registration middleware buildServer installs. Keepalive is 0
+		// (WithHeartbeatInterval is a no-op; see its doc).
+		s.handler = gosdk.NewStreamableHTTPHandler(s.mcp.getServerFunc(gen, 0), opts)
 	})
 }
 
@@ -272,6 +281,18 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	nonce := crand.Text()
 	s.mcp.setPendingRequestContext(r.Context(), nonce)
 	r.Header.Set(reqNonceHeader, nonce)
+	// KNOWN LIMITATION (issue #156, finding 6): this bridge covers request/
+	// response calls (tools/call, tools/list, initialize), which block in
+	// servePOST until the response is ready, so the deferred clear runs only
+	// AFTER the session goroutine has dispatched the message and read the nonce.
+	// It does NOT cover notification-only POSTs (e.g. notifications/initialized,
+	// notifications/cancel): those are acknowledged with an immediate 202 before
+	// the session goroutine dispatches the message, so the deferred clear can
+	// run before the dispatch middleware looks up the nonce → per-request
+	// context values are silently absent for notification handling. There is no
+	// cross-request bleed (the entry is keyed by a unique nonce), but the bridge
+	// is best-effort for notifications. A proper fix awaits go-sdk per-request
+	// context propagation (upstream ask).
 	defer s.mcp.clearPendingRequestContext(nonce)
 	// DELETE terminates the session. mcp-go answered 200 and drove the supplied
 	// SessionIdManager's Terminate; go-sdk answers 204 and manages its own session
@@ -307,12 +328,34 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	// bookkeeping dropped, rather than being served forever from the local
 	// handler. The single-replica fast-path (no manager) is preserved: there is
 	// nothing to validate against, so local sessions route straight through.
+	//
+	// Transient Validate errors (issue #156, finding 3): a Validate error that is
+	// NOT a genuine termination (e.g. a Redis blip) must NOT drop local state. If
+	// we called forgetSession here, the live go-sdk session would remain in the
+	// handler's map while the local marker is gone → the client's retry takes the
+	// !isLocalSession branch → serveRehydrated builds a SECOND go-sdk session with
+	// the same ID → split-brain (two live sessions, one ID, one pod; the standalone
+	// GET stream stays on the old one). So on a non-terminated Validate error we
+	// only reject THIS request (503, retry-able) and leave the local session
+	// intact; if the shared store recovers, the next Validate succeeds and the
+	// request is served normally. Only a genuine termination (isTerminated) drops
+	// local bookkeeping.
 	if sid := r.Header.Get("Mcp-Session-Id"); sid != "" && s.sessionIDMgr != nil && s.mcp.isLocalSession(sid) {
 		isTerminated, err := s.sessionIDMgr.Validate(sid)
 		if err != nil {
-			s.mcp.forgetSession(sid)
-			s.deleteRehydrated(sid)
-			http.Error(w, "Invalid session ID", http.StatusNotFound)
+			if isTerminated {
+				// Genuinely terminated: drop local bookkeeping so a later request
+				// with the same ID is not mistaken for a live local session.
+				s.mcp.forgetSession(sid)
+				s.deleteRehydrated(sid)
+				http.Error(w, "Session terminated", http.StatusNotFound)
+				return
+			}
+			// Transient error (e.g. shared-store blip): reject this request
+			// without dropping local state. The local go-sdk session stays
+			// alive; the client retries and, once Validate succeeds again, is
+			// served normally rather than routed through rehydration.
+			http.Error(w, "session validation unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		if isTerminated {

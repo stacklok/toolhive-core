@@ -136,6 +136,16 @@ func TestMapCallError_Transport401(t *testing.T) {
 			notErr:  transport.ErrLegacySSEServer,
 		},
 		{
+			// issue #156, finding 4: a 401 with an EMPTY body must still
+			// classify as ErrUnauthorized via the status code (not fall back to
+			// string matching, which misses bare "401 Unauthorized").
+			name:    "empty-body 401",
+			status:  http.StatusUnauthorized,
+			body:    "",
+			wantErr: transport.ErrUnauthorized,
+			notErr:  transport.ErrLegacySSEServer,
+		},
+		{
 			name:    "captured 404 session",
 			status:  http.StatusNotFound,
 			body:    "session not found",
@@ -197,9 +207,27 @@ func TestMapConnectError_4xxOnInitialize_LegacySSE(t *testing.T) {
 			notErr:  transport.ErrSessionTerminated,
 		},
 		{
+			// issue #156, finding 4: a 404 with an EMPTY body on initialize
+			// must still classify as ErrLegacySSEServer via the status code.
+			name:    "empty-body 404 on initialize",
+			status:  http.StatusNotFound,
+			body:    "",
+			wantErr: transport.ErrLegacySSEServer,
+			notErr:  transport.ErrSessionTerminated,
+		},
+		{
 			name:    "400 bad request",
 			status:  http.StatusBadRequest,
 			body:    "Bad Request",
+			wantErr: transport.ErrLegacySSEServer,
+			notErr:  transport.ErrUnauthorized,
+		},
+		{
+			// issue #156, finding 4: a 400 with an EMPTY body on initialize
+			// must still classify as ErrLegacySSEServer via the status code.
+			name:    "empty-body 400 on initialize",
+			status:  http.StatusBadRequest,
+			body:    "",
 			wantErr: transport.ErrLegacySSEServer,
 			notErr:  transport.ErrUnauthorized,
 		},
@@ -214,6 +242,16 @@ func TestMapConnectError_4xxOnInitialize_LegacySSE(t *testing.T) {
 			name:    "401 on connect stays unauthorized",
 			status:  http.StatusUnauthorized,
 			body:    "Unauthorized",
+			wantErr: transport.ErrUnauthorized,
+			notErr:  transport.ErrLegacySSEServer,
+		},
+		{
+			// issue #156, finding 4: a 401 with an EMPTY body on connect must
+			// still classify as ErrUnauthorized via the status code (so OAuth
+			// refresh triggers), not fall back to string matching.
+			name:    "empty-body 401 on connect",
+			status:  http.StatusUnauthorized,
+			body:    "",
 			wantErr: transport.ErrUnauthorized,
 			notErr:  transport.ErrLegacySSEServer,
 		},

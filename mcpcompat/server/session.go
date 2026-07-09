@@ -78,7 +78,13 @@ type clientSession struct {
 	// owner and boundServer are set when the session's go-sdk server is bound
 	// (at registration). They let SetSessionTools/SetSessionResources reconcile
 	// the per-session overlay onto the live go-sdk server at runtime.
-	owner       *MCPServer
+	//
+	// owner is an atomic.Pointer (not a plain field) because SetSessionTools/
+	// SetSessionResources may run from any goroutine (test code, before-hooks on
+	// a live request) concurrently with registerAndSync/bindRehydratedSession,
+	// which set owner on the session's connection goroutine. boundServer uses the
+	// same atomic pattern for the same reason.
+	owner       atomic.Pointer[MCPServer]
 	boundServer atomic.Pointer[gosdk.Server]
 
 	mu        sync.RWMutex
@@ -129,8 +135,10 @@ func (c *clientSession) SetSessionTools(tools map[string]ServerTool) {
 	}
 	c.mu.Unlock()
 	// Reconcile the overlay onto the live go-sdk server if one is bound.
-	if srv := c.boundServer.Load(); srv != nil && c.owner != nil {
-		c.owner.syncSessionTools(srv, c)
+	if srv := c.boundServer.Load(); srv != nil {
+		if owner := c.owner.Load(); owner != nil {
+			owner.syncSessionTools(srv, c)
+		}
 	}
 }
 
@@ -151,8 +159,10 @@ func (c *clientSession) SetSessionResources(resources map[string]ServerResource)
 		c.resources[k] = v
 	}
 	c.mu.Unlock()
-	if srv := c.boundServer.Load(); srv != nil && c.owner != nil {
-		c.owner.syncSessionResources(srv, c)
+	if srv := c.boundServer.Load(); srv != nil {
+		if owner := c.owner.Load(); owner != nil {
+			owner.syncSessionResources(srv, c)
+		}
 	}
 }
 
@@ -192,7 +202,7 @@ func (s *MCPServer) registerAndSync(ctx context.Context, ss *gosdk.ServerSession
 	}
 	cs := s.sessionFor(ss.ID())
 	cs.goSession.Store(ss)
-	cs.owner = s
+	cs.owner.Store(s)
 	cs.boundServer.Store(srv)
 	// Mark the session local: it was initialized on this instance, so the go-sdk
 	// StreamableHTTPHandler owns it and subsequent requests must route there
@@ -320,7 +330,7 @@ func (s *MCPServer) forgetSession(id string) {
 func (s *MCPServer) bindRehydratedSession(id string, ss *gosdk.ServerSession, srv *gosdk.Server) {
 	cs := s.sessionFor(id)
 	cs.goSession.Store(ss)
-	cs.owner = s
+	cs.owner.Store(s)
 	cs.boundServer.Store(srv)
 	cs.Initialize()
 }

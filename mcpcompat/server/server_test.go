@@ -5,6 +5,7 @@ package server_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -469,20 +470,18 @@ func TestDisableLocalhostProtection_DefaultRejectsNonLocalhostHost(t *testing.T)
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode, "default localhost protection must reject a non-localhost Host")
 }
 
-// TestHeartbeat_WiredToKeepAlive verifies that WithHeartbeatInterval is wired to
-// go-sdk's per-session keep-alive (issue #156, item 2) via an e2e check: a
-// server built with a heartbeat disconnects a session whose transport stops
-// responding to pings. go-sdk pings the peer at KeepAlive and closes the session
-// when a ping goes unanswered, observable as the client's stream/sessions
-// closing. Because ServerOptions.KeepAlive is not observable directly, this is
-// an e2e test.
-//
-// We observe the wiring through the resulting server's session lifecycle: a
-// raw JSON-RPC initialize against a server configured with a short heartbeat,
-// after which the client stops reading, must lead to the session being closed
-// within a bounded window. This proves the heartbeat is no longer a no-op.
-func TestHeartbeat_WiredToKeepAlive(t *testing.T) {
+// TestHeartbeat_NoOpDoesNotEvictHealthySession documents the current state of
+// WithHeartbeatInterval (issue #156): it stores the interval but does NOT wire
+// it to go-sdk's ServerOptions.KeepAlive, because go-sdk's KeepAlive sends an
+// active ping request that closes JSON-only client sessions (no standalone SSE
+// stream) on the first tick. This test asserts the inverse of the old
+// session-killing behavior: an idle, healthy client session configured with a
+// short heartbeat (150ms) must still be alive well past the heartbeat interval
+// (500ms), proving the interval is not wired to an evicting KeepAlive. If a
+// future passive keep-alive is wired here, this test will need updating.
+func TestHeartbeat_NoOpDoesNotEvictHealthySession(t *testing.T) {
 	t.Parallel()
+	ctx := context.Background()
 
 	srv := server.NewMCPServer("hb-server", testClientVersion, server.WithToolCapabilities(false))
 	srv.AddTool(mcp.NewTool("ping", mcp.WithDescription("ping")),
@@ -494,35 +493,30 @@ func TestHeartbeat_WiredToKeepAlive(t *testing.T) {
 	ts := httptest.NewServer(httpSrv)
 	t.Cleanup(ts.Close)
 
-	// Initialize a session via raw JSON-RPC, then stop reading the response
-	// stream entirely (abandon the connection). With KeepAlive wired, go-sdk's
-	// per-session pinger will fail to get a pong back and must close the session
-	// within a bounded window. We assert the session is gone by issuing a
-	// follow-up request with the same session id: once the SDK has evicted the
-	// dead session, it 404s the id (the go-sdk handler does not recognize it).
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	c, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
 
-	sid := initSession(t, ts.URL)
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
 
-	// Give the keep-alive pinger time to fire and evict the unresponsive session.
-	// The heartbeat is 150ms; allow a generous multiple for the ping timeout +
-	// eviction.
-	deadline := time.Now().Add(3 * time.Second)
-	var got404 bool
-	for time.Now().Before(deadline) {
-		resp := postRPC(ctx, t, ts.URL, sid, `{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}`)
-		sc := resp.StatusCode
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-		if sc == http.StatusNotFound {
-			got404 = true
-			break
-		}
-		// A 200 means the session is still alive; back off briefly and retry.
-		time.Sleep(100 * time.Millisecond)
-	}
-	assert.True(t, got404, "session must be evicted by keep-alive within the bounded window once the client stops responding to pings")
+	// Idle past the heartbeat interval (150ms). Wait 500ms — well over 3 ticks —
+	// so an evicting KeepAlive would have fired by now.
+	time.Sleep(500 * time.Millisecond)
+
+	// The session must still be alive and serve the call.
+	res, err := c.CallTool(ctx, mcp.CallToolRequest{Params: mcp.CallToolParams{Name: "ping"}})
+	require.NoError(t, err, "healthy idle session must survive past the heartbeat interval (no-op KeepAlive)")
+	require.False(t, res.IsError)
+	txt, ok := mcp.AsTextContent(res.Content[0])
+	require.True(t, ok)
+	assert.Equal(t, "pong", txt.Text)
 }
 
 // TestBeforeCallTool_ReceivesToolNameAndArgs verifies that the before-call hook
@@ -948,4 +942,105 @@ func TestRequestElicitation_SessionWithoutElicitationSupport(t *testing.T) {
 		Params: mcp.ElicitationParams{Message: "hi"},
 	})
 	require.ErrorIs(t, err, server.ErrElicitationNotSupported)
+}
+
+// TestGlobalTool_NonObjectSchema_DoesNotPoisonServer is a regression test for
+// issue #156, finding 2: a global tool whose RawInputSchema is a non-object
+// schema (a $ref) makes go-sdk's AddTool panic at build time. Before the fix
+// that panic ran inside sync.Once.Do, marking Once done while buildErr stayed
+// nil and handler stayed nil — so every subsequent request nil-panicked
+// forever, bricking the server. With the recover in addGlobalTool, buildServer
+// returns a clean error, buildErr is set, and requests get a 500 (not a
+// nil-pointer panic). A subsequent request (e.g. against a SEPARATE server with
+// a valid tool) proves the server object itself is usable; this test asserts
+// the poisoned server returns a clean 500 on every request rather than panicking.
+func TestGlobalTool_NonObjectSchema_DoesNotPoisonServer(t *testing.T) {
+	t.Parallel()
+
+	srv := server.NewMCPServer("bad-schema-server", testClientVersion, server.WithToolCapabilities(false))
+	// A non-object schema ($ref). normalizeObjectSchema passes it through
+	// verbatim; go-sdk AddTool panics on it. addGlobalTool must recover and
+	// convert the panic into a build error.
+	srv.AddTool(mcp.NewToolWithRawSchema("bad", "bad schema", json.RawMessage(`{"$ref":"#"}`)),
+		func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("ok"), nil
+		})
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// The first request must get a clean 500 (build error), NOT a nil-pointer
+	// panic (which would surface as a connection reset / 502).
+	resp := postRPC(ctx, t, ts.URL, "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode,
+		"a bad global tool schema must surface as a clean 500, not a nil panic")
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	// A second request with the same poisoned server must ALSO get a clean 500
+	// (sync.Once is properly poisoned with buildErr, not nil-handler-nil-error).
+	resp2 := postRPC(ctx, t, ts.URL, "", `{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`)
+	assert.Equal(t, http.StatusInternalServerError, resp2.StatusCode,
+		"sync.Once must remain poisoned with the build error, not nil-panic on retry")
+	_, _ = io.Copy(io.Discard, resp2.Body)
+	_ = resp2.Body.Close()
+}
+
+// TestGlobalTool_TypeOmittedObjectSchema_Callable verifies the
+// normalizeObjectSchema improvement (issue #156, finding 2): a spec-loose
+// object schema with NO "type" key but WITH "properties" (a shape mcp-go
+// served verbatim and callable) is normalized to include type:"object" so the
+// tool registers under go-sdk and is callable end-to-end. Without the
+// normalization, go-sdk's AddTool would panic (top-level type not "object")
+// and the tool would fail to register.
+func TestGlobalTool_TypeOmittedObjectSchema_Callable(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	srv := server.NewMCPServer("loose-schema-server", testClientVersion, server.WithToolCapabilities(false))
+	// Object schema with type OMITTED but properties present. mcp-go served
+	// this verbatim and the tool was callable; normalizeObjectSchema now adds
+	// type:"object" so go-sdk's AddTool accepts it.
+	srv.AddTool(mcp.NewToolWithRawSchema("loose", "loose object schema",
+		json.RawMessage(`{"properties":{"name":{"type":"string"}},"required":["name"]}`)),
+		func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			name := req.GetString("name", "world")
+			return mcp.NewToolResultText("hi " + name), nil
+		})
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	c, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err, "server with a type-omitted object schema tool must build and initialize")
+
+	// The tool must be advertised and callable.
+	tools, err := c.ListTools(ctx, mcp.ListToolsRequest{})
+	require.NoError(t, err)
+	require.Len(t, tools.Tools, 1)
+	assert.Equal(t, "loose", tools.Tools[0].Name)
+
+	res, err := c.CallTool(ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{Name: "loose", Arguments: map[string]any{nameKey: "loose-user"}},
+	})
+	require.NoError(t, err, "type-omitted object schema tool must be callable")
+	require.False(t, res.IsError)
+	txt, ok := mcp.AsTextContent(res.Content[0])
+	require.True(t, ok)
+	assert.Equal(t, "hi loose-user", txt.Text)
 }
