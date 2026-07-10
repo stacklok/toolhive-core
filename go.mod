@@ -12,7 +12,7 @@ require (
 	github.com/google/go-containerregistry v0.21.7
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/mark3labs/mcp-go v0.55.1
+	github.com/mark3labs/mcp-go v0.56.0
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/modelcontextprotocol/registry v1.7.9
 	github.com/opencontainers/go-digest v1.0.0
