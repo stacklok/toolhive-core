@@ -49,6 +49,44 @@ func TestClientSession_Store(t *testing.T) {
 	assert.Contains(t, cs.GetSessionResources(), "file:///r")
 }
 
+// TestForgetSession_ClosesNotifChannel verifies that forgetSession closes the
+// notification channel, allowing the drain goroutine started in newClientSession
+// to exit rather than leaking for the process lifetime. Also verifies it is safe
+// to call forgetSession multiple times for the same ID (sync.Once guards the
+// close) and that a re-created session for the same ID gets a fresh channel.
+func TestForgetSession_ClosesNotifChannel(t *testing.T) {
+	t.Parallel()
+	s := NewMCPServer("s", "1")
+
+	cs := s.sessionFor("sess-drain")
+	ch := cs.notifCh
+
+	// Send a notification to prove the channel is open before forget.
+	cs.NotificationChannel() <- mcp.JSONRPCNotification{Notification: mcp.Notification{Method: "test"}}
+
+	// forgetSession must close the channel.
+	s.forgetSession("sess-drain")
+
+	// A send to a closed channel must panic (proving it's closed).
+	assert.Panics(t, func() {
+		ch <- mcp.JSONRPCNotification{}
+	})
+
+	// Calling forgetSession again for the same ID must not panic (sync.Once
+	// guards the double-close). The entry was already deleted, so this is a
+	// no-op.
+	assert.NotPanics(t, func() { s.forgetSession("sess-drain") })
+
+	// A new sessionFor for the same ID creates a fresh, open channel — the old
+	// closed channel is not reused.
+	cs2 := s.sessionFor("sess-drain")
+	require.NotNil(t, cs2.notifCh)
+	assert.NotEqual(t, ch, cs2.notifCh, "a re-created session must get a fresh channel")
+	// The fresh channel must be usable.
+	cs2.NotificationChannel() <- mcp.JSONRPCNotification{Notification: mcp.Notification{Method: "test2"}}
+	s.forgetSession("sess-drain")
+}
+
 // TestSetSessionTools_NonObjectSchemaDoesNotPanic verifies that a per-session
 // overlay tool whose RawInputSchema is a non-object schema ($ref) does NOT crash
 // the session when synced onto the go-sdk server. go-sdk v1.6.1 AddTool panics

@@ -48,14 +48,14 @@ func mapConnectError(ctx context.Context, err error) error {
 	if h != nil && h.status >= 400 && h.status < 500 {
 		if h.status == http.StatusUnauthorized {
 			return transport.NewError(errors.Join(
-				&transport.AuthorizationRequiredError{ResourceMetadataURL: extractResourceMetadataURL(err)},
+				&transport.AuthorizationRequiredError{ResourceMetadataURL: extractResourceMetadataURL(ctx)},
 				transport.ErrUnauthorized,
 				err,
 			))
 		}
 		return transport.NewError(errors.Join(transport.ErrLegacySSEServer, err))
 	}
-	return mapTransportError(err, h)
+	return mapTransportError(ctx, err, h)
 }
 
 // mapCallError maps an error returned by an underlying go-sdk request call onto
@@ -85,7 +85,7 @@ func mapCallError(ctx context.Context, err error) error {
 		// RPC-level error with no captured HTTP status: surface unchanged.
 		return err
 	}
-	return mapTransportError(err, h)
+	return mapTransportError(ctx, err, h)
 }
 
 // mapTransportError inspects err and, when it recognizes an HTTP auth/session
@@ -98,42 +98,76 @@ func mapCallError(ctx context.Context, err error) error {
 // (e.g. a transport failure before any response, or a response whose body
 // capture was skipped), detection falls back to best-effort string matching.
 //
+// A captured 5xx status surfaces the error unchanged: a 5xx body containing the
+// substring "401" or "unauthorized" must NOT trigger ToolHive's OAuth refresh
+// flow (issue #156, wave 4 review finding). The string fallback only runs when
+// NO status was captured at all.
+//
 // NOTE: the go-sdk does not currently expose a typed error carrying the HTTP
 // status code, so the string-matching fallback is inherently best-effort. When
 // the pattern is not recognized the original error is returned unchanged. This is
 // the one area of the client shim where exact parity with mcp-go's OAuth flow
 // may need refinement as the go-sdk's error surface evolves.
-func mapTransportError(err error, h *errBody) error {
+func mapTransportError(ctx context.Context, err error, h *errBody) error {
 	if err == nil {
 		return nil
 	}
 	// Prefer the captured HTTP status over string matching: the status is
 	// authoritative, while body text (re-attached by enrichWithResponseBody)
 	// can legitimately contain words like "unauthorized" for non-401 responses.
-	if h != nil && h.status >= 400 && h.status < 500 {
-		switch h.status {
-		case http.StatusUnauthorized:
-			return transport.NewError(errors.Join(
-				&transport.AuthorizationRequiredError{ResourceMetadataURL: extractResourceMetadataURL(err)},
-				transport.ErrUnauthorized,
-				err,
-			))
-		case http.StatusNotFound:
-			return transport.NewError(errors.Join(transport.ErrSessionTerminated, err))
-		default:
-			// Other 4xx on a regular call are not legacy-SSE (that classification
-			// is connect-time only, in mapConnectError); surface unchanged.
-			return err
+	if h != nil && h.status >= 400 {
+		if ok, mapped := mapStatusError(ctx, err, h); ok {
+			return mapped
 		}
 	}
-	msg := strings.ToLower(err.Error())
+	// No captured status (or a captured status we don't classify, e.g. 5xx):
+	// fall back to best-effort string matching. A captured 5xx is surfaced
+	// unchanged by mapStatusError (ok=true, mapped=err), so the string fallback
+	// only runs when no status was captured at all.
+	return mapStringError(ctx, err)
+}
 
+// mapStatusError classifies an error using the captured HTTP status code. It
+// returns (ok, mapped): ok=true when the status was captured and classified
+// (including the 5xx pass-through), or ok=false when no status was captured (h
+// is nil or h.status == 0), signaling the caller to use the string fallback.
+func mapStatusError(ctx context.Context, err error, h *errBody) (bool, error) {
+	if h == nil || h.status == 0 {
+		return false, nil
+	}
+	if h.status < 400 {
+		return false, nil
+	}
+	if h.status >= 500 {
+		// A captured 5xx must not fall through to string matching: a 5xx body
+		// containing "401"/"unauthorized" would falsely trigger OAuth refresh.
+		return true, err
+	}
+	switch h.status {
+	case http.StatusUnauthorized:
+		return true, transport.NewError(errors.Join(
+			&transport.AuthorizationRequiredError{ResourceMetadataURL: extractResourceMetadataURL(ctx)},
+			transport.ErrUnauthorized,
+			err,
+		))
+	case http.StatusNotFound:
+		return true, transport.NewError(errors.Join(transport.ErrSessionTerminated, err))
+	default:
+		// Other 4xx on a regular call are not legacy-SSE (that classification
+		// is connect-time only, in mapConnectError); surface unchanged.
+		return true, err
+	}
+}
+
+// mapStringError classifies an error using best-effort string matching on its
+// message. This is the fallback path used when no HTTP status was captured
+// (e.g. a transport failure before any response).
+func mapStringError(ctx context.Context, err error) error {
+	msg := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(msg, "401") || strings.Contains(msg, "unauthorized"):
-		// 401: ToolHive checks both ErrAuthorizationRequired (and As
-		// *AuthorizationRequiredError / *transport.Error) and ErrUnauthorized.
 		return transport.NewError(errors.Join(
-			&transport.AuthorizationRequiredError{ResourceMetadataURL: extractResourceMetadataURL(err)},
+			&transport.AuthorizationRequiredError{ResourceMetadataURL: extractResourceMetadataURL(ctx)},
 			transport.ErrUnauthorized,
 			err,
 		))
@@ -146,9 +180,16 @@ func mapTransportError(err error, h *errBody) error {
 	}
 }
 
-// extractResourceMetadataURL is a placeholder for parsing the RFC 9728
-// resource_metadata parameter out of a WWW-Authenticate header. The go-sdk does
-// not surface the header on the error today, so this returns empty for now.
-func extractResourceMetadataURL(_ error) string {
-	return ""
+// extractResourceMetadataURL parses the RFC 9728 §5.1 resource_metadata
+// parameter from the WWW-Authenticate header captured by the shim's own
+// headerRoundTripper (see captureErrorBody). The go-sdk does not surface the
+// header on its errors, but the shim's RoundTripper has direct access to
+// resp.Header and captures it into the per-call errBody holder. Returns empty
+// when no header was captured or no resource_metadata parameter is present.
+func extractResourceMetadataURL(ctx context.Context) string {
+	h := capturedErr(ctx)
+	if h == nil {
+		return ""
+	}
+	return extractResourceMetadataURLFromHeaders(h.wwwAuthHdrs)
 }

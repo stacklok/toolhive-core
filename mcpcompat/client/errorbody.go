@@ -23,8 +23,9 @@ import (
 const maxCapturedErrBody = 8 << 10 // 8 KiB
 
 type errBody struct {
-	status int
-	body   string
+	status      int
+	body        string
+	wwwAuthHdrs []string // captured WWW-Authenticate header values (RFC 9728)
 }
 
 type errBodyKey struct{}
@@ -68,6 +69,13 @@ func captureErrorBody(req *http.Request, resp *http.Response) {
 	// regardless of body length, and the status-driven classification depends on
 	// it. Do this before reading the body so a read error cannot prevent it.
 	h.status = resp.StatusCode
+	// Capture WWW-Authenticate header values (RFC 9728 §5.1) so the error
+	// mappers can populate AuthorizationRequiredError.ResourceMetadataURL. The
+	// go-sdk does not surface this header on its errors; the shim's own
+	// RoundTripper is the only place it is available.
+	if vals := resp.Header.Values("WWW-Authenticate"); len(vals) > 0 {
+		h.wwwAuthHdrs = vals
+	}
 	// Only capture the body once (the first non-2xx response on this context).
 	if h.body != "" {
 		// Body already captured; still restore resp.Body for downstream readers.

@@ -380,7 +380,23 @@ func (s *StreamableHTTPServer) serveRehydrated(w http.ResponseWriter, r *http.Re
 	// it and drop any locally-cached reconstruction rather than serving it.
 	isTerminated, err := s.sessionIDMgr.Validate(sid)
 	if err != nil {
-		s.deleteRehydrated(sid)
+		if isTerminated {
+			s.deleteRehydrated(sid)
+			http.Error(w, "Session terminated", http.StatusNotFound)
+			return
+		}
+		// Distinguish a transient store error from a genuinely unknown session.
+		// If we have a cached reconstruction, the session WAS valid — the error is
+		// likely transient (e.g. a Redis blip), so preserve the cache and return
+		// 503 (retry-able), matching the local-session path (issue #156, finding
+		// 3). A 404 here would signal hard termination and cause the client to
+		// re-initialize. If we have NO cached reconstruction, the session was
+		// never seen by this replica — the error is "not found", and 404 is the
+		// correct response (not a transient issue with a known session).
+		if s.getRehydrated(sid) != nil {
+			http.Error(w, "session validation unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "Invalid session ID", http.StatusNotFound)
 		return
 	}
@@ -432,6 +448,16 @@ func (s *StreamableHTTPServer) deleteRehydrated(sid string) {
 // requests and can perform server->client calls such as elicitation), binds the
 // clientSession so the before-hooks can reconcile the per-session overlay, and
 // caches it keyed by session ID.
+//
+// Scalability note: rehydrate holds rehydratedMu across buildServer + Connect.
+// buildServer copies the tool/resource/prompt maps under s.mu (quick), but
+// Connect can block on transport setup, so concurrent rehydrate calls for
+// DIFFERENT session IDs serialize on this lock. The double-check at the top
+// makes same-sid serialization correct/desired; the cross-sid serialization is
+// the incidental cost. Low impact in practice (cross-replica rehydration is
+// rare and the first request per sid is the only one that builds), so not worth
+// restructuring now — but if rehydration volume ever rises, building the session
+// outside the lock and only inserting under it would remove the serialization.
 func (s *StreamableHTTPServer) rehydrate(r *http.Request, sid string) (*rehydratedSession, error) {
 	s.rehydratedMu.Lock()
 	defer s.rehydratedMu.Unlock()

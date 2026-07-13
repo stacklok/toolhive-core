@@ -323,6 +323,53 @@ func TestRehydratedSessionEvictedAfterTermination(t *testing.T) {
 	_ = resp.Body.Close()
 }
 
+// TestRehydratedSession_TransientValidateError_Returns503 verifies the fix for
+// the wave 4 review finding: a transient Validate error (e.g. a Redis blip) on
+// a CACHED rehydrated session must return 503 (retry-able), NOT 404. A 404 would
+// signal hard termination and cause the client to re-initialize. The cached
+// reconstruction is preserved so the next request (once Validate recovers) is
+// served normally. An unknown session (never cached) still gets 404.
+func TestRehydratedSession_TransientValidateError_Returns503(t *testing.T) {
+	t.Parallel()
+	mgr := &flakySessionManager{sharedSessionManager: *newSharedSessionManager()}
+
+	streamA := server.NewMCPServer("A", "1.0.0")
+	addGreetTool(streamA)
+	sA := server.NewStreamableHTTPServer(streamA, server.WithSessionIdManager(mgr))
+	tsA := httptest.NewServer(sA)
+	defer tsA.Close()
+
+	streamB := server.NewMCPServer("B", "1.0.0")
+	addGreetTool(streamB)
+	sB := server.NewStreamableHTTPServer(streamB, server.WithSessionIdManager(mgr))
+	tsB := httptest.NewServer(sB)
+	defer tsB.Close()
+
+	sid := initSession(t, tsA.URL)
+
+	// First request on B rehydrates and caches the session.
+	require.Contains(t, listToolNames(t, tsB.URL, sid), "greet",
+		"rehydrated session must be served before the flake")
+
+	// Make Validate return a transient (non-terminated) error once.
+	mgr.flake(fmt.Errorf("redis blip: connection refused"))
+
+	// The request must be rejected with 503, NOT 404, and the cached session
+	// must be preserved.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp := postRPC(ctx, t, tsB.URL, sid, `{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}`)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
+		"a transient Validate error on a cached rehydrated session must return 503, not 404")
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	// The session must still be cached: a subsequent request (Validate now
+	// succeeding) must be served normally, NOT rebuilt from scratch.
+	require.Contains(t, listToolNames(t, tsB.URL, sid), "greet",
+		"cached rehydrated session must survive a transient Validate error")
+}
+
 // TestRehydratedSessionElicitation proves a rehydrated session is a full,
 // stateful session (NOT stateless): a tool handler on the rehydrating replica
 // performs a server->client elicitation, and the client responds over the same

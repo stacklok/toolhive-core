@@ -73,7 +73,12 @@ type clientSession struct {
 	initialized atomic.Bool
 	registered  atomic.Bool
 	notifCh     chan mcp.JSONRPCNotification
-	goSession   atomic.Pointer[gosdk.ServerSession]
+	// notifClose guards against double-close of notifCh: sessionFor can re-create
+	// an entry for the same ID after forgetSession closed the channel, so a plain
+	// close would panic on the second forgetSession. The once ensures only the
+	// first forgetSession closes it.
+	notifClose sync.Once
+	goSession  atomic.Pointer[gosdk.ServerSession]
 
 	// owner and boundServer are set when the session's go-sdk server is bound
 	// (at registration). They let SetSessionTools/SetSessionResources reconcile
@@ -312,10 +317,16 @@ func (s *MCPServer) isLocalSession(id string) bool {
 
 // forgetSession drops all local bookkeeping for a session ID. It is called when
 // a session is terminated (DELETE) so a later request with the same ID is not
-// mistaken for a live local session.
+// mistaken for a live local session. It also closes the notification channel so
+// the drain goroutine started in newClientSession exits, preventing a goroutine
+// leak per closed session.
 func (s *MCPServer) forgetSession(id string) {
+	v, ok := s.sessions.LoadAndDelete(id)
 	s.localSessions.Delete(id)
-	s.sessions.Delete(id)
+	if ok {
+		cs := v.(*clientSession)
+		cs.notifClose.Do(func() { close(cs.notifCh) })
+	}
 }
 
 // bindRehydratedSession binds the clientSession for a session that was created

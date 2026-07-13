@@ -795,12 +795,16 @@ func normalizeObjectSchema(schema any) any {
 		// unset (it serializes as ""). An empty type string is the sentinel for
 		// "no schema declared"; normalize it to "object" so AddTool accepts the
 		// tool (matching mcp-go's leniency for tools with no declared input).
-		if t, ok := s[schemaTypeKey].(string); ok && t == "" {
-			// If the schema declares properties/required, this is an object
-			// schema whose type was simply omitted (spec-loose but common);
-			// normalize type to "object" preserving the other fields so the tool
-			// is callable under go-sdk. Otherwise (no properties/required) it's
-			// a truly empty-declared schema, normalized to the bare object.
+		// A missing type key with properties/required is a spec-loose but common
+		// object shape ({"properties":...}) that mcp-go served verbatim and
+		// callable; add type:"object" so go-sdk's AddTool accepts it. A missing
+		// type key WITHOUT properties/required (e.g. {$ref}, {oneOf}, {title})
+		// passes through verbatim — it is not a "no schema declared" sentinel.
+		// A non-string type value (e.g. ["object","null"]) also passes through.
+		t, hasType := s[schemaTypeKey]
+		typeStr, typeIsStr := t.(string)
+		if hasType && typeIsStr && typeStr == "" {
+			// Empty-string type: mcp-go's "no schema declared" sentinel.
 			if _, hasProps := s["properties"]; hasProps {
 				return withTypeObject(s)
 			}
@@ -809,11 +813,8 @@ func normalizeObjectSchema(schema any) any {
 			}
 			return map[string]any{schemaTypeKey: schemaTypeObject}
 		}
-		// No "type" key at all: if the schema declares properties or required,
-		// treat it as an object schema with type omitted (spec-loose but common)
-		// and add type:"object" so go-sdk's AddTool accepts it. This matches
-		// mcp-go, which served such schemas verbatim and callable.
-		if _, hasType := s[schemaTypeKey]; !hasType {
+		if !hasType {
+			// No type key: only normalize if it looks like an object schema.
 			if _, hasProps := s["properties"]; hasProps {
 				return withTypeObject(s)
 			}
