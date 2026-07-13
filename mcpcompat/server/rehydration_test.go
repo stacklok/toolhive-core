@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -322,6 +323,53 @@ func TestRehydratedSessionEvictedAfterTermination(t *testing.T) {
 	_ = resp.Body.Close()
 }
 
+// TestRehydratedSession_TransientValidateError_Returns503 verifies the fix for
+// the wave 4 review finding: a transient Validate error (e.g. a Redis blip) on
+// a CACHED rehydrated session must return 503 (retry-able), NOT 404. A 404 would
+// signal hard termination and cause the client to re-initialize. The cached
+// reconstruction is preserved so the next request (once Validate recovers) is
+// served normally. An unknown session (never cached) still gets 404.
+func TestRehydratedSession_TransientValidateError_Returns503(t *testing.T) {
+	t.Parallel()
+	mgr := &flakySessionManager{sharedSessionManager: *newSharedSessionManager()}
+
+	streamA := server.NewMCPServer("A", "1.0.0")
+	addGreetTool(streamA)
+	sA := server.NewStreamableHTTPServer(streamA, server.WithSessionIdManager(mgr))
+	tsA := httptest.NewServer(sA)
+	defer tsA.Close()
+
+	streamB := server.NewMCPServer("B", "1.0.0")
+	addGreetTool(streamB)
+	sB := server.NewStreamableHTTPServer(streamB, server.WithSessionIdManager(mgr))
+	tsB := httptest.NewServer(sB)
+	defer tsB.Close()
+
+	sid := initSession(t, tsA.URL)
+
+	// First request on B rehydrates and caches the session.
+	require.Contains(t, listToolNames(t, tsB.URL, sid), "greet",
+		"rehydrated session must be served before the flake")
+
+	// Make Validate return a transient (non-terminated) error once.
+	mgr.flake(fmt.Errorf("redis blip: connection refused"))
+
+	// The request must be rejected with 503, NOT 404, and the cached session
+	// must be preserved.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp := postRPC(ctx, t, tsB.URL, sid, `{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}`)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
+		"a transient Validate error on a cached rehydrated session must return 503, not 404")
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	// The session must still be cached: a subsequent request (Validate now
+	// succeeding) must be served normally, NOT rebuilt from scratch.
+	require.Contains(t, listToolNames(t, tsB.URL, sid), "greet",
+		"cached rehydrated session must survive a transient Validate error")
+}
+
 // TestRehydratedSessionElicitation proves a rehydrated session is a full,
 // stateful session (NOT stateless): a tool handler on the rehydrating replica
 // performs a server->client elicitation, and the client responds over the same
@@ -344,7 +392,7 @@ func TestRehydratedSessionElicitation(t *testing.T) {
 			res, err := srvB.RequestElicitation(ctx, mcp.ElicitationRequest{
 				Params: mcp.ElicitationParams{
 					Message:         "your name?",
-					RequestedSchema: map[string]any{"type": "object"},
+					RequestedSchema: map[string]any{schemaType: objectType},
 				},
 			})
 			if err != nil {
@@ -409,4 +457,138 @@ func TestRehydratedSessionElicitation(t *testing.T) {
 		}
 	}
 	assert.True(t, gotToolResult, "expected the elicited tool call to complete on the rehydrated session")
+}
+
+// TestLocalSession_ValidateEvictsWhenTerminatedInSharedStore verifies that a
+// LOCAL session (initialized on this instance) is validated against the shared
+// SessionIdManager on EVERY request (issue #156, item U5), so that a session
+// terminated in the shared store (e.g. via a DELETE on another replica, or a
+// direct manager.Terminate) is rejected here rather than served forever from
+// the local go-sdk handler. mcp-go validated every request; before the fix the
+// local fast-path trusted a local session indefinitely.
+//
+// Single server with a SessionIdManager: initialize locally, terminate the id
+// in the shared store, then issue a request with the same sid → must 404, not
+// 200.
+func TestLocalSession_ValidateEvictsWhenTerminatedInSharedStore(t *testing.T) {
+	t.Parallel()
+	mgr := newSharedSessionManager()
+
+	streamA := server.NewMCPServer("A", "1.0.0")
+	addGreetTool(streamA)
+	sA := server.NewStreamableHTTPServer(streamA, server.WithSessionIdManager(mgr))
+	tsA := httptest.NewServer(sA)
+	defer tsA.Close()
+
+	// Initialize locally on replica A — this marks the session local and hands
+	// its lifecycle to the go-sdk StreamableHTTPHandler.
+	sid := initSession(t, tsA.URL)
+	require.Contains(t, listToolNames(t, tsA.URL, sid), "greet",
+		"local session must be served before termination")
+
+	// Terminate the session in the shared store (as a DELETE on another replica
+	// would, or an explicit lifecycle operation). The local session is still
+	// cached in the go-sdk handler's map.
+	_, _ = mgr.Terminate(sid)
+
+	// The next request on A with the same sid must be rejected via per-request
+	// validation of the local session, not served from the cached local handler.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp := postRPC(ctx, t, tsA.URL, sid, `{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}`)
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode,
+		"local session terminated in the shared store must be rejected, not served")
+	_ = resp.Body.Close()
+}
+
+// TestLocalSession_ServedWithoutManager verifies the single-replica fast-path is
+// preserved: when NO SessionIdManager is configured, a local session is NOT
+// validated on every request (there is nothing to validate against), so a
+// request after the session exists is served normally (200, not 404). This
+// guards against the fix over-eagerly rejecting local sessions in single-replica
+// deployments.
+func TestLocalSession_ServedWithoutManager(t *testing.T) {
+	t.Parallel()
+
+	stream := server.NewMCPServer("solo", "1.0.0")
+	addGreetTool(stream)
+	// No WithSessionIdManager: single-replica, nothing to validate.
+	s := server.NewStreamableHTTPServer(stream)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	sid := initSession(t, ts.URL)
+	// A follow-up request must be served (200) from the local handler.
+	require.Contains(t, listToolNames(t, ts.URL, sid), "greet",
+		"local session must be served in single-replica mode without a manager")
+}
+
+// flakySessionManager is a sharedSessionManager whose Validate can be made to
+// return a transient (non-terminated) error on demand, simulating a Redis blip.
+type flakySessionManager struct {
+	sharedSessionManager
+	mu       sync.Mutex
+	flakeErr error // when non-nil, Validate returns (false, flakeErr)
+}
+
+func (m *flakySessionManager) Validate(sessionID string) (bool, error) {
+	m.mu.Lock()
+	err := m.flakeErr
+	m.flakeErr = nil // one-shot: a single flake, then recover
+	m.mu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	return m.sharedSessionManager.Validate(sessionID)
+}
+
+func (m *flakySessionManager) flake(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.flakeErr = err
+}
+
+// TestLocalSession_TransientValidateError_DoesNotForgetSession verifies the fix
+// for issue #156, finding 3: a transient Validate error (e.g. a Redis blip)
+// must NOT drop local session bookkeeping. If it did, the live go-sdk session
+// would remain in the handler's map while the local marker is gone, so the
+// client's retry would take the !isLocalSession branch and build a SECOND
+// go-sdk session with the same ID (split-brain). Instead the request is
+// rejected (503) and the local session stays local; once Validate succeeds
+// again the request is served normally through the SAME local go-sdk session.
+func TestLocalSession_TransientValidateError_DoesNotForgetSession(t *testing.T) {
+	t.Parallel()
+	mgr := &flakySessionManager{sharedSessionManager: *newSharedSessionManager()}
+
+	stream := server.NewMCPServer("flaky-A", "1.0.0")
+	addGreetTool(stream)
+	s := server.NewStreamableHTTPServer(stream, server.WithSessionIdManager(mgr))
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Initialize locally — this marks the session local and hands its lifecycle
+	// to the go-sdk StreamableHTTPHandler.
+	sid := initSession(t, ts.URL)
+	require.Contains(t, listToolNames(t, ts.URL, sid), "greet",
+		"local session must be served before the flake")
+
+	// Make Validate return a transient (non-terminated) error once.
+	mgr.flake(fmt.Errorf("redis blip: connection refused"))
+
+	// The request must be rejected (503), NOT 404, and NOT served.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp := postRPC(ctx, t, ts.URL, sid, `{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}`)
+	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode,
+		"a transient Validate error must reject with 503, not 404 (which would imply local state was dropped)")
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	// The session must STILL be local: a subsequent request (Validate now
+	// succeeding) must be served normally through the same local go-sdk session,
+	// NOT routed through rehydration. If local state had been dropped, this
+	// would either 404 (unknown to the shared store's rehydration path) or build
+	// a second session; being served proves the local marker survived.
+	require.Contains(t, listToolNames(t, ts.URL, sid), "greet",
+		"local session must survive a transient Validate error and be served once it recovers")
 }

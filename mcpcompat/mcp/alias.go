@@ -210,6 +210,38 @@ var UnmarshalContent = mcpgo.UnmarshalContent
 var NewMetaFromMap = mcpgo.NewMetaFromMap
 
 // ----------------------------------------------------------------------------
+// Logging
+// ----------------------------------------------------------------------------
+
+// LoggingLevel is the severity of a server log message, mirrored from mcp-go.
+//
+//nolint:revive // name intentionally matches mcp-go for drop-in compatibility.
+type LoggingLevel = mcpgo.LoggingLevel
+
+// SetLevelRequest is a request from the client to the server to set the logging
+// level. Re-exported from mcp-go for drop-in compatibility: downstream code
+// using the upstream idiom `c.SetLevel(ctx, mcp.SetLevelRequest{...})` compiles
+// against the shim unchanged. The shim's client.Client.SetLevel forwards to
+// SetLoggingLevel.
+type (
+	SetLevelRequest = mcpgo.SetLevelRequest
+	// SetLevelParams carries the level for a SetLevelRequest.
+	SetLevelParams = mcpgo.SetLevelParams
+)
+
+// MCP logging levels, mirrored from mcp-go.
+const (
+	LoggingLevelDebug     = mcpgo.LoggingLevelDebug
+	LoggingLevelInfo      = mcpgo.LoggingLevelInfo
+	LoggingLevelNotice    = mcpgo.LoggingLevelNotice
+	LoggingLevelWarning   = mcpgo.LoggingLevelWarning
+	LoggingLevelError     = mcpgo.LoggingLevelError
+	LoggingLevelCritical  = mcpgo.LoggingLevelCritical
+	LoggingLevelAlert     = mcpgo.LoggingLevelAlert
+	LoggingLevelEmergency = mcpgo.LoggingLevelEmergency
+)
+
+// ----------------------------------------------------------------------------
 // Tools
 // ----------------------------------------------------------------------------
 
@@ -239,6 +271,8 @@ type (
 	ListToolsRequest = mcpgo.ListToolsRequest
 	// ListToolsResult is the tool list response.
 	ListToolsResult = mcpgo.ListToolsResult
+	// Cursor is an opaque pagination token.
+	Cursor = mcpgo.Cursor
 )
 
 // Tool builders and result constructors.

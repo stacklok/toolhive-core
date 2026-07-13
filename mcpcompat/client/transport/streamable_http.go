@@ -112,6 +112,24 @@ func WithHTTPHeaderFunc(headerFunc HTTPHeaderFunc) StreamableHTTPCOption {
 }
 
 // WithSession sets an initial session ID (for resuming a session).
+//
+// LIMITATION (issue #156, item U2): a preset session ID is honored ONLY via
+// the resume path — i.e. when the client skips Initialize and issues requests
+// through Client's raw JSON-RPC resume machinery (see resume.go, exercised by
+// resume_test.go), which sends the preset ID as the Mcp-Session-Id header on
+// each POST. It is NOT honored by Initialize: Initialize always builds a fresh
+// go-sdk StreamableClientTransport (see Client.buildTransport) with no preset
+// session-ID field and performs a full initialize handshake, so the server
+// assigns (and the client adopts) a freshly-negotiated session ID that
+// overwrites the value set here.
+//
+// This cannot be fixed in the shim alone: go-sdk's StreamableClientTransport
+// has no SessionID/preset field in any version (verified through v1.6.1); the
+// session ID is solely server-assigned at initialize time. Callers that need to
+// pin a specific session ID must use the resume path (transport.WithSession +
+// direct method calls, no Initialize), not Initialize.
+// TODO(upstream): ask go-sdk to support a preset/client-requested session ID on
+// StreamableClientTransport, or a Connect option that supplies one.
 func WithSession(sessionID string) StreamableHTTPCOption {
 	return func(s *StreamableHTTP) { s.sessionID = sessionID }
 }

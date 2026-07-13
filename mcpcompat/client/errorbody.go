@@ -23,8 +23,9 @@ import (
 const maxCapturedErrBody = 8 << 10 // 8 KiB
 
 type errBody struct {
-	status int
-	body   string
+	status      int
+	body        string
+	wwwAuthHdrs []string // captured WWW-Authenticate header values (RFC 9728)
 }
 
 type errBodyKey struct{}
@@ -47,19 +48,46 @@ func capturedErr(ctx context.Context) *errBody {
 // captureErrorBody records a non-2xx response body into the context holder (if
 // present) and restores resp.Body so downstream readers are unaffected. Safe on
 // nil/2xx responses (no-op).
+//
+// The HTTP status code is recorded regardless of whether the body is non-empty
+// (issue #156, finding 4): a 4xx with an empty body — common for 401 and 404 —
+// still carries an authoritative status code, and the status-driven
+// classification in mapTransportError/mapConnectError relies on h.status being
+// set. Previously h.status was only set when the body was non-empty, so an
+// empty-body 4xx left h.status == 0 and classification fell to the
+// best-effort string fallback, which does not map bare "400 Bad Request"/"404
+// Not Found" on initialize to ErrLegacySSEServer.
 func captureErrorBody(req *http.Request, resp *http.Response) {
 	if resp == nil || resp.StatusCode < 400 || resp.Body == nil {
 		return
 	}
 	h := capturedErr(req.Context())
-	if h == nil || h.body != "" {
+	if h == nil {
+		return
+	}
+	// Record the status code unconditionally: it is available from the response
+	// regardless of body length, and the status-driven classification depends on
+	// it. Do this before reading the body so a read error cannot prevent it.
+	h.status = resp.StatusCode
+	// Capture WWW-Authenticate header values (RFC 9728 §5.1) so the error
+	// mappers can populate AuthorizationRequiredError.ResourceMetadataURL. The
+	// go-sdk does not surface this header on its errors; the shim's own
+	// RoundTripper is the only place it is available.
+	if vals := resp.Header.Values("WWW-Authenticate"); len(vals) > 0 {
+		h.wwwAuthHdrs = vals
+	}
+	// Only capture the body once (the first non-2xx response on this context).
+	if h.body != "" {
+		// Body already captured; still restore resp.Body for downstream readers.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		resp.Body = io.NopCloser(bytes.NewReader(nil))
 		return
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxCapturedErrBody))
 	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(data))
-	if err == nil && len(data) > 0 {
-		h.status = resp.StatusCode
+	if err == nil {
 		h.body = string(data)
 	}
 }

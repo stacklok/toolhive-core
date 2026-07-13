@@ -5,6 +5,7 @@ package server
 
 import (
 	"context"
+	crand "crypto/rand"
 	"fmt"
 	"mime"
 	"net/http"
@@ -59,7 +60,7 @@ type stdioConfig struct{}
 // ServeStdio runs the MCP server over stdio until the context is done. It
 // mirrors mcp-go's server.ServeStdio.
 func ServeStdio(server *MCPServer, _ ...StdioOption) error {
-	srv, err := server.buildServer(nil)
+	srv, err := server.buildServer(nil, 0)
 	if err != nil {
 		return err
 	}
@@ -83,6 +84,11 @@ type StreamableHTTPServer struct {
 	contextFunc  HTTPContextFunc
 	sessionIDMgr SessionIdManager
 	heartbeat    time.Duration
+	// disableLocalhostProtection turns off go-sdk's DNS-rebinding/localhost
+	// protection (which 403s requests on a loopback listener with a non-localhost
+	// Host header). mcp-go had no such protection; local proxies with custom Host
+	// headers need it disabled. See WithDisableLocalhostProtection.
+	disableLocalhostProtection bool
 
 	once     sync.Once
 	handler  http.Handler
@@ -130,24 +136,103 @@ func WithEndpointPath(endpointPath string) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.endpointPath = endpointPath }
 }
 
-// WithSessionIdManager supplies a session ID manager.
+// WithSessionIdManager supplies a session ID manager that drives cross-replica
+// session lifecycle.
 //
-// NOTE: the go-sdk manages MCP session IDs internally; the supplied manager is
-// retained for API compatibility but does not yet drive the SDK's ID lifecycle.
+// The manager IS wired into the SDK's session lifecycle:
+//   - Generate is installed as the go-sdk Server's GetSessionID (buildServer),
+//     so the SDK mints session IDs through it — this is where ToolHive's manager
+//     creates the placeholder session record that OnRegisterSession later
+//     promotes.
+//   - Validate is called on EVERY request carrying a session ID: for local
+//     sessions (initialized on this instance) it is validated per-request so a
+//     session terminated in the shared store (e.g. via a DELETE on another
+//     replica) is rejected here and its local bookkeeping dropped; for
+//     cross-replica sessions it drives lazy eviction on each request.
+//   - Terminate is forwarded the session ID on a DELETE so ToolHive's shared
+//     session storage is cleaned up in lockstep with the local session.
+//
+// The single-replica fast path (no manager) is preserved: there is nothing to
+// validate against, so local sessions route straight through to the go-sdk
+// handler.
 func WithSessionIdManager(manager SessionIdManager) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.sessionIDMgr = manager }
 }
 
-// WithHeartbeatInterval sets the keep-alive ping interval.
+// WithHeartbeatInterval sets the keep-alive ping interval. This option is
+// currently a NO-OP: it stores the interval but does NOT wire it to go-sdk's
+// ServerOptions.KeepAlive. go-sdk's KeepAlive sends an active ping REQUEST
+// (server→client) each interval and session.Close()s on failure; under
+// JSONResponse mode that ping routes to the standalone SSE stream, and a
+// JSON-only client (no GET stream, the shim client's own default) has that
+// stream unconnected → ping rejected → session closed on the first tick. That
+// would evict every healthy JSON-only client session at the interval. mcp-go's
+// heartbeat was passive (pings written only to an existing GET stream, never
+// awaited, never terminating).
+//
+// NOTE: the passive keep-alive is more load-bearing than "nice to have" now
+// that elicitation and all server→client notifications (list_changed,
+// progress, logging, resources/updated, elicitation/complete) structurally
+// depend on the client's idle standalone SSE stream staying open. Any
+// intermediary (LB, reverse proxy, ToolHive's own proxy) will reap that idle
+// stream on timeout — after which elicitation fails (ErrRejected) and
+// server-initiated notifications are silently dropped, with no reconnect. It
+// also feeds unbounded session growth (abandoned sessions are never reaped).
+//
+// TODO(issue #156): implement a passive keep-alive (SSE comment injection via
+// a ResponseWriter wrapper around the go-sdk handler) matching mcp-go's design
+// and wire this option to it. This should be prioritized before internet-facing
+// vMCP use; a max-session cap / idle sweep would also help. Until then the
+// value is stored but unused.
 func WithHeartbeatInterval(interval time.Duration) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.heartbeat = interval }
 }
 
+// WithDisableLocalhostProtection disables go-sdk's DNS-rebinding/localhost
+// protection on the Streamable HTTP transport. go-sdk by default rejects (403)
+// requests that arrive on a loopback listener but carry a non-localhost Host
+// header; mcp-go had no such protection, so local proxies that set a custom
+// Host header must disable it. Pass true to disable the protection (restoring
+// mcp-go's behavior); pass false (or omit) to leave go-sdk's default
+// (protected) in place.
+func WithDisableLocalhostProtection(disable bool) StreamableHTTPOption {
+	return func(s *StreamableHTTPServer) { s.disableLocalhostProtection = disable }
+}
+
 // WithHTTPContextFunc installs a per-request context customizer.
+//
+// Context values injected here are applied to ALL POSTs, including the
+// initialize request (previously the nonce bridge only bridged non-initialize
+// POSTs; the contextFunc itself now runs unconditionally on every request).
+// This is harmless/desired but observable: an initialize handler that reads a
+// context value populated by contextFunc will now see it.
 func WithHTTPContextFunc(fn HTTPContextFunc) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.contextFunc = fn }
 }
 
+// build constructs the go-sdk StreamableHTTPHandler. It is idempotent (once).
+//
+// Decision (issue #156, item U4): JSONResponse is ON by design and is NOT
+// configurable. mcp-go's server replied to POSTs with application/json, and
+// ToolHive callers json.Decode the response body, so the handler must keep
+// replying with application/json rather than text/event-stream.
+//
+// Consequence for elicitation (and any server->client request made during
+// request handling, e.g. sampling): under JSONResponse the go-sdk cannot
+// inline a server->client request on the POST response stream, so it routes
+// such messages to the standalone SSE stream (the "" stream) — see
+// streamable.go's streamableServerConn.Write: when c.jsonResponse is set and
+// the message is not a response, relatedRequest is reset to the empty id,
+// which selects c.streams[""]. If no standalone SSE stream exists (the client
+// never opened one), that stream is nil and the write is rejected
+// (ErrRejected: "write to closed stream"), so the server's Elicit call fails.
+//
+// The shim client defaults DisableStandaloneSSE to
+// !ContinuousListening(), i.e. the standalone SSE stream is OFF by default.
+// For elicitation to work the client MUST open the standalone SSE stream via
+// transport.WithContinuousListening() (and install an elicitation handler via
+// client.WithElicitationHandler). See TestElicitation_DefaultConfig for the
+// runtime verification of this contract.
 func (s *StreamableHTTPServer) build() {
 	s.once.Do(func() {
 		var gen func() string
@@ -155,19 +240,29 @@ func (s *StreamableHTTPServer) build() {
 			gen = s.sessionIDMgr.Generate
 		}
 		// Validate the server configuration once up-front so a bad registration
-		// surfaces as a clean 500 rather than a per-request nil.
-		if _, err := s.mcp.buildServer(gen); err != nil {
+		// surfaces as a clean 500 rather than a per-request nil. Pass 0 for
+		// keepalive: WithHeartbeatInterval is a documented no-op (see its doc).
+		if _, err := s.mcp.buildServer(gen, 0); err != nil {
 			s.buildErr = err
 			return
 		}
 		// JSONResponse makes the handler reply with application/json rather than
 		// text/event-stream for request/response exchanges, matching mcp-go's
 		// server so callers that json.Decode the response body keep working.
-		opts := &gosdk.StreamableHTTPOptions{JSONResponse: true}
+		opts := &gosdk.StreamableHTTPOptions{
+			JSONResponse: true,
+			// DisableLocalhostProtection propagates the option to go-sdk. It
+			// defaults to false (protection enabled, matching go-sdk's safe
+			// default); set it via WithDisableLocalhostProtection to turn the
+			// protection off, restoring mcp-go's acceptance of local proxies
+			// with custom Host headers.
+			DisableLocalhostProtection: s.disableLocalhostProtection,
+		}
 		// A fresh go-sdk server per client session lets each session carry its own
 		// tool/resource overlay (mcp-go's per-session projection), synced by the
-		// registration middleware buildServer installs.
-		s.handler = gosdk.NewStreamableHTTPHandler(s.mcp.getServerFunc(gen), opts)
+		// registration middleware buildServer installs. Keepalive is 0
+		// (WithHeartbeatInterval is a no-op; see its doc).
+		s.handler = gosdk.NewStreamableHTTPHandler(s.mcp.getServerFunc(gen, 0), opts)
 	})
 }
 
@@ -182,16 +277,34 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	if s.contextFunc != nil {
 		r = r.WithContext(s.contextFunc(r.Context(), r))
 	}
-	// Record the request context so the dispatch middleware can bridge its values
-	// into the handler running on go-sdk's detached session goroutine. Keyed by
-	// the client-supplied session ID; the initialize request (no session ID yet)
-	// carries no per-request values that the handler needs. This POST is handled
-	// synchronously (JSONResponse), so the entry is valid for the handler's whole
-	// lifetime and cleared when ServeHTTP returns.
-	if sid := r.Header.Get("Mcp-Session-Id"); sid != "" {
-		s.mcp.setPendingRequestContext(r.Context(), sid)
-		defer s.mcp.clearPendingRequestContext(sid)
-	}
+	// Bridge per-request context values into the handler. go-sdk does not
+	// propagate the per-POST request context into handlers for existing
+	// sessions (it handles messages on the session's connection goroutine using
+	// the initialize-time context), so values added by contextFunc (identity,
+	// audit BackendInfo, telemetry) would be lost. Store the request context
+	// keyed by a per-POST nonce and stamp the nonce as a header; the dispatch
+	// middleware reads it back via req.GetExtra().Header to bridge the values.
+	// Keying by nonce (not session ID) avoids the race where concurrent POSTs
+	// on the same session clobber each other's context (issue #156, item U3).
+	// The initialize POST (no session yet) carries no per-request values the
+	// handler needs; only non-initialize POSTs need bridging, but bridging
+	// initialize is harmless.
+	nonce := crand.Text()
+	s.mcp.setPendingRequestContext(r.Context(), nonce)
+	r.Header.Set(reqNonceHeader, nonce)
+	// KNOWN LIMITATION (issue #156, finding 6): this bridge covers request/
+	// response calls (tools/call, tools/list, initialize), which block in
+	// servePOST until the response is ready, so the deferred clear runs only
+	// AFTER the session goroutine has dispatched the message and read the nonce.
+	// It does NOT cover notification-only POSTs (e.g. notifications/initialized,
+	// notifications/cancel): those are acknowledged with an immediate 202 before
+	// the session goroutine dispatches the message, so the deferred clear can
+	// run before the dispatch middleware looks up the nonce → per-request
+	// context values are silently absent for notification handling. There is no
+	// cross-request bleed (the entry is keyed by a unique nonce), but the bridge
+	// is best-effort for notifications. A proper fix awaits go-sdk per-request
+	// context propagation (upstream ask).
+	defer s.mcp.clearPendingRequestContext(nonce)
 	// DELETE terminates the session. mcp-go answered 200 and drove the supplied
 	// SessionIdManager's Terminate; go-sdk answers 204 and manages its own session
 	// map. Rewrite the status to 200 for compatibility and forward the termination
@@ -218,6 +331,62 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Local-session validation (issue #156, item U5): a session initialized on
+	// THIS instance is trusted by the local go-sdk handler, but mcp-go validated
+	// every request. When a shared SessionIdManager is configured, validate local
+	// sessions on every request too, so a session terminated in the shared store
+	// (e.g. via a DELETE on another replica) is rejected here and its local
+	// bookkeeping dropped, rather than being served forever from the local
+	// handler. The single-replica fast-path (no manager) is preserved: there is
+	// nothing to validate against, so local sessions route straight through.
+	//
+	// Transient Validate errors (issue #156, finding 3): a Validate error that is
+	// NOT a genuine termination (e.g. a Redis blip) must NOT drop local state. If
+	// we called forgetSession here, the live go-sdk session would remain in the
+	// handler's map while the local marker is gone → the client's retry takes the
+	// !isLocalSession branch → serveRehydrated builds a SECOND go-sdk session with
+	// the same ID → split-brain (two live sessions, one ID, one pod; the standalone
+	// GET stream stays on the old one). So on a non-terminated Validate error we
+	// only reject THIS request (503, retry-able) and leave the local session
+	// intact; if the shared store recovers, the next Validate succeeds and the
+	// request is served normally. Only a genuine termination (isTerminated) drops
+	// local bookkeeping.
+	if sid := r.Header.Get("Mcp-Session-Id"); sid != "" && s.sessionIDMgr != nil && s.mcp.isLocalSession(sid) {
+		isTerminated, err := s.sessionIDMgr.Validate(sid)
+		if err != nil {
+			if isTerminated {
+				// Genuinely terminated: drop local bookkeeping so a later request
+				// with the same ID is not mistaken for a live local session.
+				s.mcp.forgetSession(sid)
+				s.deleteRehydrated(sid)
+				http.Error(w, "Session terminated", http.StatusNotFound)
+				return
+			}
+			// Transient error (e.g. shared-store blip): reject this request
+			// without dropping local state. The local go-sdk session stays
+			// alive; the client retries and, once Validate succeeds again, is
+			// served normally rather than routed through rehydration.
+			//
+			// Compat note: mcp-go returned 404 on ANY Validate error; the shim
+			// returns 503 on a non-terminated (transient) error and reserves
+			// 404 for genuine termination. 503 is NOT mapped by the client
+			// classifier (errors.Is(err, ErrSessionTerminated) is false), so a
+			// caller that keyed re-initialization off mcp-go's 404 →
+			// ErrSessionTerminated path won't re-init on a transient blip — it
+			// sees a generic retryable error. This is intentional (not dropping
+			// local state avoids the split-brain this PR guards against), but
+			// callers relying on that path should be aware of the divergence.
+			http.Error(w, "session validation unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if isTerminated {
+			s.mcp.forgetSession(sid)
+			s.deleteRehydrated(sid)
+			http.Error(w, "Session terminated", http.StatusNotFound)
+			return
+		}
+	}
+
 	s.handler.ServeHTTP(w, r)
 }
 
@@ -232,7 +401,23 @@ func (s *StreamableHTTPServer) serveRehydrated(w http.ResponseWriter, r *http.Re
 	// it and drop any locally-cached reconstruction rather than serving it.
 	isTerminated, err := s.sessionIDMgr.Validate(sid)
 	if err != nil {
-		s.deleteRehydrated(sid)
+		if isTerminated {
+			s.deleteRehydrated(sid)
+			http.Error(w, "Session terminated", http.StatusNotFound)
+			return
+		}
+		// Distinguish a transient store error from a genuinely unknown session.
+		// If we have a cached reconstruction, the session WAS valid — the error is
+		// likely transient (e.g. a Redis blip), so preserve the cache and return
+		// 503 (retry-able), matching the local-session path (issue #156, finding
+		// 3). A 404 here would signal hard termination and cause the client to
+		// re-initialize. If we have NO cached reconstruction, the session was
+		// never seen by this replica — the error is "not found", and 404 is the
+		// correct response (not a transient issue with a known session).
+		if s.getRehydrated(sid) != nil {
+			http.Error(w, "session validation unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "Invalid session ID", http.StatusNotFound)
 		return
 	}
@@ -284,6 +469,16 @@ func (s *StreamableHTTPServer) deleteRehydrated(sid string) {
 // requests and can perform server->client calls such as elicitation), binds the
 // clientSession so the before-hooks can reconcile the per-session overlay, and
 // caches it keyed by session ID.
+//
+// Scalability note: rehydrate holds rehydratedMu across buildServer + Connect.
+// buildServer copies the tool/resource/prompt maps under s.mu (quick), but
+// Connect can block on transport setup, so concurrent rehydrate calls for
+// DIFFERENT session IDs serialize on this lock. The double-check at the top
+// makes same-sid serialization correct/desired; the cross-sid serialization is
+// the incidental cost. Low impact in practice (cross-replica rehydration is
+// rare and the first request per sid is the only one that builds), so not worth
+// restructuring now — but if rehydration volume ever rises, building the session
+// outside the lock and only inserting under it would remove the serialization.
 func (s *StreamableHTTPServer) rehydrate(r *http.Request, sid string) (*rehydratedSession, error) {
 	s.rehydratedMu.Lock()
 	defer s.rehydratedMu.Unlock()
@@ -292,7 +487,7 @@ func (s *StreamableHTTPServer) rehydrate(r *http.Request, sid string) (*rehydrat
 		return rt, nil
 	}
 
-	srv, err := s.mcp.buildServer(nil)
+	srv, err := s.mcp.buildServer(nil, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -399,11 +594,11 @@ func WithMessageEndpoint(endpoint string) SSEOption {
 
 func (s *SSEServer) build() {
 	s.once.Do(func() {
-		if _, err := s.mcp.buildServer(nil); err != nil {
+		if _, err := s.mcp.buildServer(nil, 0); err != nil {
 			s.buildErr = err
 			return
 		}
-		s.handler = gosdk.NewSSEHandler(s.mcp.getServerFunc(nil), nil)
+		s.handler = gosdk.NewSSEHandler(s.mcp.getServerFunc(nil, 0), nil)
 	})
 }
 

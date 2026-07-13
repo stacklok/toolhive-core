@@ -51,12 +51,87 @@ type Client struct {
 	// resumes a pre-existing session (transport.WithSession) without calling
 	// Initialize. It is lazily created on the first resumed request. See resume.go.
 	resume *resumeState
+
+	// elicitationHandler, when set, is wired into the go-sdk ClientOptions so
+	// the client declares the elicitation capability at initialize and answers
+	// server->client elicitation/create requests. It mirrors mcp-go's
+	// client.WithElicitationHandler.
+	elicitationHandler ElicitationHandler
+}
+
+// ElicitationHandler handles server->client elicitation/create requests. It
+// mirrors mcp-go's client.ElicitationHandler.
+type ElicitationHandler interface {
+	Elicit(ctx context.Context, request mcp.ElicitationRequest) (*mcp.ElicitationResult, error)
+}
+
+// ElicitationHandlerFunc is an adapter to allow the use of ordinary functions
+// as elicitation handlers. It is a shim convenience adapter not present in
+// mcp-go (mcp-go's client.WithElicitationHandler accepts a plain func), kept
+// here so the shim's ElicitationHandler interface and the func form compose.
+type ElicitationHandlerFunc func(ctx context.Context, request mcp.ElicitationRequest) (*mcp.ElicitationResult, error)
+
+// Elicit calls f(ctx, request).
+func (f ElicitationHandlerFunc) Elicit(ctx context.Context, request mcp.ElicitationRequest) (*mcp.ElicitationResult, error) {
+	return f(ctx, request)
+}
+
+// ClientOption configures a Client. It is applied at construction time via
+// NewStreamableHttpClientWithOpts (the only constructor that accepts
+// ClientOptions); NewStreamableHttpClient and NewSSEMCPClient take only
+// transport-level options.
+//
+//nolint:revive // name intentionally matches mcp-go for drop-in compatibility.
+type ClientOption func(*Client)
+
+// WithElicitationHandler installs a handler for server->client
+// elicitation/create requests. The handler must be registered before Initialize
+// so it is wired into the underlying go-sdk client, which (a) declares the
+// elicitation capability at initialize time so the server's Elicit calls pass
+// the go-sdk capability gate, and (b) dispatches incoming elicitation/create
+// requests to the handler.
+//
+// Elicitation under the Streamable HTTP transport requires the client to hold
+// an open standalone SSE stream: the shim server replies with application/json
+// (JSONResponse is on by design), so the go-sdk routes a server->client
+// elicitation request made during request handling to the standalone SSE
+// stream rather than the POST response. Configure the client with
+// transport.WithContinuousListening() to open that stream; without it
+// (DisableStandaloneSSE defaults to true) elicitation cannot be delivered and
+// the server's Elicit call is rejected. See the build() doc comment in
+// mcpcompat/server/transports.go.
+//
+// It mirrors mcp-go's client.WithElicitationHandler.
+func WithElicitationHandler(h ElicitationHandler) ClientOption {
+	return func(c *Client) { c.elicitationHandler = h }
+}
+
+// applyClientOptions applies the client-level options to c.
+func applyClientOptions(c *Client, opts []ClientOption) {
+	for _, opt := range opts {
+		opt(c)
+	}
 }
 
 // NewStreamableHttpClient creates a Streamable HTTP MCP client for baseURL. Like
 // mcp-go, the returned client is not yet connected; call Start then Initialize.
+// Transport options configure the underlying Streamable HTTP transport; client
+// options (client.WithElicitationHandler, ...) configure client-level behavior.
 func NewStreamableHttpClient(baseURL string, options ...transport.StreamableHTTPCOption) (*Client, error) {
 	return &Client{streamable: transport.NewStreamableHTTP(baseURL, options...)}, nil
+}
+
+// NewStreamableHttpClientWithOpts creates a Streamable HTTP MCP client for
+// baseURL, applying transport-level options followed by client-level options.
+// It is the entry point for options that are not transport options (e.g.
+// WithElicitationHandler); NewStreamableHttpClient remains for callers that
+// only need transport options.
+func NewStreamableHttpClientWithOpts(
+	baseURL string, transportOpts []transport.StreamableHTTPCOption, clientOpts []ClientOption,
+) (*Client, error) {
+	c := &Client{streamable: transport.NewStreamableHTTP(baseURL, transportOpts...)}
+	applyClientOptions(c, clientOpts)
+	return c, nil
 }
 
 // NewSSEMCPClient creates an SSE MCP client for baseURL. The returned client is
@@ -72,6 +147,16 @@ func (*Client) Start(_ context.Context) error { return nil }
 
 // Initialize connects the underlying go-sdk client and performs the MCP
 // initialize handshake using the supplied client info and capabilities.
+//
+// LIMITATION (issue #156, item U2): if a preset session ID was supplied via
+// transport.WithSession, Initialize does NOT honor it. Initialize always
+// negotiates a fresh, server-assigned session ID: it builds a go-sdk
+// StreamableClientTransport (buildTransport) which has no preset session-ID
+// field (go-sdk has no such field in any version, verified through v1.6.1),
+// performs the initialize handshake, and then adopts the ID the server returns
+// (overwriting any value set via WithSession). To resume a pre-existing session
+// by ID, skip Initialize and use the resume path instead (see resume.go). The
+// resume path is exercised by resume_test.go.
 func (c *Client) Initialize(ctx context.Context, request mcp.InitializeRequest) (*mcp.InitializeResult, error) {
 	ctx = withErrCapture(ctx)
 	c.mu.Lock()
@@ -101,6 +186,7 @@ func (c *Client) Initialize(ctx context.Context, request mcp.InitializeRequest) 
 		opts.Capabilities = caps
 	}
 	c.installNotificationHandlers(opts)
+	c.installElicitationHandler(opts)
 
 	gc := gosdk.NewClient(impl, opts)
 
@@ -171,6 +257,32 @@ func (c *Client) Ping(ctx context.Context) error {
 		return err
 	}
 	return s.Ping(ctx, nil)
+}
+
+// SetLoggingLevel sets the server's logging level. This is a renamed and
+// simplified counterpart to mcp-go's client.Client.SetLevel: rather than
+// taking an mcp.SetLevelRequest, it accepts the mcp.LoggingLevel directly.
+// The server only delivers notifications/message notifications at or above the
+// requested level, so this must be called before the OnNotification handler
+// will see logging notifications. level is one of the MCP logging levels
+// ("debug", "info", "notice", "warning", "error", "critical", "alert",
+// "emergency").
+func (c *Client) SetLoggingLevel(ctx context.Context, level mcp.LoggingLevel) error {
+	s, err := c.sessionFor()
+	if err != nil {
+		return err
+	}
+	return s.SetLoggingLevel(ctx, &gosdk.SetLoggingLevelParams{Level: gosdk.LoggingLevel(level)})
+}
+
+// SetLevel is a drop-in compatibility alias for mcp-go's
+// client.Client.SetLevel, forwarding to SetLoggingLevel. It is provided so
+// downstream code using the upstream idiom
+// `c.SetLevel(ctx, mcp.SetLevelRequest{...})` compiles against the shim
+// unchanged. SetLevelRequest and SetLevelParams are re-exported from the mcp
+// package for the same reason.
+func (c *Client) SetLevel(ctx context.Context, request mcp.SetLevelRequest) error {
+	return c.SetLoggingLevel(ctx, request.Params.Level)
 }
 
 // ListTools lists the server's tools.
@@ -395,34 +507,182 @@ func (c *Client) ListResourceTemplates(
 // Handlers must be registered before Initialize so they can be wired into the
 // underlying go-sdk client. The go-sdk exposes typed notification handlers
 // rather than a single catch-all, so this shim synthesizes JSONRPCNotification
-// values for the list-changed, progress and logging notifications.
+// values (method + params) for each notification type and forwards each to
+// every registered handler. The following notification types are forwarded:
+//   - notifications/tools/list_changed
+//   - notifications/prompts/list_changed
+//   - notifications/resources/list_changed
+//   - notifications/resources/updated (from resources/subscribe)
+//   - notifications/elicitation/complete (out-of-band elicitation completion)
+//   - notifications/progress (server->client progress)
+//   - notifications/message (server->client logging)
+//
+// Server-initiated notifications (including the list_changed notifications,
+// which the server emits outside any in-flight request) are only delivered if
+// the client enabled continuous listening via
+// transport.WithContinuousListening(). Without it the go-sdk streamable
+// transport has no standalone SSE stream to carry such notifications and they
+// are silently dropped; no callback fires.
 func (c *Client) OnNotification(handler func(notification mcp.JSONRPCNotification)) {
 	c.notifyMu.Lock()
 	defer c.notifyMu.Unlock()
 	c.notify = append(c.notify, handler)
 }
 
-func (c *Client) dispatch(method string) {
+// dispatch fans a synthesized JSONRPCNotification out to every registered
+// OnNotification handler. params is converted into mcp-go's
+// JSONRPCNotificationParams (Meta + AdditionalFields) when non-nil, so the
+// notification carries its params as mcp-go would; nil leaves the params empty
+// (used by the list_changed notifications, which carry no params on the wire).
+func (c *Client) dispatch(method string, params any) {
 	c.notifyMu.Lock()
 	handlers := make([]func(mcp.JSONRPCNotification), len(c.notify))
 	copy(handlers, c.notify)
 	c.notifyMu.Unlock()
 	n := mcp.JSONRPCNotification{JSONRPC: mcp.JSONRPC_VERSION}
 	n.Method = method
+	if params != nil {
+		n.Params = toNotificationParams(params)
+	}
 	for _, h := range handlers {
 		h(n)
 	}
 }
 
+// toNotificationParams converts a go-sdk notification params value into the
+// mcp-go NotificationParams shape (Meta + AdditionalFields). Both encode to the
+// same MCP wire JSON, so a JSON round-trip faithfully maps the go-sdk struct's
+// fields onto mcp-go's AdditionalFields map. This mirrors the jsonConvert
+// convention used elsewhere in the shim for cross-type conversion.
+func toNotificationParams(src any) mcp.NotificationParams {
+	// Marshal the go-sdk params and unmarshal into a generic map, then split the
+	// reserved "_meta" key (if present) from the remaining fields, which become
+	// AdditionalFields.
+	b, err := json.Marshal(src)
+	if err != nil {
+		return mcp.NotificationParams{}
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		return mcp.NotificationParams{}
+	}
+	out := mcp.NotificationParams{AdditionalFields: make(map[string]any, len(m))}
+	for k, v := range m {
+		if k == "_meta" {
+			if mm, ok := v.(map[string]any); ok {
+				out.Meta = mm
+			}
+			continue
+		}
+		out.AdditionalFields[k] = v
+	}
+	return out
+}
+
 func (c *Client) installNotificationHandlers(opts *gosdk.ClientOptions) {
 	opts.ToolListChangedHandler = func(_ context.Context, _ *gosdk.ToolListChangedRequest) {
-		c.dispatch("notifications/tools/list_changed")
+		c.dispatch("notifications/tools/list_changed", nil)
 	}
 	opts.PromptListChangedHandler = func(_ context.Context, _ *gosdk.PromptListChangedRequest) {
-		c.dispatch("notifications/prompts/list_changed")
+		c.dispatch("notifications/prompts/list_changed", nil)
 	}
 	opts.ResourceListChangedHandler = func(_ context.Context, _ *gosdk.ResourceListChangedRequest) {
-		c.dispatch("notifications/resources/list_changed")
+		c.dispatch("notifications/resources/list_changed", nil)
+	}
+	// Forward server->client resource-updated notifications (the result of a
+	// resources/subscribe). go-sdk hands the params via
+	// *ResourceUpdatedNotificationRequest; dispatch synthesizes the
+	// notifications/resources/updated notification with its params (uri).
+	opts.ResourceUpdatedHandler = func(_ context.Context, req *gosdk.ResourceUpdatedNotificationRequest) {
+		c.dispatch("notifications/resources/updated", req.Params)
+	}
+	// Forward server->client elicitation-complete notifications (out-of-band
+	// elicitation completion). go-sdk hands the params via
+	// *ElicitationCompleteNotificationRequest; dispatch synthesizes the
+	// notifications/elicitation/complete notification with its params
+	// (elicitationId).
+	opts.ElicitationCompleteHandler = func(_ context.Context, req *gosdk.ElicitationCompleteNotificationRequest) {
+		c.dispatch("notifications/elicitation/complete", req.Params)
+	}
+	// Forward server->client progress notifications. go-sdk hands the params via
+	// *ProgressNotificationClientRequest; convert them to mcp-go's notification
+	// params (progressToken, progress, total, message) and dispatch.
+	opts.ProgressNotificationHandler = newProgressNotificationHandler(c.dispatch)
+	// Forward server->client logging notifications. go-sdk hands the params via
+	// *LoggingMessageRequest; convert them to mcp-go's notification params
+	// (level, data, logger) and dispatch.
+	opts.LoggingMessageHandler = newLoggingMessageHandler(c.dispatch)
+}
+
+// installElicitationHandler wires the user-supplied ElicitationHandler (set via
+// WithElicitationHandler) onto the go-sdk ClientOptions. The go-sdk
+// auto-declares the elicitation capability when ElicitationHandler is non-nil
+// (see Client.capabilities), so the server's Elicit calls pass the capability
+// gate; incoming elicitation/create requests are dispatched to the handler.
+//
+// The go-sdk handler receives a *gosdk.ElicitRequest and must return a
+// *gosdk.ElicitResult. The shim converts between the go-sdk and mcp-go-shaped
+// elicitation types via JSON round-trips (both encode the identical MCP wire
+// format), so a handler registered against the mcp-go ElicitationRequest/
+// ElicitationResult types works unchanged. The go-sdk validates an accepted
+// result against the requested schema itself (in (*Client).elicit), so the
+// shim does not re-validate here.
+func (c *Client) installElicitationHandler(opts *gosdk.ClientOptions) {
+	if c.elicitationHandler == nil {
+		return
+	}
+	opts.ElicitationHandler = func(ctx context.Context, req *gosdk.ElicitRequest) (*gosdk.ElicitResult, error) {
+		mreq := mcp.ElicitationRequest{}
+		if req != nil {
+			// Reconstruct the mcp-go-shaped request from the go-sdk params. The
+			// go-sdk ElicitRequest embeds its Params; a JSON round-trip maps them
+			// onto mcp-go's ElicitationParams (mode, message, requestedSchema, url,
+			// elicitationId, _meta).
+			if err := jsonConvert(req.Params, &mreq.Params); err != nil {
+				return nil, fmt.Errorf("converting elicitation request: %w", err)
+			}
+		}
+		res, err := c.elicitationHandler.Elicit(ctx, mreq)
+		if err != nil {
+			return nil, err
+		}
+		out := &gosdk.ElicitResult{}
+		if err := jsonConvert(res, out); err != nil {
+			return nil, fmt.Errorf("converting elicitation result: %w", err)
+		}
+		return out, nil
+	}
+}
+
+// dispatchFunc is the signature of Client.dispatch, factored out so the
+// notification handlers can be unit-tested in isolation without a live session.
+type dispatchFunc func(method string, params any)
+
+// newProgressNotificationHandler builds the go-sdk progress-notification
+// handler that forwards notifications/progress to the supplied dispatch func.
+// If the go-sdk request or its params are nil, dispatch is called with nil
+// params (an empty NotificationParams) rather than panicking.
+func newProgressNotificationHandler(dispatch dispatchFunc) func(context.Context, *gosdk.ProgressNotificationClientRequest) {
+	return func(_ context.Context, req *gosdk.ProgressNotificationClientRequest) {
+		if req == nil || req.Params == nil {
+			dispatch("notifications/progress", nil)
+			return
+		}
+		dispatch("notifications/progress", req.Params)
+	}
+}
+
+// newLoggingMessageHandler builds the go-sdk logging-notification handler that
+// forwards notifications/message to the supplied dispatch func. If the go-sdk
+// request or its params are nil, dispatch is called with nil params rather than
+// panicking.
+func newLoggingMessageHandler(dispatch dispatchFunc) func(context.Context, *gosdk.LoggingMessageRequest) {
+	return func(_ context.Context, req *gosdk.LoggingMessageRequest) {
+		if req == nil || req.Params == nil {
+			dispatch("notifications/message", nil)
+			return
+		}
+		dispatch("notifications/message", req.Params)
 	}
 }
 

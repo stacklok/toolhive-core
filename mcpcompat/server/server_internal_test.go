@@ -5,6 +5,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -16,9 +17,10 @@ import (
 // Compile-time interface checks: the concrete session must satisfy the
 // per-session interfaces ToolHive relies on.
 var (
-	_ ClientSession        = (*clientSession)(nil)
-	_ SessionWithTools     = (*clientSession)(nil)
-	_ SessionWithResources = (*clientSession)(nil)
+	_ ClientSession          = (*clientSession)(nil)
+	_ SessionWithTools       = (*clientSession)(nil)
+	_ SessionWithResources   = (*clientSession)(nil)
+	_ SessionWithElicitation = (*clientSession)(nil)
 )
 
 func TestClientSession_Store(t *testing.T) {
@@ -45,6 +47,94 @@ func TestClientSession_Store(t *testing.T) {
 		"file:///r": {Resource: mcp.Resource{URI: "file:///r"}},
 	})
 	assert.Contains(t, cs.GetSessionResources(), "file:///r")
+}
+
+// TestForgetSession_ClosesNotifChannel verifies that forgetSession closes the
+// notification channel, allowing the drain goroutine started in newClientSession
+// to exit rather than leaking for the process lifetime. Also verifies it is safe
+// to call forgetSession multiple times for the same ID (sync.Once guards the
+// close) and that a re-created session for the same ID gets a fresh channel.
+func TestForgetSession_ClosesNotifChannel(t *testing.T) {
+	t.Parallel()
+	s := NewMCPServer("s", "1")
+
+	cs := s.sessionFor("sess-drain")
+	ch := cs.notifCh
+
+	// Send a notification to prove the channel is open before forget.
+	cs.NotificationChannel() <- mcp.JSONRPCNotification{Notification: mcp.Notification{Method: "test"}}
+
+	// forgetSession must close the channel.
+	s.forgetSession("sess-drain")
+
+	// A send to a closed channel must panic (proving it's closed).
+	assert.Panics(t, func() {
+		ch <- mcp.JSONRPCNotification{}
+	})
+
+	// Calling forgetSession again for the same ID must not panic (sync.Once
+	// guards the double-close). The entry was already deleted, so this is a
+	// no-op.
+	assert.NotPanics(t, func() { s.forgetSession("sess-drain") })
+
+	// A new sessionFor for the same ID creates a fresh, open channel — the old
+	// closed channel is not reused.
+	cs2 := s.sessionFor("sess-drain")
+	require.NotNil(t, cs2.notifCh)
+	assert.NotEqual(t, ch, cs2.notifCh, "a re-created session must get a fresh channel")
+	// The fresh channel must be usable.
+	cs2.NotificationChannel() <- mcp.JSONRPCNotification{Notification: mcp.Notification{Method: "test2"}}
+	s.forgetSession("sess-drain")
+}
+
+// TestSetSessionTools_NonObjectSchemaDoesNotPanic verifies that a per-session
+// overlay tool whose RawInputSchema is a non-object schema ($ref) does NOT crash
+// the session when synced onto the go-sdk server. go-sdk v1.6.1 AddTool panics
+// unless the input schema's top-level type is "object"; normalizeObjectSchema
+// passes non-object schemas through verbatim (to mirror mcp-go), so the panic
+// must be recovered by MCPServer.addSessionTool and the offending tool skipped
+// while other tools in the same overlay still register. Without the recover in
+// syncSessionTools, this test panics mid-call.
+func TestSetSessionTools_NonObjectSchemaDoesNotPanic(t *testing.T) {
+	t.Parallel()
+	s := NewMCPServer("s", "1")
+	srv, err := s.buildServer(nil, 0)
+	require.NoError(t, err)
+
+	cs := s.sessionFor("sid-bad-schema")
+	cs.SetSessionTools(map[string]ServerTool{
+		// A non-object schema (a $ref). normalizeObjectSchema returns this
+		// verbatim; go-sdk AddTool panics on it. addSessionTool must recover.
+		"bad-schema": {
+			Tool: mcp.Tool{
+				Name:           "bad-schema",
+				RawInputSchema: json.RawMessage(`{"$ref":"#"}`),
+			},
+			Handler: func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) { return nil, nil },
+		},
+		// A well-formed object-schema tool in the same overlay. It must still
+		// register despite the sibling's bad schema.
+		"good-schema": {
+			Tool: mcp.NewTool("good-schema", mcp.WithDescription("ok")),
+			Handler: func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				return mcp.NewToolResultText("ok"), nil
+			},
+		},
+	})
+
+	// Must not panic (go-sdk AddTool would panic on the $ref schema without
+	// the recover in addSessionTool).
+	assert.NotPanics(t, func() { s.syncSessionTools(srv, cs) })
+
+	// The offending tool is skipped; the well-formed sibling is registered.
+	cs.mu.RLock()
+	registered := make(map[string]struct{}, len(cs.sdkToolNames))
+	for n := range cs.sdkToolNames {
+		registered[n] = struct{}{}
+	}
+	cs.mu.RUnlock()
+	assert.NotContains(t, registered, "bad-schema", "the non-object-schema tool must be skipped, not registered")
+	assert.Contains(t, registered, "good-schema", "the well-formed sibling tool must still register")
 }
 
 func TestHooks_Fire(t *testing.T) {
@@ -82,7 +172,7 @@ func TestBuildServer_GlobalAndSessionTools(t *testing.T) {
 	// Building the global server (with the globally-registered tool) must succeed.
 	// Per-session overlays are no longer baked in here; they are synced onto the
 	// per-session server by syncSessionTools once the session registers.
-	srv, err := s.buildServer(nil)
+	srv, err := s.buildServer(nil, 0)
 	require.NoError(t, err)
 	require.NotNil(t, srv)
 
@@ -105,7 +195,7 @@ func TestBuildServer_WithSessionIDGenerator(t *testing.T) {
 	called := false
 	gen := func() string { called = true; return "generated-id" }
 
-	srv, err := s.buildServer(gen)
+	srv, err := s.buildServer(gen, 0)
 	require.NoError(t, err)
 	require.NotNil(t, srv)
 	// The generator is installed on the server (invoked by the SDK per new
@@ -126,3 +216,131 @@ func (fakeIDManager) Validate(string) (bool, error)  { return false, nil }
 func (fakeIDManager) Terminate(string) (bool, error) { return false, nil }
 
 var _ SessionIdManager = fakeIDManager{}
+
+// TestNormalizeObjectSchema verifies the normalization rules in
+// normalizeObjectSchema: nil/empty/empty-type schemas become {"type":"object"};
+// a type-omitted (or empty-type) schema that carries "properties" or
+// "required" is treated as a spec-loose object schema and gets type:"object"
+// added (preserving the other fields), so it is callable under go-sdk (matching
+// mcp-go's verbatim, callable behavior). Truly non-object schemas ($ref, oneOf,
+// boolean, type:["object","null"], a map with no type and no
+// properties/required) pass through verbatim; go-sdk's AddTool will panic on
+// the non-callable ones, recovered by addGlobalTool/addSessionTool.
+//
+//nolint:goconst // test fixtures legitimately repeat schema keys
+func TestNormalizeObjectSchema(t *testing.T) {
+	t.Parallel()
+	emptyObject := map[string]any{schemaTypeKey: schemaTypeObject}
+
+	tests := []struct {
+		name  string
+		input any
+		want  any
+	}{
+		{
+			name:  "nil",
+			input: nil,
+			want:  emptyObject,
+		},
+		{
+			name:  "empty map",
+			input: map[string]any{},
+			want:  emptyObject,
+		},
+		{
+			name:  "type is the empty string (mcp-go wire sentinel)",
+			input: map[string]any{schemaTypeKey: ""},
+			want:  emptyObject,
+		},
+		{
+			name:  "type empty with properties (mcp-go wire sentinel)",
+			input: map[string]any{schemaTypeKey: "", "properties": map[string]any{}},
+			want: map[string]any{
+				schemaTypeKey: schemaTypeObject,
+				"properties":  map[string]any{},
+			},
+		},
+		{
+			name:  "empty string",
+			input: "",
+			want:  emptyObject,
+		},
+		{
+			name: "object schema with type object",
+			input: map[string]any{
+				schemaTypeKey: schemaTypeObject,
+				"properties": map[string]any{
+					"name": map[string]any{schemaTypeKey: "string"},
+				},
+			},
+			want: map[string]any{
+				schemaTypeKey: schemaTypeObject,
+				"properties": map[string]any{
+					"name": map[string]any{schemaTypeKey: "string"},
+				},
+			},
+		},
+		{
+			name: "object schema with type omitted gets type object",
+			input: map[string]any{
+				"properties": map[string]any{
+					"name": map[string]any{schemaTypeKey: "string"},
+				},
+			},
+			want: map[string]any{
+				schemaTypeKey: schemaTypeObject,
+				"properties": map[string]any{
+					"name": map[string]any{schemaTypeKey: "string"},
+				},
+			},
+		},
+		{
+			name: "object schema with type omitted and required gets type object",
+			input: map[string]any{
+				"required": []any{"name"},
+			},
+			want: map[string]any{
+				schemaTypeKey: schemaTypeObject,
+				"required":    []any{"name"},
+			},
+		},
+		{
+			name:  "type omitted with no properties/required passes through",
+			input: map[string]any{"title": "t"},
+			want:  map[string]any{"title": "t"},
+		},
+		{
+			name:  "type object null array passes through verbatim",
+			input: map[string]any{schemaTypeKey: []any{schemaTypeObject, "null"}},
+			want:  map[string]any{schemaTypeKey: []any{schemaTypeObject, "null"}},
+		},
+		{
+			name:  "$ref schema",
+			input: map[string]any{"$ref": "#"},
+			want:  map[string]any{"$ref": "#"},
+		},
+		{
+			name:  "oneOf schema",
+			input: map[string]any{"oneOf": []any{map[string]any{schemaTypeKey: "string"}, map[string]any{schemaTypeKey: "number"}}},
+			want:  map[string]any{"oneOf": []any{map[string]any{schemaTypeKey: "string"}, map[string]any{schemaTypeKey: "number"}}},
+		},
+		{
+			name:  "boolean true schema",
+			input: true,
+			want:  true,
+		},
+		{
+			name:  "boolean false schema",
+			input: false,
+			want:  false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := normalizeObjectSchema(tc.input)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}

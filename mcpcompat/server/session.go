@@ -29,11 +29,13 @@ type ClientSession interface {
 // SessionWithTools is a ClientSession that carries per-session tools. ToolHive's
 // vMCP layer uses this to project a per-session tool set.
 //
-// NOTE: overlays set here are stored and merged when a go-sdk server is built
-// for the session (see MCPServer.buildServer). Making per-session tool changes
-// take effect on an already-connected go-sdk session at runtime (live
-// list_changed dispatch) is the integration point that needs validation against
-// ToolHive's vMCP flow before this shim can fully replace mcp-go there.
+// Overlays set here are stored and reconciled onto the session's live go-sdk
+// server (syncSessionTools) once a server is bound to the session (at
+// registration, or immediately if already bound): added tools are registered
+// via srv.AddTool and removed tools via srv.RemoveTools, which also drives
+// go-sdk's automatic notifications/tools/list_changed emission when
+// WithToolCapabilities(true) is set. So per-session tool changes take effect
+// on an already-connected session at runtime.
 type SessionWithTools interface {
 	ClientSession
 	// GetSessionTools returns the session's tools. Thread-safe.
@@ -71,12 +73,23 @@ type clientSession struct {
 	initialized atomic.Bool
 	registered  atomic.Bool
 	notifCh     chan mcp.JSONRPCNotification
-	goSession   atomic.Pointer[gosdk.ServerSession]
+	// notifClose guards against double-close of notifCh: sessionFor can re-create
+	// an entry for the same ID after forgetSession closed the channel, so a plain
+	// close would panic on the second forgetSession. The once ensures only the
+	// first forgetSession closes it.
+	notifClose sync.Once
+	goSession  atomic.Pointer[gosdk.ServerSession]
 
 	// owner and boundServer are set when the session's go-sdk server is bound
 	// (at registration). They let SetSessionTools/SetSessionResources reconcile
 	// the per-session overlay onto the live go-sdk server at runtime.
-	owner       *MCPServer
+	//
+	// owner is an atomic.Pointer (not a plain field) because SetSessionTools/
+	// SetSessionResources may run from any goroutine (test code, before-hooks on
+	// a live request) concurrently with registerAndSync/bindRehydratedSession,
+	// which set owner on the session's connection goroutine. boundServer uses the
+	// same atomic pattern for the same reason.
+	owner       atomic.Pointer[MCPServer]
 	boundServer atomic.Pointer[gosdk.Server]
 
 	mu        sync.RWMutex
@@ -127,8 +140,10 @@ func (c *clientSession) SetSessionTools(tools map[string]ServerTool) {
 	}
 	c.mu.Unlock()
 	// Reconcile the overlay onto the live go-sdk server if one is bound.
-	if srv := c.boundServer.Load(); srv != nil && c.owner != nil {
-		c.owner.syncSessionTools(srv, c)
+	if srv := c.boundServer.Load(); srv != nil {
+		if owner := c.owner.Load(); owner != nil {
+			owner.syncSessionTools(srv, c)
+		}
 	}
 }
 
@@ -149,8 +164,10 @@ func (c *clientSession) SetSessionResources(resources map[string]ServerResource)
 		c.resources[k] = v
 	}
 	c.mu.Unlock()
-	if srv := c.boundServer.Load(); srv != nil && c.owner != nil {
-		c.owner.syncSessionResources(srv, c)
+	if srv := c.boundServer.Load(); srv != nil {
+		if owner := c.owner.Load(); owner != nil {
+			owner.syncSessionResources(srv, c)
+		}
 	}
 }
 
@@ -190,7 +207,7 @@ func (s *MCPServer) registerAndSync(ctx context.Context, ss *gosdk.ServerSession
 	}
 	cs := s.sessionFor(ss.ID())
 	cs.goSession.Store(ss)
-	cs.owner = s
+	cs.owner.Store(s)
 	cs.boundServer.Store(srv)
 	// Mark the session local: it was initialized on this instance, so the go-sdk
 	// StreamableHTTPHandler owns it and subsequent requests must route there
@@ -214,6 +231,17 @@ func (s *MCPServer) registerAndSync(ctx context.Context, ss *gosdk.ServerSession
 // syncSessionTools reconciles the session's tool overlay onto its go-sdk server:
 // tools present in the overlay are added (overwriting by name) and tools that
 // were previously added for this session but are no longer present are removed.
+//
+// go-sdk's AddTool panics unless the tool's input schema is non-nil with
+// top-level type "object". normalizeObjectSchema only normalizes nil/empty
+// schemas to {"type":"object"}; non-object schemas ($ref, oneOf, boolean, or an
+// object schema with type omitted) pass through verbatim to mirror mcp-go, so
+// AddTool can still panic here for a malformed overlay schema. This path runs on
+// the live session goroutine (from before-hooks during a request), so an
+// unrecovered panic would crash the session/process mid-request. Each tool is
+// therefore registered via addSessionTool, which recovers such a panic, logs it,
+// and skips the offending tool — one bad overlay schema does not take down the
+// session, and the remaining tools in the same overlay still register.
 func (s *MCPServer) syncSessionTools(srv *gosdk.Server, cs *clientSession) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -221,9 +249,17 @@ func (s *MCPServer) syncSessionTools(srv *gosdk.Server, cs *clientSession) {
 	for name, st := range cs.tools {
 		gt, err := toGoSDKTool(st.Tool)
 		if err != nil {
+			if s.logger != nil {
+				s.logger.Warn("skipping per-session tool: conversion failed", "tool", name, "error", err)
+			}
 			continue
 		}
-		srv.AddTool(gt, s.wrapToolHandler(st.Handler))
+		if !s.addSessionTool(srv, gt, st.Handler) {
+			if s.logger != nil {
+				s.logger.Warn("skipping per-session tool: AddTool rejected its schema", "tool", name)
+			}
+			continue
+		}
 		newNames[name] = struct{}{}
 	}
 	var removed []string
@@ -236,6 +272,26 @@ func (s *MCPServer) syncSessionTools(srv *gosdk.Server, cs *clientSession) {
 		srv.RemoveTools(removed...)
 	}
 	cs.sdkToolNames = newNames
+}
+
+// addSessionTool registers a tool on a per-session go-sdk server, recovering the
+// panic go-sdk's AddTool raises when a tool's input schema is non-nil but not
+// type:"object" (see normalizeObjectSchema). It returns false (and logs) when the
+// tool could not be registered, so the caller skips it rather than crashing the
+// session. This mirrors the fault-isolation recover pattern used in
+// wrapToolHandler (server.go).
+func (s *MCPServer) addSessionTool(srv *gosdk.Server, gt *gosdk.Tool, h ToolHandlerFunc) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if s.logger != nil {
+				s.logger.Error("per-session AddTool panicked; skipping tool",
+					"tool", gt.Name, "panic", r)
+			}
+			ok = false
+		}
+	}()
+	srv.AddTool(gt, s.wrapToolHandler(h))
+	return true
 }
 
 // syncSessionResources adds the session's resource overlay onto its go-sdk
@@ -261,11 +317,16 @@ func (s *MCPServer) isLocalSession(id string) bool {
 
 // forgetSession drops all local bookkeeping for a session ID. It is called when
 // a session is terminated (DELETE) so a later request with the same ID is not
-// mistaken for a live local session.
+// mistaken for a live local session. It also closes the notification channel so
+// the drain goroutine started in newClientSession exits, preventing a goroutine
+// leak per closed session.
 func (s *MCPServer) forgetSession(id string) {
+	v, ok := s.sessions.LoadAndDelete(id)
 	s.localSessions.Delete(id)
-	s.sessions.Delete(id)
-	s.pendingReqCtx.Delete(id)
+	if ok {
+		cs := v.(*clientSession)
+		cs.notifClose.Do(func() { close(cs.notifCh) })
+	}
 }
 
 // bindRehydratedSession binds the clientSession for a session that was created
@@ -280,7 +341,7 @@ func (s *MCPServer) forgetSession(id string) {
 func (s *MCPServer) bindRehydratedSession(id string, ss *gosdk.ServerSession, srv *gosdk.Server) {
 	cs := s.sessionFor(id)
 	cs.goSession.Store(ss)
-	cs.owner = s
+	cs.owner.Store(s)
 	cs.boundServer.Store(srv)
 	cs.Initialize()
 }
