@@ -4,10 +4,13 @@
 package metrics
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func TestMeter(t *testing.T) {
@@ -23,6 +26,20 @@ func TestMeter(t *testing.T) {
 			require.NoError(t, err)
 		})
 	})
+}
+
+func TestMeter_EmitsNoMetricsOnItsOwn(t *testing.T) {
+	t.Parallel()
+
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	meter := provider.Meter("stacklok.toolhive")
+	require.NotNil(t, meter)
+
+	var data metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &data))
+	assert.Empty(t, data.ScopeMetrics, "creating a meter must not register or emit any instrument")
 }
 
 func TestBucketPresets(t *testing.T) {
