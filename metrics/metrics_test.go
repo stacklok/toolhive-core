@@ -9,18 +9,16 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
-func TestMeter(t *testing.T) {
-	t.Parallel()
-
+func TestMeter(t *testing.T) { //nolint:paralleltest // Reads the global OTel provider, like TestMeter_EmitsNoMetricsOnItsOwn
 	meter := Meter("stacklok.toolhive")
 	require.NotNil(t, meter)
 
 	t.Run("constructing an instrument does not panic", func(t *testing.T) {
-		t.Parallel()
 		assert.NotPanics(t, func() {
 			_, err := meter.Int64Counter("stacklok.toolhive.requests")
 			require.NoError(t, err)
@@ -28,18 +26,19 @@ func TestMeter(t *testing.T) {
 	})
 }
 
-func TestMeter_EmitsNoMetricsOnItsOwn(t *testing.T) {
-	t.Parallel()
+func TestMeter_EmitsNoMetricsOnItsOwn(t *testing.T) { //nolint:paralleltest // Swaps the global OTel meter provider
+	original := otel.GetMeterProvider()
+	defer otel.SetMeterProvider(original)
 
 	reader := sdkmetric.NewManualReader()
-	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
 
-	meter := provider.Meter("stacklok.toolhive")
+	meter := Meter("stacklok.toolhive")
 	require.NotNil(t, meter)
 
 	var data metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(context.Background(), &data))
-	assert.Empty(t, data.ScopeMetrics, "creating a meter must not register or emit any instrument")
+	assert.Empty(t, data.ScopeMetrics, "Meter must not register or emit any instrument on its own")
 }
 
 func TestBucketPresets(t *testing.T) {
