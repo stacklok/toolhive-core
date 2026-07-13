@@ -123,6 +123,52 @@ func TestMapCallError_DoesNotMisclassifyJSONRPCErrors(t *testing.T) {
 	}
 }
 
+// TestMapConnectError_DoesNotMisclassifyJSONRPCErrors mirrors the mapCallError
+// guard for the connect/initialize path: a JSON-RPC error returned at
+// initialize (200 OK + JSON-RPC error body, no captured HTTP status) whose
+// message text contains "unauthorized"/"401" must NOT be reclassified as a
+// transport auth failure. Connect runs initialize through the same handleSend
+// machinery as the call methods (go-sdk v1.6.1 client.go:271), so the same
+// *jsonrpc.Error reaches mapConnectError with no captured status.
+func TestMapConnectError_DoesNotMisclassifyJSONRPCErrors(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "unauthorized in message",
+			err:  &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "unauthorized to access resource X"},
+		},
+		{
+			name: "401 in message",
+			err:  &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "got 401 from downstream"},
+		},
+		{
+			name: "method not allowed in message",
+			err:  &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "method not allowed here"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// No captured body: this is an RPC-level error at initialize.
+			ctx := withErrCapture(context.Background())
+			mapped := mapConnectError(ctx, tc.err)
+			require.Error(t, mapped)
+			assert.False(t, errors.Is(mapped, transport.ErrUnauthorized),
+				"RPC-level initialize error must not satisfy ErrUnauthorized: %v", mapped)
+			assert.False(t, errors.Is(mapped, transport.ErrAuthorizationRequired),
+				"RPC-level initialize error must not satisfy ErrAuthorizationRequired: %v", mapped)
+			assert.False(t, errors.Is(mapped, transport.ErrLegacySSEServer),
+				"RPC-level initialize error must not satisfy ErrLegacySSEServer: %v", mapped)
+			assert.False(t, errors.Is(mapped, transport.ErrSessionTerminated),
+				"RPC-level initialize error must not satisfy ErrSessionTerminated: %v", mapped)
+		})
+	}
+}
+
 // TestMapCallError_Transport401 confirms a transport-level 401 (with a captured
 // HTTP status) through mapCallError still maps to ErrUnauthorized. Scoping, not
 // removal: real transport 401s must keep triggering ToolHive's OAuth flow.

@@ -30,6 +30,9 @@ const echoToolName = "echo"
 // testClientVersion is the shared client/server version string used in tests.
 const testClientVersion = "1.0.0"
 
+// testClientName is the shared client name used in InitializeParams across tests.
+const testClientName = "test-client"
+
 // newTestServer stands up a real go-sdk MCP server exposing a single "echo"
 // tool, served over Streamable HTTP via httptest.
 func newTestServer(t *testing.T) *httptest.Server {
@@ -64,7 +67,7 @@ func TestStreamableClient_EndToEnd(t *testing.T) {
 	initRes, err := c.Initialize(ctx, mcp.InitializeRequest{
 		Params: mcp.InitializeParams{
 			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
-			ClientInfo:      mcp.Implementation{Name: "test-client", Version: testClientVersion},
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
 		},
 	})
 	require.NoError(t, err)
@@ -211,7 +214,7 @@ func TestOnNotification_ProgressAndLogging(t *testing.T) {
 	_, err = c.Initialize(ctx, mcp.InitializeRequest{
 		Params: mcp.InitializeParams{
 			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
-			ClientInfo:      mcp.Implementation{Name: "test-client", Version: testClientVersion},
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
 		},
 	})
 	require.NoError(t, err)
@@ -253,4 +256,34 @@ func TestOnNotification_ProgressAndLogging(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	require.GreaterOrEqual(t, len(got), 2, "at least progress and logging notifications expected")
+}
+
+// TestSetLevel_CompatAlias verifies that the SetLevel compatibility alias
+// (mcp-go's client.Client.SetLevel idiom) delegates to SetLoggingLevel and
+// successfully sets the server's logging level. This guards against the
+// drop-in contract breaking for downstream code using c.SetLevel(ctx,
+// mcp.SetLevelRequest{...}).
+func TestSetLevel_CompatAlias(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := newProgressLoggingServer(t)
+
+	c, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	// SetLevel must work exactly like SetLoggingLevel — it forwards to it.
+	err = c.SetLevel(ctx, mcp.SetLevelRequest{
+		Params: mcp.SetLevelParams{Level: mcp.LoggingLevelDebug},
+	})
+	assert.NoError(t, err, "SetLevel compat alias must succeed")
 }

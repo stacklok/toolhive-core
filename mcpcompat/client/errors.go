@@ -42,6 +42,14 @@ func enrichWithResponseBody(ctx context.Context, err error) error {
 // string matching when no body was captured (e.g. a failure before any
 // response). 401 stays ErrUnauthorized so ToolHive's OAuth refresh flow still
 // triggers.
+//
+// JSON-RPC-level errors (a *jsonrpc.Error returned inside a 2xx response) that
+// carry no captured HTTP status are application-level initialize rejections, not
+// transport failures: they must NOT be reclassified as transport auth/session
+// failures based on their text (mirrors mapCallError). Connect runs initialize
+// through the same handleSend machinery as the call methods (go-sdk v1.6.1
+// client.go:271), so the same *jsonrpc.Error reaches here with no captured
+// status.
 func mapConnectError(ctx context.Context, err error) error {
 	err = enrichWithResponseBody(ctx, err)
 	h := capturedErr(ctx)
@@ -54,6 +62,14 @@ func mapConnectError(ctx context.Context, err error) error {
 			))
 		}
 		return transport.NewError(errors.Join(transport.ErrLegacySSEServer, err))
+	}
+	var wireErr *jsonrpc.Error
+	if (h == nil || h.status == 0) && errors.As(err, &wireErr) {
+		// RPC-level error with no captured HTTP status: an application-level
+		// initialize rejection (200 OK + JSON-RPC error body), not a transport
+		// failure. Surface unchanged (mirrors mapCallError) rather than
+		// string-matching it into a transport auth/legacy-SSE sentinel.
+		return err
 	}
 	return mapTransportError(ctx, err, h)
 }

@@ -262,18 +262,27 @@ func (c *Client) Ping(ctx context.Context) error {
 // SetLoggingLevel sets the server's logging level. This is a renamed and
 // simplified counterpart to mcp-go's client.Client.SetLevel: rather than
 // taking an mcp.SetLevelRequest, it accepts the mcp.LoggingLevel directly.
-// The SetLevel, SetLevelRequest and SetLevelParams types from mcp-go are
-// intentionally NOT re-exported by this shim. The server only delivers
-// notifications/message notifications at or above the requested level, so this
-// must be called before the OnNotification handler will see logging
-// notifications. level is one of the MCP logging levels ("debug", "info",
-// "notice", "warning", "error", "critical", "alert", "emergency").
+// The server only delivers notifications/message notifications at or above the
+// requested level, so this must be called before the OnNotification handler
+// will see logging notifications. level is one of the MCP logging levels
+// ("debug", "info", "notice", "warning", "error", "critical", "alert",
+// "emergency").
 func (c *Client) SetLoggingLevel(ctx context.Context, level mcp.LoggingLevel) error {
 	s, err := c.sessionFor()
 	if err != nil {
 		return err
 	}
 	return s.SetLoggingLevel(ctx, &gosdk.SetLoggingLevelParams{Level: gosdk.LoggingLevel(level)})
+}
+
+// SetLevel is a drop-in compatibility alias for mcp-go's
+// client.Client.SetLevel, forwarding to SetLoggingLevel. It is provided so
+// downstream code using the upstream idiom
+// `c.SetLevel(ctx, mcp.SetLevelRequest{...})` compiles against the shim
+// unchanged. SetLevelRequest and SetLevelParams are re-exported from the mcp
+// package for the same reason.
+func (c *Client) SetLevel(ctx context.Context, request mcp.SetLevelRequest) error {
+	return c.SetLoggingLevel(ctx, request.Params.Level)
 }
 
 // ListTools lists the server's tools.
@@ -498,8 +507,15 @@ func (c *Client) ListResourceTemplates(
 // Handlers must be registered before Initialize so they can be wired into the
 // underlying go-sdk client. The go-sdk exposes typed notification handlers
 // rather than a single catch-all, so this shim synthesizes JSONRPCNotification
-// values (method + params) for the list-changed, progress and logging
-// notifications, forwarding each to every registered handler.
+// values (method + params) for each notification type and forwards each to
+// every registered handler. The following notification types are forwarded:
+//   - notifications/tools/list_changed
+//   - notifications/prompts/list_changed
+//   - notifications/resources/list_changed
+//   - notifications/resources/updated (from resources/subscribe)
+//   - notifications/elicitation/complete (out-of-band elicitation completion)
+//   - notifications/progress (server->client progress)
+//   - notifications/message (server->client logging)
 //
 // Server-initiated notifications (including the list_changed notifications,
 // which the server emits outside any in-flight request) are only delivered if
@@ -572,6 +588,21 @@ func (c *Client) installNotificationHandlers(opts *gosdk.ClientOptions) {
 	}
 	opts.ResourceListChangedHandler = func(_ context.Context, _ *gosdk.ResourceListChangedRequest) {
 		c.dispatch("notifications/resources/list_changed", nil)
+	}
+	// Forward server->client resource-updated notifications (the result of a
+	// resources/subscribe). go-sdk hands the params via
+	// *ResourceUpdatedNotificationRequest; dispatch synthesizes the
+	// notifications/resources/updated notification with its params (uri).
+	opts.ResourceUpdatedHandler = func(_ context.Context, req *gosdk.ResourceUpdatedNotificationRequest) {
+		c.dispatch("notifications/resources/updated", req.Params)
+	}
+	// Forward server->client elicitation-complete notifications (out-of-band
+	// elicitation completion). go-sdk hands the params via
+	// *ElicitationCompleteNotificationRequest; dispatch synthesizes the
+	// notifications/elicitation/complete notification with its params
+	// (elicitationId).
+	opts.ElicitationCompleteHandler = func(_ context.Context, req *gosdk.ElicitationCompleteNotificationRequest) {
+		c.dispatch("notifications/elicitation/complete", req.Params)
 	}
 	// Forward server->client progress notifications. go-sdk hands the params via
 	// *ProgressNotificationClientRequest; convert them to mcp-go's notification

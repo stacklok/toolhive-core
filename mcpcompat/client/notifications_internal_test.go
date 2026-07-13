@@ -303,3 +303,45 @@ func TestListChangedHandlers_MethodStrings(t *testing.T) {
 		"notifications/resources/list_changed",
 	}, got, "list-changed method strings must match the MCP spec names")
 }
+
+// TestResourceUpdatedAndElicitationCompleteHandlers verifies that
+// installNotificationHandlers wires the ResourceUpdatedHandler and
+// ElicitationCompleteHandler so notifications/resources/updated and
+// notifications/elicitation/complete are forwarded to the OnNotification
+// callback. Without these handlers, a client that subscribed to a resource
+// and is waiting for notifications/resources/updated via OnNotification
+// receives nothing.
+func TestResourceUpdatedAndElicitationCompleteHandlers(t *testing.T) {
+	t.Parallel()
+
+	c := &Client{}
+	var (
+		mu  sync.Mutex
+		got []string
+	)
+	c.OnNotification(func(n mcp.JSONRPCNotification) {
+		mu.Lock()
+		got = append(got, n.Method)
+		mu.Unlock()
+	})
+
+	opts := &gosdk.ClientOptions{}
+	c.installNotificationHandlers(opts)
+
+	require.NotNil(t, opts.ResourceUpdatedHandler)
+	require.NotNil(t, opts.ElicitationCompleteHandler)
+
+	opts.ResourceUpdatedHandler(context.Background(), &gosdk.ResourceUpdatedNotificationRequest{
+		Params: &gosdk.ResourceUpdatedNotificationParams{URI: "file:///example"},
+	})
+	opts.ElicitationCompleteHandler(context.Background(), &gosdk.ElicitationCompleteNotificationRequest{
+		Params: &gosdk.ElicitationCompleteParams{ElicitationID: "el-1"},
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{
+		"notifications/resources/updated",
+		"notifications/elicitation/complete",
+	}, got, "resource-updated and elicitation-complete method strings must match the MCP spec names")
+}

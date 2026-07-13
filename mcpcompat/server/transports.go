@@ -170,9 +170,20 @@ func WithSessionIdManager(manager SessionIdManager) StreamableHTTPOption {
 // heartbeat was passive (pings written only to an existing GET stream, never
 // awaited, never terminating).
 //
+// NOTE: the passive keep-alive is more load-bearing than "nice to have" now
+// that elicitation and all server→client notifications (list_changed,
+// progress, logging, resources/updated, elicitation/complete) structurally
+// depend on the client's idle standalone SSE stream staying open. Any
+// intermediary (LB, reverse proxy, ToolHive's own proxy) will reap that idle
+// stream on timeout — after which elicitation fails (ErrRejected) and
+// server-initiated notifications are silently dropped, with no reconnect. It
+// also feeds unbounded session growth (abandoned sessions are never reaped).
+//
 // TODO(issue #156): implement a passive keep-alive (SSE comment injection via
 // a ResponseWriter wrapper around the go-sdk handler) matching mcp-go's design
-// and wire this option to it. Until then the value is stored but unused.
+// and wire this option to it. This should be prioritized before internet-facing
+// vMCP use; a max-session cap / idle sweep would also help. Until then the
+// value is stored but unused.
 func WithHeartbeatInterval(interval time.Duration) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.heartbeat = interval }
 }
@@ -355,6 +366,16 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			// without dropping local state. The local go-sdk session stays
 			// alive; the client retries and, once Validate succeeds again, is
 			// served normally rather than routed through rehydration.
+			//
+			// Compat note: mcp-go returned 404 on ANY Validate error; the shim
+			// returns 503 on a non-terminated (transient) error and reserves
+			// 404 for genuine termination. 503 is NOT mapped by the client
+			// classifier (errors.Is(err, ErrSessionTerminated) is false), so a
+			// caller that keyed re-initialization off mcp-go's 404 →
+			// ErrSessionTerminated path won't re-init on a transient blip — it
+			// sees a generic retryable error. This is intentional (not dropping
+			// local state avoids the split-brain this PR guards against), but
+			// callers relying on that path should be aware of the divergence.
 			http.Error(w, "session validation unavailable", http.StatusServiceUnavailable)
 			return
 		}
