@@ -24,7 +24,7 @@ func TestValidateName(t *testing.T) {
 		},
 		{
 			name:    "accepts a qualified gateway service segment",
-			metric:  "stacklok.llm_gateway.token.usage",
+			metric:  "stacklok.ai_gateway.token.usage",
 			wantErr: false,
 		},
 		{
@@ -70,6 +70,13 @@ func TestValidateLabelKind(t *testing.T) {
 		{"rejects a bool pointer value", "is_healthy", func() *bool { b := true; return &b }(), true},
 		{"accepts a string value", "outcome", "success", false},
 		{"accepts an int value", "count", 42, false},
+		{"rejects the server re-spelling of mcp_server", "server", "backend-1", true},
+		{"rejects the status re-spelling of outcome", "status", "success", true},
+		{"rejects the success re-spelling of outcome", "success", "true", true},
+		{"rejects the tool re-spelling of tool_name", "tool", "search", true},
+		{"rejects the workflow.name re-spelling of composite_tool", "workflow.name", "pipeline", true},
+		{"accepts the canonical mcp_server key", LabelMCPServer, "backend-1", false},
+		{"accepts the canonical outcome key", LabelOutcome, "success", false},
 	}
 
 	for _, tc := range tests {

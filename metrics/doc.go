@@ -13,8 +13,8 @@ registry) use it to build their own instruments consistently.
 
 Obtain an OTel meter for an instrument scope:
 
-	meter := metrics.Meter("stacklok.toolhive")
-	counter, err := meter.Int64Counter("stacklok.toolhive.requests")
+	meter := metrics.Meter("stacklok.toolhive.proxy")
+	counter, err := meter.Int64Counter("stacklok.toolhive.proxy.requests")
 
 # Bucket Presets
 
@@ -23,7 +23,7 @@ and long-running operations such as sync, reconcile, or composite-tool
 execution:
 
 	histogram, err := meter.Float64Histogram(
-	    "stacklok.toolhive.request.duration",
+	    "stacklok.toolhive.proxy.request.duration",
 	    metric.WithExplicitBucketBoundaries(metrics.BucketsFastHTTP()...),
 	)
 
@@ -36,12 +36,21 @@ the same way:
 	    attribute.String(metrics.LabelOutcome, "success"),
 	))
 
+This package exports only canonical common keys: concepts more than one
+component emits and that a cross-component dashboard joins or groups on.
+Component-local keys used by a single emitter are not exported here; they
+are defined by that component.
+
 # Validation
 
 ValidateName and ValidateLabelKind are build-time lints, intended for use in
 tests and tooling rather than on any runtime path. ValidateName rejects a
-dotted metric name that uses "gateway" as its service segment; ValidateLabelKind
-rejects a boolean-typed label value.
+dotted metric name that uses "gateway" as its service segment.
+ValidateLabelKind rejects a boolean-typed label value, and rejects a label
+key that re-spells a canonical concept under a banned alias (e.g. "server"
+instead of "mcp_server") instead of its canonical key, so the join-key
+contract holds even for emitters that mirror these constants locally rather
+than importing them.
 
 # Stability
 

@@ -5,6 +5,12 @@ package metrics
 
 // Canonical label-key constants for Stacklok-authored metrics (RFC §3.3
 // label dictionary). One key per concept, snake_case, no boolean-typed keys.
+//
+// This set is scoped to canonical common keys only: concepts more than one
+// component emits and that a cross-component dashboard joins or groups on.
+// Component-local keys used by only one emitter (e.g. operator reconcile's
+// "phase", the circuit breaker's "from"/"to", the registry's "source") are
+// defined by the emitting component, not exported here.
 const (
 	// LabelMCPServer identifies the upstream MCP server.
 	LabelMCPServer = "mcp_server"
