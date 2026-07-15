@@ -3,18 +3,6 @@
 
 package metrics
 
-import (
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/metric"
-)
-
-// Meter returns an OTel meter for the given instrument scope name. It is a
-// thin wrapper over the global meter provider; it registers no instruments,
-// so calling it emits no metrics on its own.
-func Meter(scope string) metric.Meter {
-	return otel.Meter(scope)
-}
-
 // BucketsFastHTTP returns the histogram bucket boundaries, in seconds, for
 // fast HTTP-class measurements (RFC §3.3: 0.005-10).
 func BucketsFastHTTP() []float64 {

@@ -4,42 +4,11 @@
 package metrics
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/otel"
-	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
-
-func TestMeter(t *testing.T) { //nolint:paralleltest // Reads the global OTel provider, like TestMeter_EmitsNoMetricsOnItsOwn
-	meter := Meter("stacklok.toolhive")
-	require.NotNil(t, meter)
-
-	t.Run("constructing an instrument does not panic", func(t *testing.T) {
-		assert.NotPanics(t, func() {
-			_, err := meter.Int64Counter("stacklok.toolhive.requests")
-			require.NoError(t, err)
-		})
-	})
-}
-
-func TestMeter_EmitsNoMetricsOnItsOwn(t *testing.T) { //nolint:paralleltest // Swaps the global OTel meter provider
-	original := otel.GetMeterProvider()
-	defer otel.SetMeterProvider(original)
-
-	reader := sdkmetric.NewManualReader()
-	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
-
-	meter := Meter("stacklok.toolhive")
-	require.NotNil(t, meter)
-
-	var data metricdata.ResourceMetrics
-	require.NoError(t, reader.Collect(context.Background(), &data))
-	assert.Empty(t, data.ScopeMetrics, "Meter must not register or emit any instrument on its own")
-}
 
 func TestBucketPresets(t *testing.T) {
 	t.Parallel()
