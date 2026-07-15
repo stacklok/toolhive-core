@@ -5,6 +5,7 @@ package metrics
 
 import (
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 )
@@ -78,15 +79,30 @@ var replacedLabelKeys = map[string]string{
 // duplicate the outcome/error_type dimensions), and rejects a label key that
 // re-spells a canonical concept under a banned alias instead of its
 // canonical key (RFC §3.3 "Replaces" column).
+//
+// The boolean check unwraps pointers and inspects the underlying kind, so a
+// named boolean type (e.g. type Enabled bool) or a pointer to one is rejected
+// just like a plain bool — the lint guards the contract even for emitters that
+// define their own label types rather than using the built-in bool.
 func ValidateLabelKind(key string, value any) error {
 	if canonical, banned := replacedLabelKeys[key]; banned {
 		return fmt.Errorf("label %q is a banned re-spelling of canonical key %q", key, canonical)
 	}
 
-	switch value.(type) {
-	case bool, *bool:
+	if isBoolKind(value) {
 		return fmt.Errorf("label %q must not be boolean-typed", key)
-	default:
-		return nil
 	}
+	return nil
+}
+
+// isBoolKind reports whether value's underlying kind is bool, unwrapping any
+// levels of pointer indirection. It matches named bool types (type T bool) and
+// pointers to them, not just the built-in bool, and never dereferences a nil
+// pointer.
+func isBoolKind(value any) bool {
+	rt := reflect.TypeOf(value)
+	for rt != nil && rt.Kind() == reflect.Pointer {
+		rt = rt.Elem()
+	}
+	return rt != nil && rt.Kind() == reflect.Bool
 }

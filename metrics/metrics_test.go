@@ -45,31 +45,42 @@ func TestBucketPresets(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		buckets []float64
-		wantMin float64
-		wantMax float64
+		name   string
+		preset func() []float64
+		want   []float64
 	}{
-		{"fast HTTP", BucketsFastHTTP(), 0.005, 10},
-		{"MCP/proxy", BucketsMCPProxy(), 0.01, 300},
-		{"long-running", BucketsLongRunning(), 0.1, 300},
+		{
+			"fast HTTP",
+			BucketsFastHTTP,
+			[]float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+		},
+		{
+			"MCP/proxy",
+			BucketsMCPProxy,
+			[]float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300},
+		},
+		{
+			"long-running",
+			BucketsLongRunning,
+			[]float64{0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 180, 300},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			require.NotEmpty(t, tc.buckets)
-			assert.Equal(t, tc.wantMin, tc.buckets[0], "minimum boundary")
-			assert.Equal(t, tc.wantMax, tc.buckets[len(tc.buckets)-1], "maximum boundary")
-			assert.IsIncreasing(t, tc.buckets, "boundaries must be strictly increasing")
+			buckets := tc.preset()
+			require.NotEmpty(t, buckets)
+			assert.Equal(t, tc.want, buckets, "full documented boundary set")
+			assert.IsIncreasing(t, buckets, "boundaries must be strictly increasing")
+		})
+
+		t.Run(tc.name+" returns independent slices", func(t *testing.T) {
+			t.Parallel()
+			a := tc.preset()
+			b := tc.preset()
+			a[0] = 999
+			assert.NotEqual(t, a[0], b[0], "mutating one call's result must not affect another")
 		})
 	}
-
-	t.Run("returns independent slices", func(t *testing.T) {
-		t.Parallel()
-		a := BucketsFastHTTP()
-		b := BucketsFastHTTP()
-		a[0] = 999
-		assert.NotEqual(t, a[0], b[0], "mutating one call's result must not affect another")
-	})
 }
