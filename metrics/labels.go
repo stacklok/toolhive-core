@@ -31,12 +31,6 @@ const (
 	// LabelTransport identifies the transport used (e.g. stdio, sse, http).
 	LabelTransport = "transport"
 
-	// LabelProvider identifies the upstream LLM provider.
-	LabelProvider = "provider"
-
-	// LabelModel identifies the LLM model.
-	LabelModel = "model"
-
 	// LabelErrorType carries the failure classification on a Stacklok-authored
 	// metric (coexists with semconv error.type on OTel semconv metrics).
 	LabelErrorType = "error_type"

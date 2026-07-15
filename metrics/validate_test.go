@@ -163,8 +163,6 @@ func TestValidateLabel(t *testing.T) {
 		{"accepts the canonical tool_name key", LabelToolName, "search", ""},
 		{"accepts the canonical composite_tool key", LabelCompositeTool, "pipeline", ""},
 		{"accepts the canonical transport key", LabelTransport, "stdio", ""},
-		{"accepts the canonical provider key", LabelProvider, "openai", ""},
-		{"accepts the canonical model key", LabelModel, "gpt-4", ""},
 		{"accepts the canonical error_type key", LabelErrorType, "timeout", ""},
 	}
 
