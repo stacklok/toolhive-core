@@ -13,7 +13,9 @@ registry) use it to build their own instruments consistently.
 
 Three histogram bucket presets cover fast HTTP calls, MCP/proxy operations,
 and long-running operations such as sync, reconcile, or composite-tool
-execution:
+execution. This package does not construct meters or instruments; callers
+import go.opentelemetry.io/otel and go.opentelemetry.io/otel/metric
+themselves and pass a preset's boundaries when constructing a histogram:
 
 	meter := otel.Meter("stacklok.toolhive.proxy")
 	histogram, err := meter.Float64Histogram(
@@ -24,7 +26,8 @@ execution:
 # Label Keys
 
 Canonical label-key constants ensure every consumer spells the same concept
-the same way:
+the same way. As with the bucket presets, callers attach these to their own
+OTel instruments via go.opentelemetry.io/otel/attribute:
 
 	counter.Add(ctx, 1, metric.WithAttributes(
 	    attribute.String(metrics.LabelOutcome, "success"),

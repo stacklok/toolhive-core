@@ -53,3 +53,23 @@ func TestBucketPresets(t *testing.T) {
 		})
 	}
 }
+
+func TestLabelKeysAreUnique(t *testing.T) {
+	t.Parallel()
+
+	keys := []string{
+		LabelMCPServer,
+		LabelOutcome,
+		LabelMCPMethod,
+		LabelToolName,
+		LabelCompositeTool,
+		LabelTransport,
+		LabelErrorType,
+	}
+
+	seen := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		assert.False(t, seen[k], "duplicate label key: %q", k)
+		seen[k] = true
+	}
+}
