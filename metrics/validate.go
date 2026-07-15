@@ -6,7 +6,7 @@ package metrics
 import (
 	"fmt"
 	"reflect"
-	"slices"
+	"regexp"
 	"strings"
 )
 
@@ -24,10 +24,19 @@ const minNameSegments = 4
 // name (RFC §3.2 D1: stacklok.<service>.<subsystem>.<name>).
 const namePrefix = "stacklok"
 
+// segmentPattern matches a well-formed dotted-name segment: lowercase
+// letters, digits, and underscores. This mirrors OTel/Prometheus-safe metric
+// naming (the Prometheus exporter converts dots to underscores and expects
+// each component to already be a valid identifier), so a segment containing
+// whitespace, uppercase letters, or non-ASCII characters is rejected here
+// rather than surfacing as a broken export downstream.
+var segmentPattern = regexp.MustCompile(`^[a-z0-9_]+$`)
+
 // ValidateName is a build-time lint, not a runtime check. It rejects a
 // dotted OTel metric name that does not match the
 // stacklok.<service>.<subsystem>.<name> shape (RFC §3.2 D1), that uses
-// "gateway" as its service segment, and rejects an empty or malformed name.
+// "gateway" as its service segment, that contains a segment with characters
+// outside [a-z0-9_], and rejects an empty or malformed name.
 func ValidateName(name string) error {
 	if name == "" {
 		return fmt.Errorf("metric name must not be empty")
@@ -39,8 +48,11 @@ func ValidateName(name string) error {
 			"(stacklok.<service>.<subsystem>.<name>), got %d", name, minNameSegments, len(segments))
 	}
 
-	if slices.Contains(segments, "") {
-		return fmt.Errorf("metric name %q must not have an empty dotted segment", name)
+	for _, segment := range segments {
+		if !segmentPattern.MatchString(segment) {
+			return fmt.Errorf("metric name %q has invalid segment %q; "+
+				"segments must match [a-z0-9_]+", name, segment)
+		}
 	}
 
 	if segments[0] != namePrefix {
@@ -74,17 +86,17 @@ var replacedLabelKeys = map[string]string{
 	"target.transport_type": LabelTransport,
 }
 
-// ValidateLabelKind is a build-time lint, not a runtime check. It rejects a
-// boolean-typed label value (RFC §3.3 forbids boolean labels because they
-// duplicate the outcome/error_type dimensions), and rejects a label key that
-// re-spells a canonical concept under a banned alias instead of its
-// canonical key (RFC §3.3 "Replaces" column).
+// ValidateLabel is a build-time lint, not a runtime check. It runs two
+// independent checks on a label: it rejects a key that re-spells a canonical
+// concept under a banned alias instead of its canonical key (RFC §3.3
+// "Replaces" column), and it rejects a boolean-typed value (RFC §3.3 forbids
+// boolean labels because they duplicate the outcome/error_type dimensions).
 //
 // The boolean check unwraps pointers and inspects the underlying kind, so a
 // named boolean type (e.g. type Enabled bool) or a pointer to one is rejected
 // just like a plain bool — the lint guards the contract even for emitters that
 // define their own label types rather than using the built-in bool.
-func ValidateLabelKind(key string, value any) error {
+func ValidateLabel(key string, value any) error {
 	if canonical, banned := replacedLabelKeys[key]; banned {
 		return fmt.Errorf("label %q is a banned re-spelling of canonical key %q", key, canonical)
 	}

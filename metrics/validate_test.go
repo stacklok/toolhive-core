@@ -22,10 +22,13 @@ const (
 	// serverValue is a sample MCP server label value.
 	serverValue = "backend-1"
 	// errBooleanTyped and errBannedRespelling are substrings of the errors
-	// ValidateLabelKind returns, asserted so each case is pinned to the rule
+	// ValidateLabel returns, asserted so each case is pinned to the rule
 	// that must fire rather than merely to "some error".
 	errBooleanTyped     = "must not be boolean-typed"
 	errBannedRespelling = "banned re-spelling"
+	// errInvalidSegment is a substring of the error ValidateName returns for
+	// a segment containing characters outside [a-z0-9_].
+	errInvalidSegment = "invalid segment"
 )
 
 func TestValidateName(t *testing.T) {
@@ -76,7 +79,26 @@ func TestValidateName(t *testing.T) {
 		{
 			name:            "rejects a name with an empty dotted segment",
 			metric:          "stacklok..request.duration",
-			wantErrContains: "empty dotted segment",
+			wantErrContains: errInvalidSegment,
+		},
+		{
+			name:            "rejects a segment containing whitespace",
+			metric:          "stacklok.ai gateway.request.duration",
+			wantErrContains: errInvalidSegment,
+		},
+		{
+			name:            "rejects a segment containing uppercase letters",
+			metric:          "stacklok.Toolhive.request.duration",
+			wantErrContains: errInvalidSegment,
+		},
+		{
+			name:            "rejects a segment containing unicode characters",
+			metric:          "stacklok.工具.request.duration",
+			wantErrContains: errInvalidSegment,
+		},
+		{
+			name:   "accepts a segment containing digits and underscores",
+			metric: "stacklok.toolhive_2.request_v2.duration_ms",
 		},
 	}
 
@@ -93,7 +115,7 @@ func TestValidateName(t *testing.T) {
 	}
 }
 
-func TestValidateLabelKind(t *testing.T) {
+func TestValidateLabel(t *testing.T) {
 	t.Parallel()
 
 	var truePtr = func() *bool { b := true; return &b }()
@@ -149,7 +171,7 @@ func TestValidateLabelKind(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			err := ValidateLabelKind(tc.key, tc.value)
+			err := ValidateLabel(tc.key, tc.value)
 			if tc.wantErrContains != "" {
 				assert.ErrorContains(t, err, tc.wantErrContains)
 			} else {
@@ -159,6 +181,6 @@ func TestValidateLabelKind(t *testing.T) {
 	}
 }
 
-// health is a named boolean type used to verify ValidateLabelKind rejects
+// health is a named boolean type used to verify ValidateLabel rejects
 // boolean-kinded values beyond the built-in bool.
 type health bool
