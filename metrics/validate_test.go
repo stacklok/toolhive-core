@@ -47,6 +47,16 @@ func TestValidateName(t *testing.T) {
 			metric:  "stacklok.gateway",
 			wantErr: true,
 		},
+		{
+			name:    "rejects a name missing the stacklok prefix",
+			metric:  "toolhive.proxy.request.duration",
+			wantErr: true,
+		},
+		{
+			name:    "rejects a name with an empty dotted segment",
+			metric:  "stacklok..request.duration",
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {

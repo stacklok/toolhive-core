@@ -5,6 +5,7 @@ package metrics
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -18,8 +19,13 @@ const bannedServiceSegment = "gateway"
 // well-formed stacklok.<service>.<subsystem>.<name> metric name.
 const minNameSegments = 4
 
+// namePrefix is the required first segment of a Stacklok-authored metric
+// name (RFC §3.2 D1: stacklok.<service>.<subsystem>.<name>).
+const namePrefix = "stacklok"
+
 // ValidateName is a build-time lint, not a runtime check. It rejects a
-// dotted OTel metric name (stacklok.<service>.<subsystem>.<name>) that uses
+// dotted OTel metric name that does not match the
+// stacklok.<service>.<subsystem>.<name> shape (RFC §3.2 D1), that uses
 // "gateway" as its service segment, and rejects an empty or malformed name.
 func ValidateName(name string) error {
 	if name == "" {
@@ -30,6 +36,15 @@ func ValidateName(name string) error {
 	if len(segments) < minNameSegments {
 		return fmt.Errorf("metric name %q must have at least %d dotted segments "+
 			"(stacklok.<service>.<subsystem>.<name>), got %d", name, minNameSegments, len(segments))
+	}
+
+	if slices.Contains(segments, "") {
+		return fmt.Errorf("metric name %q must not have an empty dotted segment", name)
+	}
+
+	if segments[0] != namePrefix {
+		return fmt.Errorf("metric name %q must start with %q "+
+			"(stacklok.<service>.<subsystem>.<name>)", name, namePrefix)
 	}
 
 	service := segments[1]

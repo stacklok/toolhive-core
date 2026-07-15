@@ -45,7 +45,9 @@ are defined by that component.
 
 ValidateName and ValidateLabelKind are build-time lints, intended for use in
 tests and tooling rather than on any runtime path. ValidateName rejects a
-dotted metric name that uses "gateway" as its service segment.
+metric name that does not match the stacklok.<service>.<subsystem>.<name>
+shape (missing prefix, too few segments, or an empty segment), and rejects
+a name that uses "gateway" as its service segment.
 ValidateLabelKind rejects a boolean-typed label value, and rejects a label
 key that re-spells a canonical concept under a banned alias (e.g. "server"
 instead of "mcp_server") instead of its canonical key, so the join-key
