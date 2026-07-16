@@ -83,6 +83,7 @@ type StreamableHTTPServer struct {
 	endpointPath string
 	contextFunc  HTTPContextFunc
 	sessionIDMgr SessionIdManager
+	callGate     CallGate
 	heartbeat    time.Duration
 	// disableLocalhostProtection turns off go-sdk's DNS-rebinding/localhost
 	// protection (which 403s requests on a loopback listener with a non-localhost
@@ -267,6 +268,8 @@ func (s *StreamableHTTPServer) build() {
 }
 
 // ServeHTTP implements http.Handler.
+//
+//nolint:gocyclo // pre-dispatch gate adds one branch to an already at-limit dispatch function.
 func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.build()
 	if s.buildErr != nil {
@@ -276,6 +279,21 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	ensureAcceptMediaTypes(r)
 	if s.contextFunc != nil {
 		r = r.WithContext(s.contextFunc(r.Context(), r))
+	}
+	// Pre-dispatch denial gate. Placement is deliberate:
+	//   (a) AFTER contextFunc, so a gate that reads context injected via the
+	//       shim option (identity, parsed request) sees it;
+	//   (b) BEFORE the nonce bridge, so a denied request never registers a
+	//       pending per-request context entry;
+	//   (c) BEFORE both dispatch branches — the local go-sdk handler AND the
+	//       cross-replica serveRehydrated path — so multi-replica deployments
+	//       are gated identically;
+	//   (d) BEFORE session-ID validation (403-before-404): a denial is
+	//       determinable without session state, so a denied call with a stale,
+	//       foreign, or terminated session ID receives the denial rather than a
+	//       404, matching hosts whose authorization sits outside the SDK.
+	if s.denied(w, r) {
+		return
 	}
 	// Bridge per-request context values into the handler. go-sdk does not
 	// propagate the per-POST request context into handlers for existing
