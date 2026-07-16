@@ -60,7 +60,7 @@ type stdioConfig struct{}
 // ServeStdio runs the MCP server over stdio until the context is done. It
 // mirrors mcp-go's server.ServeStdio.
 func ServeStdio(server *MCPServer, _ ...StdioOption) error {
-	srv, err := server.buildServer(nil, 0)
+	srv, err := server.buildServer(nil)
 	if err != nil {
 		return err
 	}
@@ -84,7 +84,9 @@ type StreamableHTTPServer struct {
 	contextFunc  HTTPContextFunc
 	sessionIDMgr SessionIdManager
 	callGate     CallGate
-	heartbeat    time.Duration
+	// heartbeat is the passive SSE keep-alive comment interval for GET streams;
+	// ≤ 0 disables it. See WithHeartbeatInterval.
+	heartbeat time.Duration
 	// disableLocalhostProtection turns off go-sdk's DNS-rebinding/localhost
 	// protection (which 403s requests on a loopback listener with a non-localhost
 	// Host header). mcp-go had no such protection; local proxies with custom Host
@@ -160,31 +162,36 @@ func WithSessionIdManager(manager SessionIdManager) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.sessionIDMgr = manager }
 }
 
-// WithHeartbeatInterval sets the keep-alive ping interval. This option is
-// currently a NO-OP: it stores the interval but does NOT wire it to go-sdk's
-// ServerOptions.KeepAlive. go-sdk's KeepAlive sends an active ping REQUEST
-// (server→client) each interval and session.Close()s on failure; under
-// JSONResponse mode that ping routes to the standalone SSE stream, and a
-// JSON-only client (no GET stream, the shim client's own default) has that
-// stream unconnected → ping rejected → session closed on the first tick. That
-// would evict every healthy JSON-only client session at the interval. mcp-go's
-// heartbeat was passive (pings written only to an existing GET stream, never
-// awaited, never terminating).
+// WithHeartbeatInterval sets the passive SSE keep-alive interval for GET
+// streams. A positive interval enables the keep-alive; an interval ≤ 0 disables
+// it (mcp-go parity: mcp-go's default was no heartbeat, a positive interval
+// opts in). The keep-alive is implemented at the HTTP layer by keepAliveWriter,
+// which wraps the GET stream's ResponseWriter and injects an SSE comment once
+// per interval, on BOTH the local go-sdk handler path and the cross-replica
+// serveRehydrated path. The first comment is emitted after one full interval.
 //
-// NOTE: the passive keep-alive is more load-bearing than "nice to have" now
-// that elicitation and all server→client notifications (list_changed,
-// progress, logging, resources/updated, elicitation/complete) structurally
-// depend on the client's idle standalone SSE stream staying open. Any
-// intermediary (LB, reverse proxy, ToolHive's own proxy) will reap that idle
-// stream on timeout — after which elicitation fails (ErrRejected) and
-// server-initiated notifications are silently dropped, with no reconnect. It
-// also feeds unbounded session growth (abandoned sessions are never reaped).
+// The payload is an SSE comment (": keep-alive"), NOT a JSON-RPC ping. This
+// diverges deliberately from mcp-go, which sent a full ping REQUEST event: a
+// conforming client answers a ping with a response POST carrying an ID the
+// go-sdk server never issued, so every tick would generate unknown-request-ID
+// handling. An SSE comment is ignored by every conforming SSE parser and is
+// invisible at the JSON-RPC layer (see keepAliveComment).
 //
-// TODO(issue #156): implement a passive keep-alive (SSE comment injection via
-// a ResponseWriter wrapper around the go-sdk handler) matching mcp-go's design
-// and wire this option to it. This should be prioritized before internet-facing
-// vMCP use; a max-session cap / idle sweep would also help. Until then the
-// value is stored but unused.
+// This does NOT wire go-sdk's ServerOptions.KeepAlive, and must not: go-sdk's
+// KeepAlive sends an ACTIVE ping request (server→client) each interval and
+// session.Close()s on failure. Under JSONResponse mode that ping routes to the
+// standalone SSE stream, so a JSON-only client (no GET stream — the shim
+// client's own default) would have its session evicted on the first tick. The
+// passive comment-based keep-alive avoids that by writing only to an
+// already-open GET stream and never awaiting a response.
+//
+// The keep-alive is load-bearing, not merely nice to have: elicitation and all
+// server→client notifications (list_changed, progress, logging,
+// resources/updated, elicitation/complete) structurally depend on the client's
+// idle standalone SSE stream staying open. Any intermediary (LB, reverse proxy,
+// ToolHive's own proxy) reaps an idle stream on timeout — after which
+// elicitation fails (ErrRejected) and server-initiated notifications are
+// silently dropped, with no reconnect.
 func WithHeartbeatInterval(interval time.Duration) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.heartbeat = interval }
 }
@@ -241,9 +248,8 @@ func (s *StreamableHTTPServer) build() {
 			gen = s.sessionIDMgr.Generate
 		}
 		// Validate the server configuration once up-front so a bad registration
-		// surfaces as a clean 500 rather than a per-request nil. Pass 0 for
-		// keepalive: WithHeartbeatInterval is a documented no-op (see its doc).
-		if _, err := s.mcp.buildServer(gen, 0); err != nil {
+		// surfaces as a clean 500 rather than a per-request nil.
+		if _, err := s.mcp.buildServer(gen); err != nil {
 			s.buildErr = err
 			return
 		}
@@ -261,9 +267,10 @@ func (s *StreamableHTTPServer) build() {
 		}
 		// A fresh go-sdk server per client session lets each session carry its own
 		// tool/resource overlay (mcp-go's per-session projection), synced by the
-		// registration middleware buildServer installs. Keepalive is 0
-		// (WithHeartbeatInterval is a no-op; see its doc).
-		s.handler = gosdk.NewStreamableHTTPHandler(s.mcp.getServerFunc(gen, 0), opts)
+		// registration middleware buildServer installs. The heartbeat keep-alive
+		// is applied at the HTTP layer (keepAliveWriter, see WithHeartbeatInterval),
+		// not through go-sdk's active KeepAlive.
+		s.handler = gosdk.NewStreamableHTTPHandler(s.mcp.getServerFunc(gen), opts)
 	})
 }
 
@@ -276,6 +283,12 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		http.Error(w, fmt.Sprintf("building server: %v", s.buildErr), http.StatusInternalServerError)
 		return
 	}
+	// Wrap the GET stream with the passive keep-alive before either dispatch
+	// branch (local handler or serveRehydrated) so both are covered. The wrap is
+	// pure observation; stopKA is the single authoritative teardown and must run
+	// on every return path, hence the defer here at the top.
+	w, stopKA := s.wrapKeepAlive(w, r)
+	defer stopKA()
 	ensureAcceptMediaTypes(r)
 	if s.contextFunc != nil {
 		r = r.WithContext(s.contextFunc(r.Context(), r))
@@ -408,6 +421,21 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	s.handler.ServeHTTP(w, r)
 }
 
+// wrapKeepAlive wraps w with the passive SSE keep-alive for GET requests when a
+// heartbeat interval is configured. All other requests (POST/DELETE, or the
+// heartbeat disabled) pass through unchanged with a no-op stop. Keeping the
+// method gate here — rather than a branch in ServeHTTP — holds the gocyclo
+// budget flat and keeps the keep-alive logic in one place. POST is doubly
+// safe: it is excluded here by method, and even if wrapped the Content-Type
+// gate (application/json under JSONResponse) would keep the ticker off.
+func (s *StreamableHTTPServer) wrapKeepAlive(w http.ResponseWriter, r *http.Request) (http.ResponseWriter, func()) {
+	if r.Method != http.MethodGet || s.heartbeat <= 0 {
+		return w, func() {}
+	}
+	k := newKeepAliveWriter(w, s.heartbeat, s.mcp.logger)
+	return k, k.stopKeepAlive
+}
+
 // serveRehydrated routes a request for a session created on another replica.
 // It validates the session ID against the shared SessionIdManager and serves it
 // through a locally-reconstructed session, matching mcp-go's behavior where any
@@ -505,7 +533,7 @@ func (s *StreamableHTTPServer) rehydrate(r *http.Request, sid string) (*rehydrat
 		return rt, nil
 	}
 
-	srv, err := s.mcp.buildServer(nil, 0)
+	srv, err := s.mcp.buildServer(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -612,11 +640,11 @@ func WithMessageEndpoint(endpoint string) SSEOption {
 
 func (s *SSEServer) build() {
 	s.once.Do(func() {
-		if _, err := s.mcp.buildServer(nil, 0); err != nil {
+		if _, err := s.mcp.buildServer(nil); err != nil {
 			s.buildErr = err
 			return
 		}
-		s.handler = gosdk.NewSSEHandler(s.mcp.getServerFunc(nil, 0), nil)
+		s.handler = gosdk.NewSSEHandler(s.mcp.getServerFunc(nil), nil)
 	})
 }
 

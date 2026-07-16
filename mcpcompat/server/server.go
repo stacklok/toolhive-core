@@ -38,7 +38,6 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	gosdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -410,22 +409,7 @@ func (s *MCPServer) AddPrompt(prompt mcp.Prompt, handler PromptHandlerFunc) {
 // middleware installed by this function syncs that session's overlay tools and
 // resources onto its own server once the OnRegisterSession hooks have run. This
 // mirrors mcp-go, whose per-session tools were dispatched per connection.
-func (s *MCPServer) buildServer(genSessionID func() string, _ time.Duration) (*gosdk.Server, error) {
-	// NOTE: the keepalive parameter is intentionally unused. Wave 3 wired
-	// WithHeartbeatInterval to go-sdk's ServerOptions.KeepAlive, but go-sdk's
-	// KeepAlive sends an active ping REQUEST (server→client) each interval and
-	// session.Close()s on failure. Under JSONResponse mode that ping routes to
-	// the standalone SSE stream; a JSON-only client (no GET stream, the shim
-	// client's own default) has that stream unconnected → ping rejected →
-	// session closed on the first tick. mcp-go's heartbeat was passive (pings
-	// written only to an existing GET stream, never awaited, never
-	// terminating). Wiring KeepAlive therefore evicts every healthy JSON-only
-	// client session at the heartbeat interval. The interval is stored by
-	// WithHeartbeatInterval (see transports.go) but NOT wired to KeepAlive.
-	//
-	// TODO(issue #156): implement a passive keep-alive (SSE comment injection
-	// via a ResponseWriter wrapper around the go-sdk handler) matching
-	// mcp-go's design, rather than the active ping go-sdk's KeepAlive performs.
+func (s *MCPServer) buildServer(genSessionID func() string) (*gosdk.Server, error) {
 	s.mu.RLock()
 	tools := make(map[string]ServerTool, len(s.tools))
 	for k, v := range s.tools {
@@ -452,10 +436,10 @@ func (s *MCPServer) buildServer(genSessionID func() string, _ time.Duration) (*g
 		// DefaultPageSize (1000) in place, preserving the pre-existing behavior
 		// for callers that do not set WithPageSize.
 		PageSize: s.pageSize,
-		// KeepAlive is intentionally NOT set: see the note on buildServer's
-		// keepalive parameter above. go-sdk's KeepAlive sends an active ping
-		// request that closes sessions without a connected standalone SSE
-		// stream, incompatible with JSONResponse mode + JSON-only clients.
+		// KeepAlive is deliberately NOT set. go-sdk's KeepAlive is an active ping
+		// request that evicts JSON-mode sessions without a connected standalone
+		// SSE stream (incompatible with JSONResponse + JSON-only clients); the
+		// shim's passive keep-alive lives in keepalive.go instead.
 		InitializedHandler: func(ctx context.Context, req *gosdk.InitializedRequest) {
 			if req == nil || req.Session == nil {
 				return
@@ -542,13 +526,11 @@ func addGlobalTool(srv *gosdk.Server, gt *gosdk.Tool, h gosdk.ToolHandler, name 
 
 // getServerFunc returns a getServer callback for the go-sdk HTTP/SSE handlers,
 // which invoke it once per new client session. genSessionID (may be nil) is the
-// session-ID generator to install on each per-session server. The keepalive
-// parameter is retained for signature stability but is NOT wired to go-sdk's
-// KeepAlive (see buildServer); it is effectively ignored. On a build error it
-// logs and returns nil, which the go-sdk handler surfaces as an HTTP 400.
-func (s *MCPServer) getServerFunc(genSessionID func() string, keepalive time.Duration) func(*http.Request) *gosdk.Server {
+// session-ID generator to install on each per-session server. On a build error
+// it logs and returns nil, which the go-sdk handler surfaces as an HTTP 400.
+func (s *MCPServer) getServerFunc(genSessionID func() string) func(*http.Request) *gosdk.Server {
 	return func(*http.Request) *gosdk.Server {
-		srv, err := s.buildServer(genSessionID, keepalive)
+		srv, err := s.buildServer(genSessionID)
 		if err != nil {
 			if s.logger != nil {
 				s.logger.Error("building per-session MCP server", "error", err)
