@@ -26,6 +26,7 @@ The ToolHive ecosystem spans multiple Go repositories, and several of these proj
 | `env` | Stable | Environment variable abstraction with `Reader` interface |
 | `httperr` | Stable | Wrap errors with HTTP status codes |
 | `logging` | Alpha | Pre-configured `*slog.Logger` factory with consistent ToolHive defaults |
+| `metrics` | Alpha | Shared OTel histogram bucket presets and label-key constants |
 | `oci/skills` | Alpha | OCI artifact types, media types, and registry operations for skills |
 | `oci/plugins` | Alpha | OCI artifact types, media types, and registry operations for plugins |
 | `postgres` | Alpha | PostgreSQL connection pool with optional AWS RDS IAM dynamic auth |
