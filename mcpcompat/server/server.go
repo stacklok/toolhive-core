@@ -14,13 +14,17 @@
 //
 // # Scope and status
 //
-// The global registration path (AddTool/AddResource/AddPrompt served over the
-// stdio and HTTP transports) is fully functional and tested. The per-session
-// interfaces (SessionWithTools, SessionWithResources, SessionWithPrompts,
-// SessionWithElicitation, SessionIdManager) and the Hooks type are implemented
-// and wired: per-session tool/resource/prompt overlays set via SetSessionTools/
-// SetSessionResources/SetSessionPrompts are reconciled onto the session's live
-// go-sdk server (syncSessionTools/syncSessionResources/syncSessionPrompts), and
+// The global registration path (AddTool/AddResource/AddResourceTemplate/
+// AddPrompt served over the stdio and HTTP transports), the completion handler
+// (WithCompletionHandler) and the resource subscribe/unsubscribe handlers
+// (WithSubscribeHandlers) are functional and tested. The per-session interfaces
+// (SessionWithTools, SessionWithResources, SessionWithResourceTemplates,
+// SessionWithPrompts, SessionWithElicitation, SessionIdManager) and the Hooks
+// type are implemented and wired: per-session
+// tool/resource/resource-template/prompt overlays set via SetSessionTools/
+// SetSessionResources/SetSessionResourceTemplates/SetSessionPrompts are
+// reconciled onto the session's live go-sdk server (syncSessionTools/
+// syncSessionResources/syncSessionResourceTemplates/syncSessionPrompts), and
 // the before-list/before-call hooks fire ahead of SDK dispatch so ToolHive's
 // lazy per-session tool injection runs first.
 // Cross-replica session rehydration (Validate-driven lazy eviction) and the
@@ -70,6 +74,14 @@ type ResourceTemplateHandlerFunc func(ctx context.Context, request mcp.ReadResou
 
 // PromptHandlerFunc handles a prompt get.
 type PromptHandlerFunc func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error)
+
+// CompletionHandlerFunc handles a completion/complete request. It mirrors the
+// handler shape ToolHive's vMCP aggregator installs via WithCompletionHandler.
+type CompletionHandlerFunc func(ctx context.Context, request mcp.CompleteRequest) (*mcp.CompleteResult, error)
+
+// SubscribeHandlerFunc handles a resources/subscribe or resources/unsubscribe
+// request for a single resource URI.
+type SubscribeHandlerFunc func(ctx context.Context, uri string) error
 
 // NotificationHandlerFunc handles a client notification.
 type NotificationHandlerFunc func(ctx context.Context, notification mcp.JSONRPCNotification)
@@ -138,6 +150,18 @@ type MCPServer struct {
 	// page. Setting it via WithPageSize lets aggregators with >1000 tools raise
 	// (or otherwise configure) the page size so tools/list is not paginated.
 	pageSize int
+
+	// completionHandler, when set via WithCompletionHandler, answers
+	// completion/complete requests. go-sdk auto-advertises the completions
+	// capability when ServerOptions.CompletionHandler is non-nil.
+	completionHandler CompletionHandlerFunc
+
+	// subscribeHandler/unsubscribeHandler, when both set via
+	// WithSubscribeHandlers, answer resources/subscribe and
+	// resources/unsubscribe. go-sdk PANICS if only one of the two is set, so the
+	// option requires both together (see WithSubscribeHandlers).
+	subscribeHandler   SubscribeHandlerFunc
+	unsubscribeHandler SubscribeHandlerFunc
 
 	mu                sync.RWMutex
 	tools             map[string]ServerTool
@@ -320,6 +344,38 @@ func WithLogging() ServerOption {
 	return func(s *MCPServer) { s.logging = true }
 }
 
+// WithCompletionHandler installs a handler for completion/complete requests.
+// Setting it makes go-sdk auto-advertise the completions capability at
+// initialize time (ServerOptions.CompletionHandler), so spec-compliant clients
+// that gate completion on the capability will issue completion requests.
+//
+// The handler's context carries the ClientSession (bridged by the shim's
+// dispatch middleware), so it can be recovered with ClientSessionFromContext
+// for per-session completion.
+func WithCompletionHandler(h CompletionHandlerFunc) ServerOption {
+	return func(s *MCPServer) { s.completionHandler = h }
+}
+
+// WithSubscribeHandlers installs the resources/subscribe and
+// resources/unsubscribe handlers. Both MUST be provided together: go-sdk panics
+// during server construction if only one of ServerOptions.SubscribeHandler /
+// UnsubscribeHandler is set, so passing a nil subscribe or unsubscribe is a
+// programming error. If either is nil the option is a no-op (neither handler is
+// wired), leaving go-sdk to reject subscribe/unsubscribe with -32601.
+//
+// This does NOT change the advertised resource capabilities: the consumer must
+// still call WithResourceCapabilities(true, ...) to advertise subscribe support
+// at initialize time.
+func WithSubscribeHandlers(subscribe, unsubscribe SubscribeHandlerFunc) ServerOption {
+	return func(s *MCPServer) {
+		if subscribe == nil || unsubscribe == nil {
+			return
+		}
+		s.subscribeHandler = subscribe
+		s.unsubscribeHandler = unsubscribe
+	}
+}
+
 // WithLogger sets the server logger.
 func WithLogger(logger *slog.Logger) ServerOption {
 	return func(s *MCPServer) { s.logger = logger }
@@ -402,10 +458,13 @@ func (s *MCPServer) AddPrompt(prompt mcp.Prompt, handler PromptHandlerFunc) {
 }
 
 // buildServer constructs a go-sdk Server from the globally-registered features
-// (AddTool/AddResource/AddPrompt).
+// (AddTool/AddResource/AddResourceTemplate/AddPrompt) and wires the optional
+// completion (WithCompletionHandler) and resource subscribe/unsubscribe
+// (WithSubscribeHandlers) handlers.
 //
 // Per-session overlays (SessionWithTools/SessionWithResources/
-// SessionWithPrompts) are NOT baked in here: the streamable/SSE transports call
+// SessionWithResourceTemplates/SessionWithPrompts) are NOT baked in here: the
+// streamable/SSE transports call
 // this once per new client session (via getServer) so each session gets its own
 // go-sdk Server, and the registration middleware installed by this function
 // syncs that session's overlay tools, resources and prompts onto its own server
@@ -424,6 +483,10 @@ func (s *MCPServer) buildServer(genSessionID func() string) (*gosdk.Server, erro
 	prompts := make(map[string]ServerPrompt, len(s.prompts))
 	for k, v := range s.prompts {
 		prompts[k] = v
+	}
+	resourceTemplates := make(map[string]ServerResourceTemplate, len(s.resourceTemplates))
+	for k, v := range s.resourceTemplates {
+		resourceTemplates[k] = v
 	}
 	s.mu.RUnlock()
 
@@ -462,6 +525,15 @@ func (s *MCPServer) buildServer(genSessionID func() string) (*gosdk.Server, erro
 	// it to be advertised regardless of registered features; a nil entry leaves
 	// go-sdk's inference (from registered features) in place.
 	opts.Capabilities = s.serverCapabilities()
+	// Wire the completion handler. go-sdk auto-advertises the completions
+	// capability when ServerOptions.CompletionHandler is non-nil; the shim
+	// converts the go-sdk request/result to and from the mcp-go-shaped types.
+	if s.completionHandler != nil {
+		opts.CompletionHandler = s.wrapCompletionHandler()
+	}
+	// Wire the resource subscribe/unsubscribe handlers (no-op unless both were
+	// set via WithSubscribeHandlers).
+	s.wireSubscribeHandlers(opts)
 	// When a SessionIdManager is supplied (WithSessionIdManager), drive the SDK's
 	// session-ID generation through it: mcp-go called Generate() to mint the ID,
 	// which is where ToolHive's manager creates the placeholder session record
@@ -473,40 +545,142 @@ func (s *MCPServer) buildServer(genSessionID func() string) (*gosdk.Server, erro
 	}
 	srv = gosdk.NewServer(impl, opts)
 
-	// Register global tools/resources/prompts. go-sdk's AddTool/AddResource/
-	// AddPrompt panic on a malformed schema (e.g. a $ref or non-object type),
-	// and buildServer runs inside sync.Once.Do in the transports' build(): a
-	// panic here would mark Once done while buildErr stays nil and handler stays
-	// nil, so every subsequent request nil-panics forever. Recover such panics
-	// and convert them into an error so they flow into buildErr and properly
-	// poison the Once (issue #156, finding 2). This mirrors the per-session
-	// recover in addSessionTool (session.go).
+	if err := s.registerGlobalFeatures(srv, tools, resources, prompts, resourceTemplates); err != nil {
+		return nil, err
+	}
+
+	srv.AddReceivingMiddleware(s.sessionDispatchMiddleware(srv))
+	return srv, nil
+}
+
+// registerGlobalFeatures registers the globally-declared tools, resources,
+// prompts and resource templates onto srv. go-sdk's AddTool/AddResource/
+// AddPrompt/AddResourceTemplate panic on a malformed schema (e.g. a $ref or
+// non-object type) or an invalid/non-absolute URI template, and buildServer runs
+// inside sync.Once.Do in the transports' build(): a panic here would mark Once
+// done while buildErr stays nil and handler stays nil, so every subsequent
+// request nil-panics forever. addGlobalTool/addGlobalResourceTemplate recover
+// such panics and convert them into an error so they flow into buildErr and
+// properly poison the Once (issue #156, finding 2). This mirrors the per-session
+// recover in addSessionTool (session.go).
+func (s *MCPServer) registerGlobalFeatures(
+	srv *gosdk.Server,
+	tools map[string]ServerTool,
+	resources map[string]ServerResource,
+	prompts map[string]ServerPrompt,
+	resourceTemplates map[string]ServerResourceTemplate,
+) error {
 	for _, st := range tools {
 		gt, err := toGoSDKTool(st.Tool)
 		if err != nil {
-			return nil, fmt.Errorf("converting tool %q: %w", st.Tool.Name, err)
+			return fmt.Errorf("converting tool %q: %w", st.Tool.Name, err)
 		}
 		if err := addGlobalTool(srv, gt, s.wrapToolHandler(st.Handler), st.Tool.Name); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	for _, sr := range resources {
 		gr := &gosdk.Resource{}
 		if err := jsonConvert(sr.Resource, gr); err != nil {
-			return nil, fmt.Errorf("converting resource %q: %w", sr.Resource.URI, err)
+			return fmt.Errorf("converting resource %q: %w", sr.Resource.URI, err)
 		}
 		srv.AddResource(gr, s.wrapResourceHandler(sr.Handler))
 	}
 	for _, sp := range prompts {
 		gp := &gosdk.Prompt{}
 		if err := jsonConvert(sp.Prompt, gp); err != nil {
-			return nil, fmt.Errorf("converting prompt %q: %w", sp.Prompt.Name, err)
+			return fmt.Errorf("converting prompt %q: %w", sp.Prompt.Name, err)
 		}
 		srv.AddPrompt(gp, s.wrapPromptHandler(sp.Handler))
 	}
+	for _, srt := range resourceTemplates {
+		grt := &gosdk.ResourceTemplate{}
+		if err := jsonConvert(srt.Template, grt); err != nil {
+			return fmt.Errorf("converting resource template %q: %w", srt.Template.Name, err)
+		}
+		h := s.wrapResourceHandler(ResourceHandlerFunc(srt.Handler))
+		if err := addGlobalResourceTemplate(srv, grt, h, srt.Template.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-	srv.AddReceivingMiddleware(s.sessionDispatchMiddleware(srv))
-	return srv, nil
+// addGlobalResourceTemplate registers a globally-declared resource template on a
+// go-sdk server, recovering the panic go-sdk's AddResourceTemplate raises when
+// the URI template is invalid or not absolute. It converts the panic into a
+// returned error so buildServer surfaces a clean construction-time error
+// (flowing into buildErr/sync.Once) rather than poisoning the once. Mirrors
+// addGlobalTool.
+func addGlobalResourceTemplate(
+	srv *gosdk.Server, grt *gosdk.ResourceTemplate, h gosdk.ResourceHandler, name string,
+) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf(
+				"registering global resource template %q: go-sdk AddResourceTemplate rejected its URI template: %v",
+				name, r)
+		}
+	}()
+	srv.AddResourceTemplate(grt, h)
+	return nil
+}
+
+// wireSubscribeHandlers installs the resource subscribe/unsubscribe handlers on
+// the go-sdk ServerOptions. WithSubscribeHandlers only sets both together
+// (go-sdk panics if exactly one of these is set), so they are wired as a pair
+// here; if either is unset this is a no-op. The default WithResourceCapabilities
+// is left untouched: advertising subscribe support is the consumer's opt-in.
+func (s *MCPServer) wireSubscribeHandlers(opts *gosdk.ServerOptions) {
+	if s.subscribeHandler == nil || s.unsubscribeHandler == nil {
+		return
+	}
+	subscribe, unsubscribe := s.subscribeHandler, s.unsubscribeHandler
+	opts.SubscribeHandler = func(ctx context.Context, req *gosdk.SubscribeRequest) error {
+		uri := ""
+		if req != nil && req.Params != nil {
+			uri = req.Params.URI
+		}
+		return subscribe(ctx, uri)
+	}
+	opts.UnsubscribeHandler = func(ctx context.Context, req *gosdk.UnsubscribeRequest) error {
+		uri := ""
+		if req != nil && req.Params != nil {
+			uri = req.Params.URI
+		}
+		return unsubscribe(ctx, uri)
+	}
+}
+
+// wrapCompletionHandler adapts the shim's CompletionHandlerFunc to go-sdk's
+// ServerOptions.CompletionHandler. It recovers handler panics (go-sdk runs
+// handlers on a detached goroutine with no recovery) and converts the go-sdk
+// request/result to and from the mcp-go-shaped completion types via JSON
+// round-trips. The session is already bridged into ctx by the dispatch
+// middleware, so no extra session plumbing is needed here.
+func (s *MCPServer) wrapCompletionHandler() func(context.Context, *gosdk.CompleteRequest) (*gosdk.CompleteResult, error) {
+	return func(ctx context.Context, req *gosdk.CompleteRequest) (res *gosdk.CompleteResult, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				res, err = nil, fmt.Errorf("panic recovered in completion handler: %v", r)
+			}
+		}()
+		mreq := mcp.CompleteRequest{}
+		if req != nil && req.Params != nil {
+			if err := jsonConvert(req.Params, &mreq.Params); err != nil {
+				return nil, fmt.Errorf("converting completion request: %w", err)
+			}
+		}
+		mres, err := s.completionHandler(ctx, mreq)
+		if err != nil {
+			return nil, err
+		}
+		out := &gosdk.CompleteResult{}
+		if err := jsonConvert(mres, out); err != nil {
+			return nil, fmt.Errorf("converting completion result: %w", err)
+		}
+		return out, nil
+	}
 }
 
 // addGlobalTool registers a globally-declared tool on a go-sdk server, recovering

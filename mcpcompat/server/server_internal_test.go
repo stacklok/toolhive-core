@@ -17,11 +17,12 @@ import (
 // Compile-time interface checks: the concrete session must satisfy the
 // per-session interfaces ToolHive relies on.
 var (
-	_ ClientSession          = (*clientSession)(nil)
-	_ SessionWithTools       = (*clientSession)(nil)
-	_ SessionWithResources   = (*clientSession)(nil)
-	_ SessionWithPrompts     = (*clientSession)(nil)
-	_ SessionWithElicitation = (*clientSession)(nil)
+	_ ClientSession                = (*clientSession)(nil)
+	_ SessionWithTools             = (*clientSession)(nil)
+	_ SessionWithResources         = (*clientSession)(nil)
+	_ SessionWithResourceTemplates = (*clientSession)(nil)
+	_ SessionWithPrompts           = (*clientSession)(nil)
+	_ SessionWithElicitation       = (*clientSession)(nil)
 )
 
 func TestClientSession_Store(t *testing.T) {
@@ -48,6 +49,17 @@ func TestClientSession_Store(t *testing.T) {
 		"file:///r": {Resource: mcp.Resource{URI: "file:///r"}},
 	})
 	assert.Contains(t, cs.GetSessionResources(), "file:///r")
+
+	cs.SetSessionResourceTemplates(map[string]ServerResourceTemplate{
+		"tmpl": {Template: mcp.ResourceTemplate{Name: "tmpl", URITemplate: "file:///{id}"}},
+	})
+	gotTemplates := cs.GetSessionResourceTemplates()
+	require.Contains(t, gotTemplates, "tmpl")
+
+	// GetSessionResourceTemplates must return a copy (mutating it must not affect
+	// the store).
+	gotTemplates["tmpl2"] = ServerResourceTemplate{}
+	assert.NotContains(t, cs.GetSessionResourceTemplates(), "tmpl2")
 
 	cs.SetSessionPrompts(map[string]ServerPrompt{
 		"p": {Prompt: mcp.Prompt{Name: "p"}},

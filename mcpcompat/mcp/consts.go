@@ -44,6 +44,9 @@ const (
 	// MethodElicitationCreate requests additional information from the user during interactions.
 	MethodElicitationCreate MCPMethod = "elicitation/create"
 
+	// MethodComplete requests argument-completion options from the server.
+	MethodComplete MCPMethod = "completion/complete"
+
 	// MethodListRoots requests roots list from the client during interactions.
 	MethodListRoots MCPMethod = "roots/list"
 
