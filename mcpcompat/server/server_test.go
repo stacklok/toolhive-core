@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -914,6 +915,140 @@ func TestCallUnknownTool_ErrorContainsToolName(t *testing.T) {
 		"unknown-tool error must name the requested tool, not the empty name")
 	assert.NotContains(t, err.Error(), `tool "" not found`,
 		"unknown-tool error must not carry the empty tool name")
+}
+
+// TestSessionPrompts_ListAndGet_EndToEnd is the regression anchor for
+// per-session prompts (SessionWithPrompts): a prompt injected onto a session via
+// the OnRegisterSession hook's SetSessionPrompts must be served by BOTH
+// prompts/list AND prompts/get. Before SessionWithPrompts existed, prompts/get
+// returned -32602 (InvalidParams) for a session-injected prompt because nothing
+// registered it onto the session's go-sdk server. This drives the whole
+// server->go-sdk->client path over Streamable HTTP and asserts the prompt is
+// listed, gettable (returning the handler's distinctive result), that a global
+// prompt is merged alongside it, and that a SECOND session whose hook injects
+// nothing does NOT see the per-session prompt (session isolation).
+func TestSessionPrompts_ListAndGet_EndToEnd(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	const (
+		sessionPromptName = "session-prompt"
+		globalPromptName  = "global-prompt"
+		promptReply       = "session prompt reply"
+	)
+
+	// injectPrompts controls whether the register hook installs the per-session
+	// prompt; the second client below flips it off to assert isolation.
+	var injectPrompts atomic.Bool
+	injectPrompts.Store(true)
+
+	hooks := &server.Hooks{}
+	hooks.AddOnRegisterSession(func(_ context.Context, s server.ClientSession) {
+		if !injectPrompts.Load() {
+			return
+		}
+		swp, ok := s.(server.SessionWithPrompts)
+		require.True(t, ok, "session must implement SessionWithPrompts")
+		swp.SetSessionPrompts(map[string]server.ServerPrompt{
+			sessionPromptName: {
+				Prompt: mcp.Prompt{Name: sessionPromptName, Description: "per-session prompt"},
+				Handler: func(_ context.Context, _ mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+					return &mcp.GetPromptResult{
+						Description: "per-session prompt",
+						Messages: []mcp.PromptMessage{
+							mcp.NewPromptMessage(mcp.RoleUser, mcp.NewTextContent(promptReply)),
+						},
+					}, nil
+				},
+			},
+		})
+	})
+
+	srv := server.NewMCPServer("prompt-server", testClientVersion,
+		server.WithPromptCapabilities(true),
+		server.WithHooks(hooks),
+	)
+	// A cheap global prompt to assert list returns global+session merged.
+	srv.AddPrompt(mcp.Prompt{Name: globalPromptName, Description: "global prompt"},
+		func(_ context.Context, _ mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{
+				Messages: []mcp.PromptMessage{
+					mcp.NewPromptMessage(mcp.RoleUser, mcp.NewTextContent("global reply")),
+				},
+			}, nil
+		})
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	c, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	initRes, err := c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, initRes.Capabilities.Prompts, "prompts capability must be advertised")
+
+	// prompts/list must return both the global and the session-injected prompt.
+	list, err := c.ListPrompts(ctx, mcp.ListPromptsRequest{})
+	require.NoError(t, err)
+	names := make([]string, 0, len(list.Prompts))
+	for _, p := range list.Prompts {
+		names = append(names, p.Name)
+	}
+	assert.Contains(t, names, sessionPromptName, "prompts/list must include the per-session prompt")
+	assert.Contains(t, names, globalPromptName, "prompts/list must include the global prompt")
+
+	// prompts/get on the session-injected prompt must succeed (NOT -32602) and
+	// return the handler's distinctive result.
+	got, err := c.GetPrompt(ctx, mcp.GetPromptRequest{
+		Params: mcp.GetPromptParams{Name: sessionPromptName},
+	})
+	require.NoError(t, err, "prompts/get on a session-injected prompt must succeed (regression: was -32602)")
+	require.Len(t, got.Messages, 1)
+	txt, ok := mcp.AsTextContent(got.Messages[0].Content)
+	require.True(t, ok)
+	assert.Equal(t, promptReply, txt.Text, "prompts/get must return the session prompt handler's result")
+
+	// Session isolation: a SECOND client whose hook injects nothing must not see
+	// the per-session prompt.
+	injectPrompts.Store(false)
+	c2, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c2.Start(ctx))
+	t.Cleanup(func() { _ = c2.Close() })
+
+	_, err = c2.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	list2, err := c2.ListPrompts(ctx, mcp.ListPromptsRequest{})
+	require.NoError(t, err)
+	names2 := make([]string, 0, len(list2.Prompts))
+	for _, p := range list2.Prompts {
+		names2 = append(names2, p.Name)
+	}
+	assert.NotContains(t, names2, sessionPromptName,
+		"a session without an injected prompt must not see another session's prompt")
+	assert.Contains(t, names2, globalPromptName, "the global prompt must still be visible to the second session")
+
+	// prompts/get for the un-injected per-session prompt must fail on the second
+	// session (the regression's original -32602 behavior is correct HERE).
+	_, err = c2.GetPrompt(ctx, mcp.GetPromptRequest{
+		Params: mcp.GetPromptParams{Name: sessionPromptName},
+	})
+	require.Error(t, err, "prompts/get for a prompt not injected on this session must fail")
 }
 
 // TestRequestElicitation_NoActiveSession is a fast unit-level test (no HTTP

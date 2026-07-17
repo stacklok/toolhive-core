@@ -16,12 +16,13 @@
 //
 // The global registration path (AddTool/AddResource/AddPrompt served over the
 // stdio and HTTP transports) is fully functional and tested. The per-session
-// interfaces (SessionWithTools, SessionWithResources, SessionWithElicitation,
-// SessionIdManager) and the Hooks type are implemented and wired: per-session
-// tool/resource overlays set via SetSessionTools/SetSessionResources are
-// reconciled onto the session's live go-sdk server (syncSessionTools/
-// syncSessionResources), and the before-list/before-call hooks fire ahead of
-// SDK dispatch so ToolHive's lazy per-session tool injection runs first.
+// interfaces (SessionWithTools, SessionWithResources, SessionWithPrompts,
+// SessionWithElicitation, SessionIdManager) and the Hooks type are implemented
+// and wired: per-session tool/resource/prompt overlays set via SetSessionTools/
+// SetSessionResources/SetSessionPrompts are reconciled onto the session's live
+// go-sdk server (syncSessionTools/syncSessionResources/syncSessionPrompts), and
+// the before-list/before-call hooks fire ahead of SDK dispatch so ToolHive's
+// lazy per-session tool injection runs first.
 // Cross-replica session rehydration (Validate-driven lazy eviction) and the
 // Streamable HTTP transports are functional. See the notes on SessionWithTools
 // for the live-overlay reconciliation details.
@@ -403,12 +404,13 @@ func (s *MCPServer) AddPrompt(prompt mcp.Prompt, handler PromptHandlerFunc) {
 // buildServer constructs a go-sdk Server from the globally-registered features
 // (AddTool/AddResource/AddPrompt).
 //
-// Per-session overlays (SessionWithTools/SessionWithResources) are NOT baked in
-// here: the streamable/SSE transports call this once per new client session (via
-// getServer) so each session gets its own go-sdk Server, and the registration
-// middleware installed by this function syncs that session's overlay tools and
-// resources onto its own server once the OnRegisterSession hooks have run. This
-// mirrors mcp-go, whose per-session tools were dispatched per connection.
+// Per-session overlays (SessionWithTools/SessionWithResources/
+// SessionWithPrompts) are NOT baked in here: the streamable/SSE transports call
+// this once per new client session (via getServer) so each session gets its own
+// go-sdk Server, and the registration middleware installed by this function
+// syncs that session's overlay tools, resources and prompts onto its own server
+// once the OnRegisterSession hooks have run. This mirrors mcp-go, whose
+// per-session tools were dispatched per connection.
 func (s *MCPServer) buildServer(genSessionID func() string) (*gosdk.Server, error) {
 	s.mu.RLock()
 	tools := make(map[string]ServerTool, len(s.tools))

@@ -20,6 +20,7 @@ var (
 	_ ClientSession          = (*clientSession)(nil)
 	_ SessionWithTools       = (*clientSession)(nil)
 	_ SessionWithResources   = (*clientSession)(nil)
+	_ SessionWithPrompts     = (*clientSession)(nil)
 	_ SessionWithElicitation = (*clientSession)(nil)
 )
 
@@ -47,6 +48,16 @@ func TestClientSession_Store(t *testing.T) {
 		"file:///r": {Resource: mcp.Resource{URI: "file:///r"}},
 	})
 	assert.Contains(t, cs.GetSessionResources(), "file:///r")
+
+	cs.SetSessionPrompts(map[string]ServerPrompt{
+		"p": {Prompt: mcp.Prompt{Name: "p"}},
+	})
+	gotPrompts := cs.GetSessionPrompts()
+	require.Contains(t, gotPrompts, "p")
+
+	// GetSessionPrompts must return a copy (mutating it must not affect the store).
+	gotPrompts["p2"] = ServerPrompt{}
+	assert.NotContains(t, cs.GetSessionPrompts(), "p2")
 }
 
 // TestForgetSession_ClosesNotifChannel verifies that forgetSession closes the
