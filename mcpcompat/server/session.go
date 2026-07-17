@@ -53,6 +53,15 @@ type SessionWithResources interface {
 	SetSessionResources(resources map[string]ServerResource)
 }
 
+// SessionWithPrompts is a ClientSession that carries per-session prompts.
+type SessionWithPrompts interface {
+	ClientSession
+	// GetSessionPrompts returns the session's prompts. Thread-safe.
+	GetSessionPrompts() map[string]ServerPrompt
+	// SetSessionPrompts sets the session's prompts. Thread-safe.
+	SetSessionPrompts(prompts map[string]ServerPrompt)
+}
+
 // SessionIdManager governs MCP session ID lifecycle. It mirrors mcp-go's
 // server.SessionIdManager so ToolHive's implementation can be supplied via
 // WithSessionIdManager.
@@ -81,20 +90,22 @@ type clientSession struct {
 	goSession  atomic.Pointer[gosdk.ServerSession]
 
 	// owner and boundServer are set when the session's go-sdk server is bound
-	// (at registration). They let SetSessionTools/SetSessionResources reconcile
-	// the per-session overlay onto the live go-sdk server at runtime.
+	// (at registration). They let SetSessionTools/SetSessionResources/
+	// SetSessionPrompts reconcile the per-session overlay onto the live go-sdk
+	// server at runtime.
 	//
 	// owner is an atomic.Pointer (not a plain field) because SetSessionTools/
-	// SetSessionResources may run from any goroutine (test code, before-hooks on
-	// a live request) concurrently with registerAndSync/bindRehydratedSession,
-	// which set owner on the session's connection goroutine. boundServer uses the
-	// same atomic pattern for the same reason.
+	// SetSessionResources/SetSessionPrompts may run from any goroutine (test
+	// code, before-hooks on a live request) concurrently with registerAndSync/
+	// bindRehydratedSession, which set owner on the session's connection
+	// goroutine. boundServer uses the same atomic pattern for the same reason.
 	owner       atomic.Pointer[MCPServer]
 	boundServer atomic.Pointer[gosdk.Server]
 
 	mu        sync.RWMutex
 	tools     map[string]ServerTool
 	resources map[string]ServerResource
+	prompts   map[string]ServerPrompt
 	// sdkToolNames tracks the tool names this session has added to its go-sdk
 	// server, so a later SetSessionTools can remove the ones that went away.
 	sdkToolNames map[string]struct{}
@@ -171,6 +182,30 @@ func (c *clientSession) SetSessionResources(resources map[string]ServerResource)
 	}
 }
 
+func (c *clientSession) GetSessionPrompts() map[string]ServerPrompt {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]ServerPrompt, len(c.prompts))
+	for k, v := range c.prompts {
+		out[k] = v
+	}
+	return out
+}
+
+func (c *clientSession) SetSessionPrompts(prompts map[string]ServerPrompt) {
+	c.mu.Lock()
+	c.prompts = make(map[string]ServerPrompt, len(prompts))
+	for k, v := range prompts {
+		c.prompts[k] = v
+	}
+	c.mu.Unlock()
+	if srv := c.boundServer.Load(); srv != nil {
+		if owner := c.owner.Load(); owner != nil {
+			owner.syncSessionPrompts(srv, c)
+		}
+	}
+}
+
 // sessionContextKey is the context key under which the ClientSession is stored.
 type sessionContextKey struct{}
 
@@ -197,7 +232,7 @@ func (s *MCPServer) sessionFor(id string) *clientSession {
 
 // registerAndSync registers the session for the given go-sdk ServerSession,
 // firing the OnRegisterSession hooks exactly once and then reconciling any
-// per-session tool/resource overlay the hooks installed onto srv (the go-sdk
+// per-session tool/resource/prompt overlay the hooks installed onto srv (the go-sdk
 // server bound to this session). It is invoked from the initialize dispatch
 // middleware (matching mcp-go's on-initialize timing) and, defensively, from the
 // InitializedHandler; the once-guard makes the second call a cheap no-op.
@@ -220,12 +255,13 @@ func (s *MCPServer) registerAndSync(ctx context.Context, ss *gosdk.ServerSession
 	if s.hooks != nil {
 		s.hooks.registerSession(ctx, cs)
 	}
-	// The hooks may have installed per-session tools/resources via
-	// SetSessionTools/SetSessionResources; those calls reconcile onto srv
-	// themselves now that boundServer is set. Sync once more here to cover any
-	// overlay set before the server was bound.
+	// The hooks may have installed per-session tools/resources/prompts via
+	// SetSessionTools/SetSessionResources/SetSessionPrompts; those calls
+	// reconcile onto srv themselves now that boundServer is set. Sync once more
+	// here to cover any overlay set before the server was bound.
 	s.syncSessionTools(srv, cs)
 	s.syncSessionResources(srv, cs)
+	s.syncSessionPrompts(srv, cs)
 }
 
 // syncSessionTools reconciles the session's tool overlay onto its go-sdk server:
@@ -308,6 +344,28 @@ func (s *MCPServer) syncSessionResources(srv *gosdk.Server, cs *clientSession) {
 	}
 }
 
+// syncSessionPrompts adds the session's prompt overlay onto its go-sdk server.
+// go-sdk serves both prompts/list and prompts/get from a prompt registered via
+// AddPrompt, so a per-session prompt injected here is enumerable AND gettable
+// without any shim-side dispatch. Prompts are add-only here (ToolHive sets them
+// once at registration). Unlike AddTool, go-sdk's AddPrompt performs no
+// schema/URI validation and cannot panic, so no recover wrapper is needed
+// (mirroring syncSessionResources rather than the tool path).
+func (s *MCPServer) syncSessionPrompts(srv *gosdk.Server, cs *clientSession) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	for name, sp := range cs.prompts {
+		gp := &gosdk.Prompt{}
+		if err := jsonConvert(sp.Prompt, gp); err != nil {
+			if s.logger != nil {
+				s.logger.Warn("skipping per-session prompt: conversion failed", "prompt", name, "error", err)
+			}
+			continue
+		}
+		srv.AddPrompt(gp, s.wrapPromptHandler(sp.Handler))
+	}
+}
+
 // isLocalSession reports whether the session ID was initialized on this server
 // instance (see MCPServer.localSessions).
 func (s *MCPServer) isLocalSession(id string) bool {
@@ -337,7 +395,8 @@ func (s *MCPServer) forgetSession(id string) {
 // two-phase creation), and cross-replica capability projection is driven by the
 // before-list/before-call hooks (ToolHive's lazy per-session tool injection),
 // not by OnRegisterSession. Binding owner+boundServer here lets those hooks'
-// SetSessionTools/SetSessionResources reconcile the overlay onto srv.
+// SetSessionTools/SetSessionResources/SetSessionPrompts reconcile the overlay
+// onto srv.
 func (s *MCPServer) bindRehydratedSession(id string, ss *gosdk.ServerSession, srv *gosdk.Server) {
 	cs := s.sessionFor(id)
 	cs.goSession.Store(ss)
