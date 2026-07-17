@@ -122,6 +122,70 @@ type EmbeddedResource struct {
 
 func (EmbeddedResource) isContent() {}
 
+// embeddedResourceJSON is a helper type for unmarshaling EmbeddedResource. It
+// mirrors EmbeddedResource but keeps the resource as a raw message so the
+// ResourceContents interface field can be decoded into a concrete type.
+type embeddedResourceJSON struct {
+	Annotated
+	Meta     *Meta           `json:"_meta,omitempty"`
+	Type     string          `json:"type"`
+	Resource json.RawMessage `json:"resource"`
+}
+
+// UnmarshalJSON implements custom JSON unmarshaling for EmbeddedResource.
+// The Resource field is a ResourceContents interface, which encoding/json
+// cannot populate directly. The nested resource object is decoded into the
+// concrete TextResourceContents or BlobResourceContents type based on the
+// presence of the "blob" (blob resource) or "text" (text resource) field,
+// mirroring the text/blob selection used elsewhere in the shim.
+func (er *EmbeddedResource) UnmarshalJSON(data []byte) error {
+	var raw embeddedResourceJSON
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	er.Annotated = raw.Annotated
+	er.Meta = raw.Meta
+	er.Type = raw.Type
+
+	// An absent or JSON-null resource leaves Resource nil.
+	if len(raw.Resource) == 0 || string(raw.Resource) == "null" {
+		er.Resource = nil
+		return nil
+	}
+
+	resource, err := unmarshalResourceContents(raw.Resource)
+	if err != nil {
+		return fmt.Errorf("unmarshaling embedded resource contents: %w", err)
+	}
+	er.Resource = resource
+	return nil
+}
+
+// unmarshalResourceContents decodes a single JSON resource-contents object into
+// the concrete ResourceContents implementation. A blob resource carries a
+// "blob" field; a text resource carries "text". This mirrors the text/blob
+// selection performed by the client shim's convertReadResourceResult.
+func unmarshalResourceContents(data []byte) (ResourceContents, error) {
+	var probe struct {
+		Blob *string `json:"blob"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return nil, err
+	}
+	if probe.Blob != nil {
+		var blob BlobResourceContents
+		if err := json.Unmarshal(data, &blob); err != nil {
+			return nil, err
+		}
+		return blob, nil
+	}
+	var text TextResourceContents
+	if err := json.Unmarshal(data, &text); err != nil {
+		return nil, err
+	}
+	return text, nil
+}
+
 // ToolUseContent represents a request from the assistant to call a tool within a sampling message.
 // It must have Type set to "tool_use".
 type ToolUseContent struct {
