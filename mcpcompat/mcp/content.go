@@ -122,6 +122,56 @@ type EmbeddedResource struct {
 
 func (EmbeddedResource) isContent() {}
 
+// embeddedResourceJSON is a helper for unmarshaling EmbeddedResource, whose
+// Resource field is the ResourceContents interface and cannot be populated by
+// a generic JSON round-trip.
+type embeddedResourceJSON struct {
+	Annotated
+	Meta     *Meta           `json:"_meta,omitempty"`
+	Type     string          `json:"type"`
+	Resource json.RawMessage `json:"resource"`
+}
+
+// UnmarshalJSON decodes an embedded resource, resolving the polymorphic
+// Resource field to a concrete TextResourceContents or BlobResourceContents.
+// Without this, stdlib cannot unmarshal into the ResourceContents interface and
+// any "type":"resource" content item errors, aborting the whole result decode.
+func (e *EmbeddedResource) UnmarshalJSON(data []byte) error {
+	var raw embeddedResourceJSON
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	e.Annotated = raw.Annotated
+	e.Meta = raw.Meta
+	e.Type = raw.Type
+
+	if len(raw.Resource) == 0 {
+		return nil
+	}
+	// Peek to decide text vs blob. A non-empty "blob" field means blob contents;
+	// otherwise treat as text (mirrors the client's convertReadResourceResult).
+	var probe struct {
+		Blob string `json:"blob"`
+	}
+	if err := json.Unmarshal(raw.Resource, &probe); err != nil {
+		return err
+	}
+	if probe.Blob != "" {
+		var blob BlobResourceContents
+		if err := json.Unmarshal(raw.Resource, &blob); err != nil {
+			return err
+		}
+		e.Resource = blob
+		return nil
+	}
+	var text TextResourceContents
+	if err := json.Unmarshal(raw.Resource, &text); err != nil {
+		return err
+	}
+	e.Resource = text
+	return nil
+}
+
 // ToolUseContent represents a request from the assistant to call a tool within a sampling message.
 // It must have Type set to "tool_use".
 type ToolUseContent struct {
