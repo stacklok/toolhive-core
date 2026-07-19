@@ -53,6 +53,18 @@ type SessionWithResources interface {
 	SetSessionResources(resources map[string]ServerResource)
 }
 
+// SessionWithResourceTemplates is a ClientSession that carries per-session
+// resource templates. ToolHive's vMCP layer uses this to project a per-session
+// set of resource templates (resources/templates/list) whose URIs are served
+// by the template handler on resources/read.
+type SessionWithResourceTemplates interface {
+	ClientSession
+	// GetSessionResourceTemplates returns the session's resource templates. Thread-safe.
+	GetSessionResourceTemplates() map[string]ServerResourceTemplate
+	// SetSessionResourceTemplates sets the session's resource templates. Thread-safe.
+	SetSessionResourceTemplates(templates map[string]ServerResourceTemplate)
+}
+
 // SessionWithPrompts is a ClientSession that carries per-session prompts.
 type SessionWithPrompts interface {
 	ClientSession
@@ -102,10 +114,11 @@ type clientSession struct {
 	owner       atomic.Pointer[MCPServer]
 	boundServer atomic.Pointer[gosdk.Server]
 
-	mu        sync.RWMutex
-	tools     map[string]ServerTool
-	resources map[string]ServerResource
-	prompts   map[string]ServerPrompt
+	mu                sync.RWMutex
+	tools             map[string]ServerTool
+	resources         map[string]ServerResource
+	resourceTemplates map[string]ServerResourceTemplate
+	prompts           map[string]ServerPrompt
 	// sdkToolNames tracks the tool names this session has added to its go-sdk
 	// server, so a later SetSessionTools can remove the ones that went away.
 	sdkToolNames map[string]struct{}
@@ -178,6 +191,30 @@ func (c *clientSession) SetSessionResources(resources map[string]ServerResource)
 	if srv := c.boundServer.Load(); srv != nil {
 		if owner := c.owner.Load(); owner != nil {
 			owner.syncSessionResources(srv, c)
+		}
+	}
+}
+
+func (c *clientSession) GetSessionResourceTemplates() map[string]ServerResourceTemplate {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]ServerResourceTemplate, len(c.resourceTemplates))
+	for k, v := range c.resourceTemplates {
+		out[k] = v
+	}
+	return out
+}
+
+func (c *clientSession) SetSessionResourceTemplates(templates map[string]ServerResourceTemplate) {
+	c.mu.Lock()
+	c.resourceTemplates = make(map[string]ServerResourceTemplate, len(templates))
+	for k, v := range templates {
+		c.resourceTemplates[k] = v
+	}
+	c.mu.Unlock()
+	if srv := c.boundServer.Load(); srv != nil {
+		if owner := c.owner.Load(); owner != nil {
+			owner.syncSessionResourceTemplates(srv, c)
 		}
 	}
 }
@@ -261,6 +298,7 @@ func (s *MCPServer) registerAndSync(ctx context.Context, ss *gosdk.ServerSession
 	// here to cover any overlay set before the server was bound.
 	s.syncSessionTools(srv, cs)
 	s.syncSessionResources(srv, cs)
+	s.syncSessionResourceTemplates(srv, cs)
 	s.syncSessionPrompts(srv, cs)
 }
 
@@ -342,6 +380,56 @@ func (s *MCPServer) syncSessionResources(srv *gosdk.Server, cs *clientSession) {
 		}
 		srv.AddResource(gr, s.wrapResourceHandler(sr.Handler))
 	}
+}
+
+// syncSessionResourceTemplates adds the session's resource-template overlay onto
+// its go-sdk server. Templates are add-only here (ToolHive sets them once at
+// registration), mirroring syncSessionResources. Unlike AddResource, go-sdk's
+// AddResourceTemplate parses the URI template and PANICS if it is invalid or not
+// absolute; this path can run on the live session goroutine, so each template is
+// registered via addSessionResourceTemplate, which recovers such a panic, logs
+// it, and skips the offending template so one bad template does not take down
+// the session.
+func (s *MCPServer) syncSessionResourceTemplates(srv *gosdk.Server, cs *clientSession) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	for name, srt := range cs.resourceTemplates {
+		grt := &gosdk.ResourceTemplate{}
+		if err := jsonConvert(srt.Template, grt); err != nil {
+			if s.logger != nil {
+				s.logger.Warn("skipping per-session resource template: conversion failed",
+					"template", name, "error", err)
+			}
+			continue
+		}
+		if !s.addSessionResourceTemplate(srv, grt, ResourceHandlerFunc(srt.Handler)) {
+			if s.logger != nil {
+				s.logger.Warn("skipping per-session resource template: AddResourceTemplate rejected its URI template",
+					"template", name)
+			}
+		}
+	}
+}
+
+// addSessionResourceTemplate registers a resource template on a per-session
+// go-sdk server, recovering the panic go-sdk's AddResourceTemplate raises when
+// the URI template is invalid or not absolute. It returns false (and logs) when
+// the template could not be registered, so the caller skips it rather than
+// crashing the session. Mirrors addSessionTool.
+func (s *MCPServer) addSessionResourceTemplate(
+	srv *gosdk.Server, grt *gosdk.ResourceTemplate, h ResourceHandlerFunc,
+) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if s.logger != nil {
+				s.logger.Error("per-session AddResourceTemplate panicked; skipping template",
+					"template", grt.Name, "panic", r)
+			}
+			ok = false
+		}
+	}()
+	srv.AddResourceTemplate(grt, s.wrapResourceHandler(h))
+	return true
 }
 
 // syncSessionPrompts adds the session's prompt overlay onto its go-sdk server.
