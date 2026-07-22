@@ -69,6 +69,7 @@ task license-fix   # Add missing license headers
 | Package | Purpose |
 |---------|---------|
 | `cel` | Generic CEL expression compilation and evaluation (Alpha) |
+| `config` | Embeddable `BaseConfig` (service name, log level) + strict YAML loader; consumers embed and extend with their own fields (Alpha) |
 | `env` | Environment variable abstraction with `Reader` interface for testable code |
 | `httperr` | Wrap errors with HTTP status codes; use `WithCode()`, `Code()`, `New()` |
 | `logging` | Pre-configured `*slog.Logger` factory with consistent ToolHive defaults (Alpha) |
