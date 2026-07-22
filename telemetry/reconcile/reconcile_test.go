@@ -71,9 +71,9 @@ func TestInstrumentNamesAndLabels(t *testing.T) {
 		unit string
 		keys []string
 	}{
-		"stacklok.operator.reconcile.duration":          {"s", []string{"component", "name", "namespace", "outcome"}},
-		"stacklok.operator.reconcile.errors":            {"{error}", []string{"component", "name", "namespace", "phase"}},
-		"stacklok.operator.reconcile.managed_resources": {"{resource}", []string{"component", "kind", "name", "namespace"}},
+		"stacklok.operator.reconcile.duration":          {"s", []string{LabelComponent, LabelName, LabelNamespace, LabelOutcome}},
+		"stacklok.operator.reconcile.errors":            {"{error}", []string{LabelComponent, LabelName, LabelNamespace, LabelPhase}},
+		"stacklok.operator.reconcile.managed_resources": {"{resource}", []string{LabelComponent, LabelKind, LabelName, LabelNamespace}},
 	}
 
 	for name, exp := range want {
