@@ -5,6 +5,10 @@
     "helpers:pinGitHubActionDigests",
     ":semanticCommitsDisabled"
   ],
-  "labels": ["dependencies"],
+  "labels": ["dependencies", "automerge"],
+  "minimumReleaseAge": "0",
+  "automerge": true,
+  "automergeType": "pr",
+  "platformAutomerge": true,
   "postUpdateOptions": ["gomodTidy"]
 }
