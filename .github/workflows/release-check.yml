@@ -1,0 +1,272 @@
+# SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Daily Release Check
+#
+# Opens or updates EXACTLY ONE release PR for the commits merged to main since
+# the last tag, then classifies it:
+#
+#   - dependency-only: every merged PR since the last tag was authored by an
+#     automation identity (Renovate / the approver bot) AND carries the
+#     `dependencies` label. Gets the `automerge` label and GitHub auto-merge, so
+#     it merges once required checks are green (the approver app clears review).
+#
+#   - functional: any merged PR is human-authored or unlabeled. Gets the
+#     `needs-human` label, no auto-merge, and the PR body lists which PRs tipped
+#     it to functional.
+#
+# Fail-safe: if classification is uncertain (e.g. commits exist since the tag but
+# no merged PRs can be listed), it is treated as functional. Never auto-release
+# when in doubt.
+#
+# Idempotent: reuses the single open release PR if one exists (never stacks), and
+# only creates a new one via releaseo when none is open. Auto-releases always use
+# a `patch` bump; minor/major stay behind create-release-pr.yml.
+
+name: Daily Release Check
+
+on:
+  schedule:
+    # 06:17 UTC daily. toolhive-core is the head of the dependency cascade, so it
+    # runs early; downstream repos stagger later. Off-zero minute on purpose.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  release-check:
+    name: Release Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate release app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Ensure classification labels exist
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh label create automerge   --color 0e8a16 --description "Approver app may clear review; auto-merges on green CI" 2>/dev/null || true
+          gh label create needs-human  --color d93f0b --description "Requires human review before merge" 2>/dev/null || true
+          gh label create dependencies --color ededed --description "Dependency updates" 2>/dev/null || true
+
+      - name: Analyze unreleased commits and classify
+        id: analyze
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          # Logins (as reported by `gh ... --json author`) treated as automation.
+          # Renovate is `app/renovate`. Append the approver/release bot login here
+          # if it ever authors dependency PRs.
+          AUTOMATION_LOGINS: "app/renovate renovate[bot]"
+        run: |
+          set -euo pipefail
+
+          LAST_TAG=$(git tag --list 'v*' --sort=-creatordate | head -1)
+          if [ -z "$LAST_TAG" ]; then
+            echo "No existing tag found; cannot establish a baseline. Treating as functional."
+            LAST_TAG=""
+          fi
+
+          if [ -n "$LAST_TAG" ]; then
+            BOUNDARY_EPOCH=$(git log -1 --format=%ct "$LAST_TAG")
+            SINCE_DATE=$(git log -1 --format=%cI "$LAST_TAG" | cut -dT -f1)
+            COMMITS=$(git rev-list --count "${LAST_TAG}..HEAD")
+          else
+            BOUNDARY_EPOCH=0
+            SINCE_DATE="1970-01-01"
+            COMMITS=$(git rev-list --count HEAD)
+          fi
+          echo "last_tag=${LAST_TAG:-<none>} commits_since=$COMMITS boundary_epoch=$BOUNDARY_EPOCH"
+
+          if [ "$COMMITS" -eq 0 ]; then
+            echo "No unreleased commits since ${LAST_TAG}. Nothing to do."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # List PRs merged into main on/after the tag date, then filter precisely
+          # by merge timestamp. Querying merged PRs (not commit messages) is robust
+          # to squash vs merge-commit strategies.
+          gh pr list --repo "$REPO" --state merged \
+            --search "base:main merged:>=$SINCE_DATE" \
+            --limit 200 \
+            --json number,title,author,labels,mergedAt > prs.json
+
+          CLASS_JSON=$(jq -c \
+            --argjson boundary "$BOUNDARY_EPOCH" \
+            --arg autos "$AUTOMATION_LOGINS" '
+            ($autos | split(" ")) as $auto
+            | [ .[] | select((.mergedAt | fromdateiso8601) > $boundary) ] as $rel
+            | if ($rel | length) == 0 then
+                { total: 0, functional: true,
+                  bad: ["(commits exist since the last tag but no merged PRs were found; treating as functional)"] }
+              else
+                [ $rel[]
+                  | select(
+                      ( ([.author.login] | inside($auto)) and
+                        ([.labels[].name] | index("dependencies") != null)
+                      ) | not
+                    )
+                  | "- #\(.number) \(.title) (@\(.author.login))"
+                ] as $bad
+                | { total: ($rel | length), functional: ($bad | length > 0), bad: $bad }
+              end
+            ' prs.json)
+
+          echo "classification json: $CLASS_JSON"
+          FUNCTIONAL=$(echo "$CLASS_JSON" | jq -r '.functional')
+          TOTAL=$(echo "$CLASS_JSON" | jq -r '.total')
+
+          if [ "$FUNCTIONAL" = "true" ]; then
+            CLASSIFICATION="functional"
+          else
+            CLASSIFICATION="dependency-only"
+          fi
+
+          # Write the "why functional" list for the PR body.
+          echo "$CLASS_JSON" | jq -r '.bad[]' > functional_reasons.txt || true
+
+          # Target version = patch bump of the current VERSION file.
+          CURRENT=$(tr -d '[:space:]v' < VERSION)
+          IFS='.' read -r x y z <<< "$CURRENT"
+          TARGET="${x}.${y}.$((z+1))"
+
+          # Find the single open release PR, if any (idempotency: never stack).
+          gh pr list --repo "$REPO" --state open \
+            --json number,headRefName \
+            --jq '[.[] | select(.headRefName | startswith("release/"))] | sort_by(.number)' > open_release_prs.json
+          EXISTING=$(jq -r '.[0].number // empty' open_release_prs.json)
+          OPEN_COUNT=$(jq 'length' open_release_prs.json)
+          if [ "$OPEN_COUNT" -gt 1 ]; then
+            echo "::warning::Found $OPEN_COUNT open release PRs. Reusing the lowest-numbered (#$EXISTING); close the extras manually."
+          fi
+
+          {
+            echo "proceed=true"
+            echo "classification=$CLASSIFICATION"
+            echo "target_version=$TARGET"
+            echo "existing_pr=$EXISTING"
+            echo "merged_pr_total=$TOTAL"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Classification: $CLASSIFICATION (target v$TARGET, existing PR: ${EXISTING:-none})"
+
+      # Only when we will create a fresh PR: clear a stale release branch left by
+      # a previous failed run so releaseo doesn't hit "Reference already exists".
+      - name: Clean up stale release branch
+        if: steps.analyze.outputs.proceed == 'true' && steps.analyze.outputs.existing_pr == ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          BRANCH="release/v${{ steps.analyze.outputs.target_version }}"
+          echo "Deleting stale branch $BRANCH if it exists (no open PR uses it)..."
+          gh api -X DELETE "/repos/${{ github.repository }}/git/refs/heads/${BRANCH}" 2>/dev/null || true
+
+      - name: Create release PR (patch)
+        id: create
+        if: steps.analyze.outputs.proceed == 'true' && steps.analyze.outputs.existing_pr == ''
+        uses: stacklok/releaseo@80e8d8131d41cf8763254d02360f2c5ce9b7c0df # v0.0.4
+        with:
+          releaseo_version: v0.0.4
+          bump_type: patch
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Apply classification, labels and auto-merge
+        if: steps.analyze.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          CLASSIFICATION: ${{ steps.analyze.outputs.classification }}
+          TARGET: ${{ steps.analyze.outputs.target_version }}
+          EXISTING_PR: ${{ steps.analyze.outputs.existing_pr }}
+          CREATED_PR: ${{ steps.create.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          PR="${EXISTING_PR:-$CREATED_PR}"
+          if [ -z "$PR" ]; then
+            echo "::error::No release PR number resolved; cannot apply classification."
+            exit 1
+          fi
+          echo "Applying '$CLASSIFICATION' to PR #$PR (v$TARGET)"
+
+          # Rebuild the release-check-managed block in the PR body, preserving the
+          # rest of the body (releaseo's checklist) across runs.
+          MARK_START="<!-- release-check:start -->"
+          MARK_END="<!-- release-check:end -->"
+          CUR=$(gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""')
+          # Drop any prior release-check block, then trim trailing blank lines so
+          # the block doesn't drift down the body on repeated daily runs.
+          printf '%s' "$CUR" | awk -v s="$MARK_START" -v e="$MARK_END" '
+            $0==s {skip=1; next}
+            $0==e {skip=0; next}
+            skip==0 {print}
+          ' | awk '{ a[NR]=$0 } NF { last=NR } END { for (i=1; i<=last; i++) print a[i] }' > body.clean
+
+          {
+            cat body.clean
+            echo ""
+            echo "$MARK_START"
+            if [ "$CLASSIFICATION" = "dependency-only" ]; then
+              echo "## Release classification: dependency-only"
+              echo ""
+              echo "Every PR merged since the last tag is an automated dependency update."
+              echo "Labeled \`automerge\`; GitHub auto-merge is enabled and it will merge once"
+              echo "the required status checks are green and the approver app has approved."
+            else
+              echo "## Release classification: needs human review"
+              echo ""
+              echo "This release is **not** dependency-only, so it will not auto-merge."
+              echo "A maintainer needs to review and merge it."
+              echo ""
+              echo "PRs that made this a functional release:"
+              echo ""
+              if [ -s functional_reasons.txt ]; then
+                cat functional_reasons.txt
+              else
+                echo "- (unable to enumerate; see workflow logs)"
+              fi
+            fi
+            echo "$MARK_END"
+          } > body.new
+
+          gh pr edit "$PR" --repo "$REPO" --body-file body.new
+
+          if [ "$CLASSIFICATION" = "dependency-only" ]; then
+            gh pr edit "$PR" --repo "$REPO" --add-label automerge --remove-label needs-human
+            # Enable GitHub-native auto-merge (squash). Required status checks +
+            # the approver app's review gate the actual merge.
+            gh pr merge "$PR" --repo "$REPO" --auto --squash
+          else
+            gh pr edit "$PR" --repo "$REPO" --add-label needs-human --remove-label automerge
+            # Belt and suspenders: make sure auto-merge is not left enabled.
+            gh pr merge "$PR" --repo "$REPO" --disable-auto 2>/dev/null || true
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Daily Release Check"
+            echo ""
+            if [ "${{ steps.analyze.outputs.proceed }}" != "true" ]; then
+              echo "No unreleased commits. No release PR needed."
+            else
+              echo "- **Classification**: ${{ steps.analyze.outputs.classification }}"
+              echo "- **Target version**: v${{ steps.analyze.outputs.target_version }}"
+              echo "- **Merged PRs since last tag**: ${{ steps.analyze.outputs.merged_pr_total }}"
+              echo "- **Reused existing PR**: ${{ steps.analyze.outputs.existing_pr || 'no (created new)' }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

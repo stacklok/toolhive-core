@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Create Release PR workflow using releaseo
+#
+# Manually cuts a release PR that bumps ONLY the VERSION file. toolhive-core
+# ships no Helm chart, so unlike toolhive there are no chart/values/helm-docs
+# steps here.
+#
+# Auto-releases (the daily release-check job) always use a `patch` bump. Use
+# this workflow for the `minor`/`major` bumps that must stay behind a human.
+#
+# Usage: Actions tab -> "Create Release PR" -> Run workflow, or
+#   gh workflow run create-release-pr.yml -f bump_type=minor
+
+name: Create Release PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    name: Create Release PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate release app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Remove a stale release branch left by a previous failed run, so releaseo
+      # doesn't fail with "Reference already exists" when it recreates the branch.
+      # Only deletes when the branch exists with no open PR.
+      - name: Clean up stale release branch from previous failed run
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BUMP_TYPE: ${{ inputs.bump_type }}
+        run: |
+          CURRENT=$(tr -d '[:space:]v' < VERSION)
+          IFS='.' read -r x y z <<< "$CURRENT"
+          case "$BUMP_TYPE" in
+            patch) z=$((z+1));;
+            minor) y=$((y+1)); z=0;;
+            major) x=$((x+1)); y=0; z=0;;
+            *) echo "Unknown bump type: $BUMP_TYPE"; exit 1;;
+          esac
+          NEW_VERSION="${x}.${y}.${z}"
+          BRANCH="release/v${NEW_VERSION}"
+          OPEN_PR=$(gh pr list --head "$BRANCH" --state open --json number -q 'length' 2>/dev/null || echo "0")
+          if [ "$OPEN_PR" = "0" ] || [ -z "$OPEN_PR" ]; then
+            echo "Deleting stale branch $BRANCH if it exists (from previous failed run)..."
+            gh api -X DELETE "/repos/${{ github.repository }}/git/refs/heads/${BRANCH}" 2>/dev/null || true
+          else
+            echo "Branch $BRANCH has an open PR - skipping cleanup. Close or merge the existing PR first."
+            exit 1
+          fi
+
+      - name: Create Release PR
+        id: release
+        uses: stacklok/releaseo@80e8d8131d41cf8763254d02360f2c5ce9b7c0df # v0.0.4
+        with:
+          releaseo_version: v0.0.4
+          bump_type: ${{ inputs.bump_type }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Summary
+        run: |
+          {
+            echo "## Release PR Created"
+            echo ""
+            echo "- **Version**: ${{ steps.release.outputs.version }}"
+            echo "- **PR**: #${{ steps.release.outputs.pr_number }}"
+            echo "- **URL**: ${{ steps.release.outputs.pr_url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
