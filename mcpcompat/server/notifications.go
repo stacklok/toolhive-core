@@ -5,9 +5,72 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	gosdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// ErrUnsupportedNotification is returned by SendNotificationToClient for a
+// notification method the shim cannot map onto a typed go-sdk sender (the
+// go-sdk exposes no generic notification sender; only the well-known
+// progress/message methods are supported). It lets callers distinguish an
+// unsupported method from a session/transport error.
+var ErrUnsupportedNotification = errors.New("unsupported notification method")
+
+// SendNotificationToClient sends a single server-initiated notification to the
+// client bound to the session in ctx (the session a tool/prompt/resource
+// handler is running under). It is the per-session counterpart to
+// SendNotificationToAllClients and mirrors mcp-go's
+// server.MCPServer.SendNotificationToClient, which ToolHive's vMCP layer uses
+// to forward a backend's mid-call progress/logging notifications to the
+// downstream client on the same session.
+//
+// It returns ErrNoActiveSession when ctx carries no session (e.g. a
+// non-session context), a descriptive error when the session has no bound
+// go-sdk session yet, and ErrUnsupportedNotification for a method the shim
+// cannot map. Callers that forward best-effort (e.g. a relay) can treat a
+// no-session error as a no-op.
+//
+// go-sdk backing and the same limitation as the broadcast variant: only the
+// well-known MCP notification methods map onto go-sdk's typed senders:
+//
+//   - notifications/progress -> ServerSession.NotifyProgress
+//   - notifications/message  -> ServerSession.Log (delivered only once the
+//     client has set a logging level, per the go-sdk/spec behavior)
+//
+// Any other method returns ErrUnsupportedNotification rather than being
+// silently dropped, so a caller can decide how to handle it.
+func (*MCPServer) SendNotificationToClient(ctx context.Context, method string, params map[string]any) error {
+	session := ClientSessionFromContext(ctx)
+	if session == nil {
+		return ErrNoActiveSession
+	}
+	cs, ok := session.(*clientSession)
+	if !ok {
+		return fmt.Errorf("session %q does not support server-initiated notifications", session.SessionID())
+	}
+	ss := cs.goSession.Load()
+	if ss == nil {
+		return fmt.Errorf("session %q has no bound go-sdk session", session.SessionID())
+	}
+	switch method {
+	case "notifications/progress":
+		var p gosdk.ProgressNotificationParams
+		if err := jsonConvert(params, &p); err != nil {
+			return fmt.Errorf("converting %s params: %w", method, err)
+		}
+		return ss.NotifyProgress(ctx, &p)
+	case "notifications/message":
+		var p gosdk.LoggingMessageParams
+		if err := jsonConvert(params, &p); err != nil {
+			return fmt.Errorf("converting %s params: %w", method, err)
+		}
+		return ss.Log(ctx, &p)
+	default:
+		return fmt.Errorf("%w: %q", ErrUnsupportedNotification, method)
+	}
+}
 
 // SendNotificationToAllClients broadcasts a server-initiated notification with
 // the given method and params to every currently connected client session. It

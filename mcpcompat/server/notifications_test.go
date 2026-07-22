@@ -26,7 +26,7 @@ func TestSendNotificationToAllClients_NoSessions(t *testing.T) {
 	t.Parallel()
 	srv := server.NewMCPServer("notify-server", "1.0.0")
 	assert.NotPanics(t, func() {
-		srv.SendNotificationToAllClients("notifications/message", map[string]any{"data": "hi"})
+		srv.SendNotificationToAllClients(methodMessage, map[string]any{fieldData: "hi"})
 	})
 }
 
@@ -91,12 +91,12 @@ func TestSendNotificationToAllClients_Broadcast(t *testing.T) {
 		got = append(got, r)
 		mu.Unlock()
 		switch n.Method {
-		case "notifications/progress":
+		case methodProgress:
 			select {
 			case progChan <- r:
 			default:
 			}
-		case "notifications/message":
+		case methodMessage:
 			select {
 			case logChan <- r:
 			default:
@@ -107,10 +107,10 @@ func TestSendNotificationToAllClients_Broadcast(t *testing.T) {
 	// Each of these maps onto a different branch of the dispatcher; none should
 	// panic even though some are dropped (list-changed, unknown).
 	assert.NotPanics(t, func() {
-		srv.SendNotificationToAllClients("notifications/progress",
-			map[string]any{"progressToken": "t", "progress": 0.5})
-		srv.SendNotificationToAllClients("notifications/message",
-			map[string]any{"level": "info", "data": "hello"})
+		srv.SendNotificationToAllClients(methodProgress,
+			map[string]any{fieldProgressToken: "t", fieldProgress: 0.5})
+		srv.SendNotificationToAllClients(methodMessage,
+			map[string]any{"level": "info", fieldData: "hello"})
 		srv.SendNotificationToAllClients("notifications/tools/list_changed", nil)
 		srv.SendNotificationToAllClients("some/unknown/method", map[string]any{"x": 1})
 	})
@@ -118,18 +118,18 @@ func TestSendNotificationToAllClients_Broadcast(t *testing.T) {
 	// Confirm the progress notification actually arrived with its params.
 	select {
 	case p := <-progChan:
-		assert.Equal(t, "notifications/progress", p.method)
-		assert.Equal(t, "t", p.params.AdditionalFields["progressToken"])
-		assert.InDelta(t, 0.5, p.params.AdditionalFields["progress"], 1e-9)
+		assert.Equal(t, methodProgress, p.method)
+		assert.Equal(t, "t", p.params.AdditionalFields[fieldProgressToken])
+		assert.InDelta(t, 0.5, p.params.AdditionalFields[fieldProgress], 1e-9)
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for notifications/progress broadcast")
 	}
 	// Confirm the message notification actually arrived with its params.
 	select {
 	case l := <-logChan:
-		assert.Equal(t, "notifications/message", l.method)
+		assert.Equal(t, methodMessage, l.method)
 		assert.Equal(t, "info", l.params.AdditionalFields["level"])
-		assert.Equal(t, "hello", l.params.AdditionalFields["data"])
+		assert.Equal(t, "hello", l.params.AdditionalFields[fieldData])
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for notifications/message broadcast")
 	}

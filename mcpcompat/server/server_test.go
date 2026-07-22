@@ -12,9 +12,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	gosdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -914,6 +916,391 @@ func TestCallUnknownTool_ErrorContainsToolName(t *testing.T) {
 		"unknown-tool error must name the requested tool, not the empty name")
 	assert.NotContains(t, err.Error(), `tool "" not found`,
 		"unknown-tool error must not carry the empty tool name")
+}
+
+// TestSessionPrompts_ListAndGet_EndToEnd is the regression anchor for
+// per-session prompts (SessionWithPrompts): a prompt injected onto a session via
+// the OnRegisterSession hook's SetSessionPrompts must be served by BOTH
+// prompts/list AND prompts/get. Before SessionWithPrompts existed, prompts/get
+// returned -32602 (InvalidParams) for a session-injected prompt because nothing
+// registered it onto the session's go-sdk server. This drives the whole
+// server->go-sdk->client path over Streamable HTTP and asserts the prompt is
+// listed, gettable (returning the handler's distinctive result), that a global
+// prompt is merged alongside it, and that a SECOND session whose hook injects
+// nothing does NOT see the per-session prompt (session isolation).
+func TestSessionPrompts_ListAndGet_EndToEnd(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	const (
+		sessionPromptName = "session-prompt"
+		globalPromptName  = "global-prompt"
+		promptReply       = "session prompt reply"
+	)
+
+	// injectPrompts controls whether the register hook installs the per-session
+	// prompt; the second client below flips it off to assert isolation.
+	var injectPrompts atomic.Bool
+	injectPrompts.Store(true)
+
+	hooks := &server.Hooks{}
+	hooks.AddOnRegisterSession(func(_ context.Context, s server.ClientSession) {
+		if !injectPrompts.Load() {
+			return
+		}
+		swp, ok := s.(server.SessionWithPrompts)
+		require.True(t, ok, "session must implement SessionWithPrompts")
+		swp.SetSessionPrompts(map[string]server.ServerPrompt{
+			sessionPromptName: {
+				Prompt: mcp.Prompt{Name: sessionPromptName, Description: "per-session prompt"},
+				Handler: func(_ context.Context, _ mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+					return &mcp.GetPromptResult{
+						Description: "per-session prompt",
+						Messages: []mcp.PromptMessage{
+							mcp.NewPromptMessage(mcp.RoleUser, mcp.NewTextContent(promptReply)),
+						},
+					}, nil
+				},
+			},
+		})
+	})
+
+	srv := server.NewMCPServer("prompt-server", testClientVersion,
+		server.WithPromptCapabilities(true),
+		server.WithHooks(hooks),
+	)
+	// A cheap global prompt to assert list returns global+session merged.
+	srv.AddPrompt(mcp.Prompt{Name: globalPromptName, Description: "global prompt"},
+		func(_ context.Context, _ mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{
+				Messages: []mcp.PromptMessage{
+					mcp.NewPromptMessage(mcp.RoleUser, mcp.NewTextContent("global reply")),
+				},
+			}, nil
+		})
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	c, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	initRes, err := c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, initRes.Capabilities.Prompts, "prompts capability must be advertised")
+
+	// prompts/list must return both the global and the session-injected prompt.
+	list, err := c.ListPrompts(ctx, mcp.ListPromptsRequest{})
+	require.NoError(t, err)
+	names := make([]string, 0, len(list.Prompts))
+	for _, p := range list.Prompts {
+		names = append(names, p.Name)
+	}
+	assert.Contains(t, names, sessionPromptName, "prompts/list must include the per-session prompt")
+	assert.Contains(t, names, globalPromptName, "prompts/list must include the global prompt")
+
+	// prompts/get on the session-injected prompt must succeed (NOT -32602) and
+	// return the handler's distinctive result.
+	got, err := c.GetPrompt(ctx, mcp.GetPromptRequest{
+		Params: mcp.GetPromptParams{Name: sessionPromptName},
+	})
+	require.NoError(t, err, "prompts/get on a session-injected prompt must succeed (regression: was -32602)")
+	require.Len(t, got.Messages, 1)
+	txt, ok := mcp.AsTextContent(got.Messages[0].Content)
+	require.True(t, ok)
+	assert.Equal(t, promptReply, txt.Text, "prompts/get must return the session prompt handler's result")
+
+	// Session isolation: a SECOND client whose hook injects nothing must not see
+	// the per-session prompt.
+	injectPrompts.Store(false)
+	c2, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c2.Start(ctx))
+	t.Cleanup(func() { _ = c2.Close() })
+
+	_, err = c2.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	list2, err := c2.ListPrompts(ctx, mcp.ListPromptsRequest{})
+	require.NoError(t, err)
+	names2 := make([]string, 0, len(list2.Prompts))
+	for _, p := range list2.Prompts {
+		names2 = append(names2, p.Name)
+	}
+	assert.NotContains(t, names2, sessionPromptName,
+		"a session without an injected prompt must not see another session's prompt")
+	assert.Contains(t, names2, globalPromptName, "the global prompt must still be visible to the second session")
+
+	// prompts/get for the un-injected per-session prompt must fail on the second
+	// session (the regression's original -32602 behavior is correct HERE).
+	_, err = c2.GetPrompt(ctx, mcp.GetPromptRequest{
+		Params: mcp.GetPromptParams{Name: sessionPromptName},
+	})
+	require.Error(t, err, "prompts/get for a prompt not injected on this session must fail")
+}
+
+// TestSessionResourceTemplates_ListAndRead_EndToEnd is the regression anchor for
+// per-session resource templates (SessionWithResourceTemplates): a template
+// injected onto a session via the OnRegisterSession hook's
+// SetSessionResourceTemplates must be enumerable via resources/templates/list
+// AND a resources/read of a URI matching the template must route to the
+// template's handler and return its contents. It also asserts that a SECOND
+// session whose hook injects nothing does NOT see the per-session template
+// (session isolation).
+func TestSessionResourceTemplates_ListAndRead_EndToEnd(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	const (
+		templateName = "user-template"
+		uriTemplate  = "file:///users/{id}"
+		readURI      = "file:///users/42"
+		bodyText     = "template body for 42"
+	)
+
+	// injectTemplate controls whether the register hook installs the per-session
+	// template; the second client below flips it off to assert isolation.
+	var injectTemplate atomic.Bool
+	injectTemplate.Store(true)
+
+	hooks := &server.Hooks{}
+	hooks.AddOnRegisterSession(func(_ context.Context, s server.ClientSession) {
+		if !injectTemplate.Load() {
+			return
+		}
+		swrt, ok := s.(server.SessionWithResourceTemplates)
+		require.True(t, ok, "session must implement SessionWithResourceTemplates")
+		swrt.SetSessionResourceTemplates(map[string]server.ServerResourceTemplate{
+			templateName: {
+				Template: mcp.ResourceTemplate{Name: templateName, URITemplate: uriTemplate},
+				Handler: func(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+					return []mcp.ResourceContents{
+						mcp.TextResourceContents{URI: req.Params.URI, Text: bodyText},
+					}, nil
+				},
+			},
+		})
+	})
+
+	srv := server.NewMCPServer("rt-server", testClientVersion,
+		server.WithResourceCapabilities(true, true),
+		server.WithHooks(hooks),
+	)
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	c, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	// resources/templates/list must include the per-session template.
+	list, err := c.ListResourceTemplates(ctx, mcp.ListResourceTemplatesRequest{})
+	require.NoError(t, err)
+	tmplNames := make([]string, 0, len(list.ResourceTemplates))
+	for _, rt := range list.ResourceTemplates {
+		tmplNames = append(tmplNames, rt.Name)
+	}
+	assert.Contains(t, tmplNames, templateName,
+		"resources/templates/list must include the per-session template")
+
+	// resources/read of a URI matching the template must route to the template
+	// handler and return its contents.
+	read, err := c.ReadResource(ctx, mcp.ReadResourceRequest{
+		Params: mcp.ReadResourceParams{URI: readURI},
+	})
+	require.NoError(t, err, "resources/read of a template-matching URI must succeed")
+	require.Len(t, read.Contents, 1)
+	tc, ok := read.Contents[0].(mcp.TextResourceContents)
+	require.True(t, ok, "template read must return text contents")
+	assert.Equal(t, bodyText, tc.Text, "resources/read must return the template handler's contents")
+	assert.Equal(t, readURI, tc.URI, "template read must echo the requested URI")
+
+	// Session isolation: a SECOND client whose hook injects nothing must not see
+	// the per-session template.
+	injectTemplate.Store(false)
+	c2, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c2.Start(ctx))
+	t.Cleanup(func() { _ = c2.Close() })
+
+	_, err = c2.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	list2, err := c2.ListResourceTemplates(ctx, mcp.ListResourceTemplatesRequest{})
+	require.NoError(t, err)
+	tmplNames2 := make([]string, 0, len(list2.ResourceTemplates))
+	for _, rt := range list2.ResourceTemplates {
+		tmplNames2 = append(tmplNames2, rt.Name)
+	}
+	assert.NotContains(t, tmplNames2, templateName,
+		"a session without an injected template must not see another session's template")
+
+	// resources/read of the template URI must fail on the second session (nothing
+	// registered it there).
+	_, err = c2.ReadResource(ctx, mcp.ReadResourceRequest{
+		Params: mcp.ReadResourceParams{URI: readURI},
+	})
+	require.Error(t, err, "resources/read must fail on a session without the template")
+}
+
+// TestCompletion_EndToEnd verifies WithCompletionHandler end-to-end: a server
+// built with a completion handler that returns fixed values for a given prompt
+// reference must (1) advertise the completions capability at initialize and (2)
+// answer the client's Complete call with those values. Without
+// WithCompletionHandler go-sdk advertises no completions capability and rejects
+// completion/complete with -32601 (method not found).
+func TestCompletion_EndToEnd(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	const (
+		promptName = "greet"
+		argName    = "name"
+	)
+	wantValues := []string{"opt-a", "opt-b", "opt-c"}
+
+	srv := server.NewMCPServer("completion-server", testClientVersion,
+		server.WithPromptCapabilities(true),
+		server.WithCompletionHandler(
+			func(_ context.Context, req mcp.CompleteRequest) (*mcp.CompleteResult, error) {
+				// The ref arrives as a decoded map (Ref is typed as any). Only
+				// answer for the expected prompt ref; otherwise return nothing.
+				ref, _ := req.Params.Ref.(map[string]any)
+				if ref["type"] != "ref/prompt" || ref["name"] != promptName {
+					return &mcp.CompleteResult{}, nil
+				}
+				return &mcp.CompleteResult{
+					Completion: mcp.CompletionResultDetails{
+						Values: wantValues,
+						Total:  len(wantValues),
+					},
+				}, nil
+			}),
+	)
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	c, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	initRes, err := c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, initRes.Capabilities.Completions,
+		"completions capability must be advertised when WithCompletionHandler is set")
+
+	res, err := c.Complete(ctx, mcp.CompleteRequest{
+		Params: mcp.CompleteParams{
+			Ref:      mcp.PromptReference{Type: "ref/prompt", Name: promptName},
+			Argument: mcp.CompleteArgument{Name: argName, Value: "a"},
+		},
+	})
+	require.NoError(t, err, "completion/complete must succeed (regression: -32601 without WithCompletionHandler)")
+	assert.Equal(t, wantValues, res.Completion.Values,
+		"Complete must return the completion handler's values")
+}
+
+// TestSubscribe_EndToEnd verifies WithSubscribeHandlers end-to-end: a server
+// built with subscribe/unsubscribe handlers (recording invocations) and
+// WithResourceCapabilities(true, ...) must (1) advertise subscribe support at
+// initialize and (2) invoke both handlers when a client drives
+// resources/subscribe and resources/unsubscribe. The shim client has no
+// Subscribe/Unsubscribe methods (ToolHive does not use them), so this drives the
+// two requests through a raw go-sdk client session directly against the shim
+// server. Without WithSubscribeHandlers go-sdk rejects resources/subscribe with
+// -32601 and the handlers never fire.
+func TestSubscribe_EndToEnd(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	const subURI = "file:///watched"
+
+	var (
+		mu            sync.Mutex
+		subscribedURI string
+		unsubURI      string
+	)
+	subscribe := func(_ context.Context, uri string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		subscribedURI = uri
+		return nil
+	}
+	unsubscribe := func(_ context.Context, uri string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		unsubURI = uri
+		return nil
+	}
+
+	srv := server.NewMCPServer("subscribe-server", testClientVersion,
+		server.WithResourceCapabilities(true, true),
+		server.WithSubscribeHandlers(subscribe, unsubscribe),
+	)
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	// Drive subscribe/unsubscribe through a raw go-sdk client session (the shim
+	// client exposes no Subscribe/Unsubscribe methods).
+	gc := gosdk.NewClient(&gosdk.Implementation{Name: testClientName, Version: testClientVersion}, nil)
+	sess, err := gc.Connect(ctx, &gosdk.StreamableClientTransport{Endpoint: ts.URL}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sess.Close() })
+
+	// The subscribe capability must be advertised at initialize.
+	initRes := sess.InitializeResult()
+	require.NotNil(t, initRes.Capabilities.Resources, "resources capability must be advertised")
+	assert.True(t, initRes.Capabilities.Resources.Subscribe,
+		"subscribe support must be advertised when WithResourceCapabilities(true, ...) is set")
+
+	require.NoError(t, sess.Subscribe(ctx, &gosdk.SubscribeParams{URI: subURI}),
+		"resources/subscribe must succeed (regression: -32601 without WithSubscribeHandlers)")
+	require.NoError(t, sess.Unsubscribe(ctx, &gosdk.UnsubscribeParams{URI: subURI}),
+		"resources/unsubscribe must succeed")
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, subURI, subscribedURI, "the subscribe handler must be invoked with the requested URI")
+	assert.Equal(t, subURI, unsubURI, "the unsubscribe handler must be invoked with the requested URI")
 }
 
 // TestRequestElicitation_NoActiveSession is a fast unit-level test (no HTTP

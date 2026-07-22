@@ -57,6 +57,12 @@ type Client struct {
 	// server->client elicitation/create requests. It mirrors mcp-go's
 	// client.WithElicitationHandler.
 	elicitationHandler ElicitationHandler
+
+	// samplingHandler, when set, is wired into the go-sdk ClientOptions so the
+	// client declares the sampling capability at initialize and answers
+	// server->client sampling/createMessage requests. It mirrors mcp-go's
+	// client.WithSamplingHandler.
+	samplingHandler SamplingHandler
 }
 
 // ElicitationHandler handles server->client elicitation/create requests. It
@@ -73,6 +79,26 @@ type ElicitationHandlerFunc func(ctx context.Context, request mcp.ElicitationReq
 
 // Elicit calls f(ctx, request).
 func (f ElicitationHandlerFunc) Elicit(ctx context.Context, request mcp.ElicitationRequest) (*mcp.ElicitationResult, error) {
+	return f(ctx, request)
+}
+
+// SamplingHandler handles server->client sampling/createMessage requests. It
+// mirrors mcp-go's client.SamplingHandler.
+type SamplingHandler interface {
+	CreateMessage(ctx context.Context, request mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error)
+}
+
+// SamplingHandlerFunc is an adapter to allow the use of ordinary functions as
+// sampling handlers. It is a shim convenience adapter not present in mcp-go
+// (mcp-go's client.WithSamplingHandler accepts a SamplingHandler interface),
+// kept here so the shim's SamplingHandler interface and the func form compose,
+// mirroring ElicitationHandlerFunc.
+type SamplingHandlerFunc func(ctx context.Context, request mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error)
+
+// CreateMessage calls f(ctx, request).
+func (f SamplingHandlerFunc) CreateMessage(
+	ctx context.Context, request mcp.CreateMessageRequest,
+) (*mcp.CreateMessageResult, error) {
 	return f(ctx, request)
 }
 
@@ -104,6 +130,28 @@ type ClientOption func(*Client)
 // It mirrors mcp-go's client.WithElicitationHandler.
 func WithElicitationHandler(h ElicitationHandler) ClientOption {
 	return func(c *Client) { c.elicitationHandler = h }
+}
+
+// WithSamplingHandler installs a handler for server->client
+// sampling/createMessage requests. The handler must be registered before
+// Initialize so it is wired into the underlying go-sdk client, which (a)
+// auto-declares the sampling capability at initialize time so the server's
+// CreateMessage calls pass the go-sdk capability gate, and (b) dispatches
+// incoming sampling/createMessage requests to the handler.
+//
+// Like elicitation, sampling under the Streamable HTTP transport requires the
+// client to hold an open standalone SSE stream: the shim server replies with
+// application/json (JSONResponse is on by design), so the go-sdk routes a
+// server->client sampling request made during request handling to the
+// standalone SSE stream rather than the POST response. Configure the client
+// with transport.WithContinuousListening() to open that stream; without it
+// (DisableStandaloneSSE defaults to true) sampling cannot be delivered and the
+// server's CreateMessage call is rejected. See WithElicitationHandler and the
+// build() doc comment in mcpcompat/server/transports.go.
+//
+// It mirrors mcp-go's client.WithSamplingHandler.
+func WithSamplingHandler(h SamplingHandler) ClientOption {
+	return func(c *Client) { c.samplingHandler = h }
 }
 
 // applyClientOptions applies the client-level options to c.
@@ -187,6 +235,7 @@ func (c *Client) Initialize(ctx context.Context, request mcp.InitializeRequest) 
 	}
 	c.installNotificationHandlers(opts)
 	c.installElicitationHandler(opts)
+	c.installSamplingHandler(opts)
 
 	gc := gosdk.NewClient(impl, opts)
 
@@ -503,6 +552,38 @@ func (c *Client) ListResourceTemplates(
 	return convertResult[mcp.ListResourceTemplatesResult](res)
 }
 
+// Complete requests argument-completion options from the server
+// (completion/complete). It mirrors mcp-go's client.Client.Complete: the caller
+// supplies the completion reference (a PromptReference or ResourceReference),
+// the argument being completed, and optional resolved context; the server
+// responds with candidate values.
+//
+// The go-sdk exposes completion via ClientSession.Complete(ctx,
+// *gosdk.CompleteParams); request.Params is converted to that shape via a JSON
+// round-trip (the mcp-go-shaped Ref/Argument/Context fields encode the identical
+// MCP wire format, and go-sdk's CompleteReference has a custom unmarshaler that
+// accepts the ref/prompt and ref/resource shapes).
+func (c *Client) Complete(ctx context.Context, request mcp.CompleteRequest) (*mcp.CompleteResult, error) {
+	ctx = withErrCapture(ctx)
+	if c.isResume() {
+		out := &mcp.CompleteResult{}
+		return out, c.resumeCall(ctx, "completion/complete", request.Params, out)
+	}
+	s, err := c.sessionFor()
+	if err != nil {
+		return nil, err
+	}
+	params := &gosdk.CompleteParams{}
+	if err := jsonConvert(request.Params, params); err != nil {
+		return nil, fmt.Errorf("converting completion request: %w", err)
+	}
+	res, err := s.Complete(ctx, params)
+	if err != nil {
+		return nil, mapCallError(ctx, err)
+	}
+	return convertResult[mcp.CompleteResult](res)
+}
+
 // OnNotification registers a handler invoked for server-initiated notifications.
 // Handlers must be registered before Initialize so they can be wired into the
 // underlying go-sdk client. The go-sdk exposes typed notification handlers
@@ -649,6 +730,45 @@ func (c *Client) installElicitationHandler(opts *gosdk.ClientOptions) {
 		out := &gosdk.ElicitResult{}
 		if err := jsonConvert(res, out); err != nil {
 			return nil, fmt.Errorf("converting elicitation result: %w", err)
+		}
+		return out, nil
+	}
+}
+
+// installSamplingHandler wires the user-supplied SamplingHandler (set via
+// WithSamplingHandler) onto the go-sdk ClientOptions. The go-sdk auto-declares
+// the sampling capability when CreateMessageHandler is non-nil (see
+// Client.capabilities), so the server's CreateMessage calls pass the capability
+// gate; incoming sampling/createMessage requests are dispatched to the handler.
+//
+// The go-sdk handler receives a *gosdk.CreateMessageRequest and must return a
+// *gosdk.CreateMessageResult. The shim converts between the go-sdk and
+// mcp-go-shaped sampling types via JSON round-trips (both encode the identical
+// MCP wire format), so a handler registered against the mcp-go
+// CreateMessageRequest/CreateMessageResult types works unchanged.
+func (c *Client) installSamplingHandler(opts *gosdk.ClientOptions) {
+	if c.samplingHandler == nil {
+		return
+	}
+	opts.CreateMessageHandler = func(
+		ctx context.Context, req *gosdk.CreateMessageRequest,
+	) (*gosdk.CreateMessageResult, error) {
+		mreq := mcp.CreateMessageRequest{}
+		if req != nil {
+			// Reconstruct the mcp-go-shaped request from the go-sdk params. A JSON
+			// round-trip maps them onto mcp-go's CreateMessageParams (messages,
+			// modelPreferences, systemPrompt, maxTokens, ...).
+			if err := jsonConvert(req.Params, &mreq.CreateMessageParams); err != nil {
+				return nil, fmt.Errorf("converting sampling request: %w", err)
+			}
+		}
+		res, err := c.samplingHandler.CreateMessage(ctx, mreq)
+		if err != nil {
+			return nil, err
+		}
+		out := &gosdk.CreateMessageResult{}
+		if err := jsonConvert(res, out); err != nil {
+			return nil, fmt.Errorf("converting sampling result: %w", err)
 		}
 		return out, nil
 	}
