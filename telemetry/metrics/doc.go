@@ -2,12 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /*
-Package metrics provides shared histogram bucket presets and label-key
-constants for OpenTelemetry metrics across the ToolHive ecosystem.
+Package metrics provides shared histogram bucket presets, label-key
+constants, and emitter-ownership vocabulary for OpenTelemetry metrics across
+the ToolHive ecosystem.
 
-This package provides construction helpers only. Importing it registers no
-instruments and emits no metrics; consumers (the ToolHive proxy, vMCP, and the
-registry) use it to build their own instruments consistently.
+This package is construction helpers and vocabulary only: importing it
+installs no global providers and emits no metrics of its own. The one
+exception is RegisterBuildInfo, which registers an observable gauge on the
+meter the caller passes in — see "Build Info" below; it still constructs no
+meter or provider itself. Consumers (the ToolHive proxy, vMCP, and the
+registry) use the rest of this package to build their own instruments
+consistently.
 
 # Bucket Presets
 
@@ -37,6 +42,22 @@ This package exports only canonical common keys: concepts more than one
 component emits and that a cross-component dashboard joins or groups on.
 Component-local keys used by a single emitter are not exported here; they
 are defined by that component.
+
+# Emitter Ownership
+
+AttrStacklokComponent and AttrStacklokProduct are resource attributes (RFC
+§3.3, D8), not metric labels: a component sets them once on its OTel resource,
+and the Prometheus exporter promotes them to per-series labels via
+WithResourceAsConstantLabels. ProductStacklokPlatform is the frozen value
+every component stamps; the Component* constants are the known roster of
+stacklok.component values.
+
+# Build Info
+
+RegisterBuildInfo registers the fleet-wide stacklok.build_info observable
+gauge on a caller-provided meter, for release correlation across components:
+
+	err := metrics.RegisterBuildInfo(meter, metrics.ComponentToolhive, version, commit)
 
 # Stability
 

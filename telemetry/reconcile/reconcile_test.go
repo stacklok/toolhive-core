@@ -6,6 +6,7 @@ package reconcile
 import (
 	"context"
 	"sort"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -98,6 +99,108 @@ func TestInstrumentNamesAndLabels(t *testing.T) {
 	require.Len(t, gauge.DataPoints, 1)
 	assert.Equal(t, int64(3), gauge.DataPoints[0].Value)
 	assert.Equal(t, "configmap", attrValue(gauge.DataPoints[0].Attributes, "kind"))
+}
+
+// TestRecordReconcileErrorExtraAttributes confirms a caller-supplied extra
+// attribute actually reaches the errors counter's data point, alongside the
+// four standard labels.
+func TestRecordReconcileErrorExtraAttributes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(ctx) })
+	meter := mp.Meter("test-extra-attrs")
+
+	e, err := New(meter, "operator")
+	require.NoError(t, err)
+
+	e.RecordReconcileError(ctx, "ns1", "obj1", "compile", attribute.String("provider", "openai"))
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &rm))
+
+	var sum metricdata.Sum[int64]
+	for _, m := range rm.ScopeMetrics[0].Metrics {
+		if m.Name == "stacklok.operator.reconcile.errors" {
+			sum = m.Data.(metricdata.Sum[int64])
+		}
+	}
+	require.Len(t, sum.DataPoints, 1)
+	var keys []string
+	for _, kv := range sum.DataPoints[0].Attributes.ToSlice() {
+		keys = append(keys, string(kv.Key))
+	}
+	assert.ElementsMatch(t,
+		[]string{LabelComponent, LabelNamespace, LabelName, LabelPhase, "provider"},
+		keys,
+		"extra attribute must appear alongside the four standard labels",
+	)
+	assert.Equal(t, "openai", attrValue(sum.DataPoints[0].Attributes, "provider"))
+}
+
+// TestEmitterConcurrentRecording exercises RecordReconcile and
+// RecordReconcileError from many goroutines under -race, backing the
+// Emitter doc comment's concurrent-use claim with an explicit test rather
+// than relying solely on the OTel SDK's own documented thread-safety.
+func TestEmitterConcurrentRecording(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(sdkmetric.NewManualReader()))
+	t.Cleanup(func() { _ = mp.Shutdown(ctx) })
+	meter := mp.Meter("test-concurrent")
+
+	e, err := New(meter, "operator")
+	require.NoError(t, err)
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			e.RecordReconcile(ctx, "ns1", "obj1", "success", 0.1)
+			e.RecordReconcileError(ctx, "ns1", "obj1", "compile")
+		}()
+	}
+	wg.Wait()
+}
+
+func TestRegisterManagedResourcesRejectsSecondCall(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(ctx) })
+	meter := mp.Meter("test-duplicate-registration")
+
+	e, err := New(meter, "operator")
+	require.NoError(t, err)
+
+	observe := func(context.Context) []ManagedResource {
+		return []ManagedResource{{Namespace: "ns1", Name: "obj1", Kind: "configmap", Count: 1}}
+	}
+
+	reg, err := e.RegisterManagedResources(meter, observe)
+	require.NoError(t, err, "first registration succeeds")
+	t.Cleanup(func() { _ = reg.Unregister() })
+
+	_, err = e.RegisterManagedResources(meter, observe)
+	assert.Error(t, err, "second registration on the same Emitter must be rejected")
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &rm))
+	for _, m := range rm.ScopeMetrics[0].Metrics {
+		if m.Name != "stacklok.operator.reconcile.managed_resources" {
+			continue
+		}
+		gauge, ok := m.Data.(metricdata.Gauge[int64])
+		require.True(t, ok)
+		assert.Len(t, gauge.DataPoints, 1, "only one callback must be observing, not two")
+	}
 }
 
 // firstDataPointKeys returns the attribute keys on the first data point of m,

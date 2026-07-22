@@ -16,9 +16,12 @@ import (
 // verbatim by every component.
 const BuildInfoMetricName = "stacklok.build_info"
 
+// unknownBuildInfoValue is the fallback for an empty version or commit.
+const unknownBuildInfoValue = "unknown"
+
 // RegisterBuildInfo registers the stacklok.build_info observable gauge on the
 // given meter. The gauge always observes 1; the identity rides its labels
-// (component, version, commit). Empty version/commit fall back to "unknown".
+// (component, version, commit). Empty version/commit fall back to unknownBuildInfoValue.
 //
 // The component label uses the bare "component" key, not the dotted
 // stacklok.component resource attribute (AttrStacklokComponent), so it does not
@@ -29,14 +32,21 @@ const BuildInfoMetricName = "stacklok.build_info"
 // the caller supplies the meter (typically otel.Meter(scope) after installing
 // its provider). It registers no global state of its own.
 func RegisterBuildInfo(meter metric.Meter, component, version, commit string) error {
+	if meter == nil {
+		return fmt.Errorf("metrics: meter must not be nil")
+	}
+	if component == "" {
+		return fmt.Errorf("metrics: component must not be empty")
+	}
 	if version == "" {
-		version = "unknown"
+		version = unknownBuildInfoValue
 	}
 	if commit == "" {
-		commit = "unknown"
+		commit = unknownBuildInfoValue
 	}
 
 	_, err := meter.Int64ObservableGauge(BuildInfoMetricName,
+		metric.WithUnit("1"),
 		metric.WithDescription("Build information; always 1, identity carried on labels."),
 		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
 			o.Observe(1, metric.WithAttributes(

@@ -75,7 +75,8 @@ task license-fix   # Add missing license headers
 | `mcpcompat/mcp` | Drop-in shim for `mark3labs/mcp-go/mcp` data types; re-exports via aliases, backed by go-sdk elsewhere (Alpha) |
 | `mcpcompat/client` | Drop-in shim for `mark3labs/mcp-go/client` (+ `client/transport`) reimplemented on the official go-sdk (Alpha) |
 | `mcpcompat/server` | Drop-in shim for `mark3labs/mcp-go/server` reimplemented on the official go-sdk (Alpha) |
-| `metrics` | Shared OTel histogram bucket presets and label-key constants (Alpha) |
+| `telemetry/metrics` | Shared OTel histogram bucket presets, label-key constants, and emitter-ownership vocabulary (Alpha) |
+| `telemetry/reconcile` | Unified operator reconcile metric emitter (Alpha) |
 | `oci/artifact` | Artifact-agnostic OCI tar/gzip/extraction/platform primitives shared by oci/skills and oci/plugins (Alpha) |
 | `oci/skills` | OCI artifact types, media types, and registry operations for ToolHive skills (Alpha) |
 | `oci/plugins` | OCI artifact types, media types, and registry operations for ToolHive plugins (Alpha) |

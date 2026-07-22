@@ -23,6 +23,12 @@
 //     unit "{resource}", labels component/namespace/name/kind. Its samples
 //     come from a caller callback registered via RegisterManagedResources.
 //
+// The name/namespace labels carry the reconciled object's identity, which is
+// a deliberate, bounded exception to the per-request cardinality policy (RFC
+// §3.3): unlike a per-request metric, a reconcile sample is emitted once per
+// object per reconcile, and the number of managed custom resources in a
+// cluster is orders of magnitude below per-request cardinality.
+//
 // # Stability
 //
 // This package is Alpha stability. The API may change without notice.
@@ -31,6 +37,7 @@ package reconcile
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -68,13 +75,19 @@ const (
 )
 
 // Emitter records the unified operator reconcile metrics for one component.
-// Build it once per operator with New and share it across reconciles; its
-// methods are safe for concurrent use (the underlying OTel instruments are).
+// Build it once per operator with New and share it across reconciles.
+// RecordReconcile and RecordReconcileError are safe for concurrent use (the
+// underlying OTel instruments are). RegisterManagedResources is a one-time
+// setup call, not intended for repeated or concurrent invocation; see its
+// doc comment.
 type Emitter struct {
 	component        string
 	reconcileDur     metric.Float64Histogram
 	reconcileErrors  metric.Int64Counter
 	managedResources metric.Int64ObservableGauge
+
+	managedResourcesOnce sync.Once
+	managedResourcesErr  error
 }
 
 // New constructs the reconcile triplet on meter and returns an Emitter that
@@ -138,9 +151,12 @@ func (e *Emitter) RecordReconcile(ctx context.Context, namespace, name, outcome 
 }
 
 // RecordReconcileError increments the per-phase reconcile error counter for
-// the given object and phase. extra lets a caller attach bounded
+// the given object and phase. extra lets a caller attach additional
 // disambiguating attributes (e.g. a provider name) without a schema change;
-// pass none for the common case.
+// pass none for the common case. Per the cardinality policy (RFC §3.3), extra
+// attributes must come from a bounded, closed set of values (e.g. a fixed
+// provider enum) — never an unbounded or per-request value such as an error
+// message, a resource ID, or a user identifier.
 func (e *Emitter) RecordReconcileError(
 	ctx context.Context, namespace, name, phase string, extra ...attribute.KeyValue,
 ) {
@@ -167,26 +183,45 @@ type ManagedResource struct {
 // RegisterManagedResources wires an observable-gauge callback that emits one
 // series per ManagedResource returned by observe on each collection cycle. It
 // returns the registration so the caller can Unregister it on shutdown. observe
-// is invoked by the OTel SDK; it must not block. The component label is stamped
-// automatically.
+// is invoked by the OTel SDK; it must not block, and it must be safe for
+// concurrent, reentrant invocation, per the OTel callback contract. The
+// component label is stamped automatically.
+//
+// RegisterManagedResources may be called at most once per Emitter; a second
+// call returns an error rather than silently registering a duplicate callback
+// against the same gauge, which would double-count observations.
 func (e *Emitter) RegisterManagedResources(
 	meter metric.Meter, observe func(context.Context) []ManagedResource,
 ) (metric.Registration, error) {
 	if observe == nil {
 		return nil, fmt.Errorf("reconcile: observe callback must not be nil")
 	}
-	return meter.RegisterCallback(
-		func(ctx context.Context, obs metric.Observer) error {
-			for _, r := range observe(ctx) {
-				obs.ObserveInt64(e.managedResources, r.Count, metric.WithAttributes(
-					attribute.String(LabelComponent, e.component),
-					attribute.String(LabelNamespace, r.Namespace),
-					attribute.String(LabelName, r.Name),
-					attribute.String(LabelKind, r.Kind),
-				))
-			}
-			return nil
-		},
-		e.managedResources,
+
+	var (
+		reg    metric.Registration
+		regErr error
 	)
+	registered := false
+	e.managedResourcesOnce.Do(func() {
+		registered = true
+		reg, regErr = meter.RegisterCallback(
+			func(ctx context.Context, obs metric.Observer) error {
+				for _, r := range observe(ctx) {
+					obs.ObserveInt64(e.managedResources, r.Count, metric.WithAttributes(
+						attribute.String(LabelComponent, e.component),
+						attribute.String(LabelNamespace, r.Namespace),
+						attribute.String(LabelName, r.Name),
+						attribute.String(LabelKind, r.Kind),
+					))
+				}
+				return nil
+			},
+			e.managedResources,
+		)
+		e.managedResourcesErr = regErr
+	})
+	if !registered {
+		return nil, fmt.Errorf("reconcile: managed-resources callback already registered")
+	}
+	return reg, e.managedResourcesErr
 }

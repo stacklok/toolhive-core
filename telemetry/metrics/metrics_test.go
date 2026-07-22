@@ -4,10 +4,13 @@
 package metrics
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 func TestBucketPresets(t *testing.T) {
@@ -114,7 +117,11 @@ func TestOwnershipAttrs(t *testing.T) {
 	}
 	seen := make(map[string]bool, len(roster))
 	for _, c := range roster {
-		assert.NotContains(t, c.got, "gateway.", "%s must not contain the banned unqualified 'gateway'", c.name)
+		// D3 bans the unqualified word "gateway" as a component value on its
+		// own; a qualified compound like "ai_gateway" or "connector_gateway"
+		// is the RFC-sanctioned form (RFC §3.1 glossary), so only the exact,
+		// bare value is rejected here.
+		assert.NotEqual(t, "gateway", c.got, "%s must not be the banned unqualified 'gateway' value", c.name)
 		assert.False(t, seen[c.got], "duplicate component value: %q", c.got)
 		seen[c.got] = true
 	}
@@ -125,4 +132,76 @@ func TestBuildInfoMetricName(t *testing.T) {
 	t.Parallel()
 
 	assert.Equal(t, "stacklok.build_info", BuildInfoMetricName)
+}
+
+func TestRegisterBuildInfoValidation(t *testing.T) {
+	t.Parallel()
+
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(sdkmetric.NewManualReader()))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	meter := mp.Meter("test")
+
+	assert.Error(t, RegisterBuildInfo(nil, "toolhive", "1.0.0", "abc123"), "nil meter rejected")
+	assert.Error(t, RegisterBuildInfo(meter, "", "1.0.0", "abc123"), "empty component rejected")
+	assert.NoError(t, RegisterBuildInfo(meter, "toolhive", "1.0.0", "abc123"), "valid registration")
+}
+
+// TestRegisterBuildInfo pins the observed gauge value, unit, and label set by
+// scraping a real manual reader, and confirms empty version/commit fall back
+// to "unknown".
+func TestRegisterBuildInfo(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		component   string
+		version     string
+		commit      string
+		wantVersion string
+		wantCommit  string
+	}{
+		{"full values", "toolhive", "1.2.3", "deadbeef", "1.2.3", "deadbeef"},
+		{"empty version and commit fall back to unknown", "toolhive", "", "", unknownBuildInfoValue, unknownBuildInfoValue},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			t.Cleanup(func() { _ = mp.Shutdown(ctx) })
+			meter := mp.Meter("test-build-info")
+
+			require.NoError(t, RegisterBuildInfo(meter, tc.component, tc.version, tc.commit))
+
+			var rm metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(ctx, &rm))
+			require.Len(t, rm.ScopeMetrics, 1)
+			require.Len(t, rm.ScopeMetrics[0].Metrics, 1)
+
+			m := rm.ScopeMetrics[0].Metrics[0]
+			assert.Equal(t, BuildInfoMetricName, m.Name)
+			assert.Equal(t, "1", m.Unit)
+
+			gauge, ok := m.Data.(metricdata.Gauge[int64])
+			require.True(t, ok, "build_info must be an Int64ObservableGauge")
+			require.Len(t, gauge.DataPoints, 1)
+			dp := gauge.DataPoints[0]
+			assert.Equal(t, int64(1), dp.Value, "build_info always observes 1")
+
+			component, ok := dp.Attributes.Value("component")
+			require.True(t, ok)
+			assert.Equal(t, tc.component, component.AsString())
+
+			version, ok := dp.Attributes.Value("version")
+			require.True(t, ok)
+			assert.Equal(t, tc.wantVersion, version.AsString())
+
+			commit, ok := dp.Attributes.Value("commit")
+			require.True(t, ok)
+			assert.Equal(t, tc.wantCommit, commit.AsString())
+		})
+	}
 }
