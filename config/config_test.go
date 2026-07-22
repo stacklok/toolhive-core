@@ -34,6 +34,10 @@ func TestBaseConfig_Validate(t *testing.T) {
 			cfg:  config.BaseConfig{ServiceName: serviceName},
 		},
 		{
+			name: "valid with freeform environment",
+			cfg:  config.BaseConfig{ServiceName: serviceName, Environment: "qa-shared-3"},
+		},
+		{
 			name:    "missing service name",
 			cfg:     config.BaseConfig{LogLevel: "info"},
 			wantErr: "serviceName is required",
@@ -133,6 +137,7 @@ func TestLoad_ExtendedServiceConfig(t *testing.T) {
 	path := writeYAML(t, `
 serviceName: airlock-gateway
 logLevel: debug
+env: staging
 gateway:
   id: gw-1
 `)
@@ -150,6 +155,9 @@ gateway:
 	}
 	if cfg.LogLevel != levelDebug {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, levelDebug)
+	}
+	if cfg.Environment != "staging" {
+		t.Errorf("Environment = %q, want %q", cfg.Environment, "staging")
 	}
 	if cfg.Gateway.ID != "gw-1" {
 		t.Errorf("Gateway.ID = %q, want %q", cfg.Gateway.ID, "gw-1")

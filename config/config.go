@@ -29,6 +29,12 @@ type BaseConfig struct {
 	// LogLevel is the minimum log level: "debug", "info", "warn", or
 	// "error". Defaults to "info" when empty.
 	LogLevel string `yaml:"logLevel"`
+
+	// Environment identifies the deployment tier a service is running in
+	// (e.g. "dev", "staging", "prod"). Deployments name their environments
+	// differently, so this is a freeform string with no fixed set of
+	// values and no validation.
+	Environment string `yaml:"env"`
 }
 
 // Validate checks the base fields and returns the first violation

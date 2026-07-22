@@ -8,9 +8,11 @@ ToolHive-ecosystem services, plus a strict YAML loader for it.
 # Scope
 
 This package only owns fields that are truly universal across services:
-service identity and logging. It does not define per-service schema
-(database DSNs, upstream URLs, feature flags, etc.) — those belong in each
-consuming service's own config struct.
+service identity, logging, and deployment environment. It does not define
+per-service schema (database DSNs, upstream URLs, feature flags, etc.) —
+those belong in each consuming service's own config struct. It also does
+not impose a fixed vocabulary for values that vary by deployment, such as
+Environment — those stay freeform strings.
 
 # Basic Usage
 
