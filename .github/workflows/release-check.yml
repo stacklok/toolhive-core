@@ -9,7 +9,8 @@
 #   - dependency-only: every merged PR since the last tag was authored by an
 #     automation identity (Renovate / the approver bot) AND carries the
 #     `dependencies` label. Gets the `automerge` label and GitHub auto-merge, so
-#     it merges once required checks are green (the approver app clears review).
+#     it merges once required checks are green (the approve-automerge workflow
+#     clears the required review).
 #
 #   - functional: any merged PR is human-authored or unlabeled. Gets the
 #     `needs-human` label, no auto-merge, and the PR body lists which PRs tipped
@@ -224,7 +225,7 @@ jobs:
               echo ""
               echo "Every PR merged since the last tag is an automated dependency update."
               echo "Labeled \`automerge\`; GitHub auto-merge is enabled and it will merge once"
-              echo "the required status checks are green and the approver app has approved."
+              echo "the required status checks are green and the approve-automerge workflow has approved."
             else
               echo "## Release classification: needs human review"
               echo ""
@@ -247,7 +248,7 @@ jobs:
           if [ "$CLASSIFICATION" = "dependency-only" ]; then
             gh pr edit "$PR" --repo "$REPO" --add-label automerge --remove-label needs-human
             # Enable GitHub-native auto-merge (squash). Required status checks +
-            # the approver app's review gate the actual merge.
+            # the approve-automerge workflow's review gate the actual merge.
             gh pr merge "$PR" --repo "$REPO" --auto --squash
           else
             gh pr edit "$PR" --repo "$REPO" --add-label needs-human --remove-label automerge
