@@ -1,19 +1,22 @@
 # SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-# Approve automation PRs
+# Approve Renovate PRs
 #
 # The repo ruleset requires 1 approval, so GitHub-native auto-merge (or
 # Renovate's) can never complete on its own: a bot cannot approve its own PR.
 # This workflow supplies that approval from a SEPARATE app identity, which counts
 # toward the "require 1 approval" rule.
 #
+# Scope: Renovate PRs ONLY. It never approves human PRs, release PRs, or any
+# other bot's PRs. Release PRs are handled separately by release-check.yml and
+# still require a human approval.
+#
 # Mechanism:
 #   1. Triggers on `workflow_run` (completed) for the CI workflow.
 #   2. Only proceeds when that run succeeded and was for a pull_request.
 #   3. Resolves the PR from the run's head SHA and checks eligibility:
-#      the PR carries the `automerge` label AND is authored by a bot (Renovate or
-#      the release-bot) AND is not authored by the approver app itself.
+#      the PR is authored by Renovate AND carries the `automerge` label.
 #   4. Confirms the full check set on the head SHA is green.
 #   5. Submits an approving review with the approver app token, then enables
 #      GitHub auto-merge (squash). Required checks still gate the actual merge, so
@@ -23,7 +26,7 @@
 # with Pull requests: write + Contents: read, exposed as:
 #   vars.APPROVER_APP_CLIENT_ID  /  secrets.APPROVER_APP_PRIVATE_KEY
 
-name: Approve automation PRs
+name: Approve Renovate PRs
 
 on:
   workflow_run:
@@ -41,7 +44,7 @@ concurrency:
 
 jobs:
   approve:
-    name: Approve automation PRs
+    name: Approve Renovate PRs
     # Only act on a successful CI run that was triggered by a pull request.
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
@@ -55,15 +58,18 @@ jobs:
           client-id: ${{ vars.APPROVER_APP_CLIENT_ID }}
           private-key: ${{ secrets.APPROVER_APP_PRIVATE_KEY }}
 
-      - name: Approve and enable auto-merge for eligible bot PRs
+      - name: Approve and enable auto-merge for Renovate PRs
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           # App slug -> bot login, used to avoid self-approval and to dedupe reviews.
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          # Renovate author login(s). The REST API returns `renovate[bot]`; the
+          # `app/renovate` form is accepted defensively.
+          RENOVATE_LOGINS: "renovate[bot] app/renovate"
           # This job's name, so its own check run is excluded from the green check.
-          SELF_CHECK_NAME: "Approve automation PRs"
+          SELF_CHECK_NAME: "Approve Renovate PRs"
         run: |
           set -euo pipefail
 
@@ -92,15 +98,20 @@ jobs:
             HAS_AUTOMERGE=$(echo "$META" | jq -r 'if (.labels | index("automerge")) then "yes" else "no" end')
             echo "author=$AUTHOR type=$TYPE automerge_label=$HAS_AUTOMERGE"
 
-            # Eligibility: automerge label + bot author, and not the approver's own PR.
-            if [ "$HAS_AUTOMERGE" != "yes" ]; then
-              echo "Not labeled 'automerge'; skipping."; echo "::endgroup::"; continue
+            # Eligibility: Renovate-authored AND labeled `automerge`. This workflow
+            # never approves human PRs, release PRs, or any other bot's PRs.
+            IS_RENOVATE=no
+            for login in $RENOVATE_LOGINS; do
+              if [ "$AUTHOR" = "$login" ]; then IS_RENOVATE=yes; break; fi
+            done
+            if [ "$IS_RENOVATE" != "yes" ]; then
+              echo "Author '$AUTHOR' is not Renovate; skipping."; echo "::endgroup::"; continue
             fi
             if [ "$TYPE" != "Bot" ]; then
-              echo "Author is not a bot ($TYPE); skipping (human PRs are never auto-approved)."; echo "::endgroup::"; continue
+              echo "Author '$AUTHOR' is not a bot ($TYPE); skipping."; echo "::endgroup::"; continue
             fi
-            if [ -n "$ME" ] && [ "$AUTHOR" = "$ME" ]; then
-              echo "PR authored by the approver app itself; cannot self-approve. Skipping."; echo "::endgroup::"; continue
+            if [ "$HAS_AUTOMERGE" != "yes" ]; then
+              echo "Not labeled 'automerge'; skipping."; echo "::endgroup::"; continue
             fi
 
             # Confirm the full check set on the head SHA is green: every check run
