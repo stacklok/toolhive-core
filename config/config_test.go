@@ -27,21 +27,33 @@ func TestBaseConfig_Validate(t *testing.T) {
 	}{
 		{
 			name: "valid with explicit level",
-			cfg:  config.BaseConfig{ServiceName: serviceName, LogLevel: levelDebug},
+			cfg: config.BaseConfig{
+				ServiceName: serviceName, LogLevel: levelDebug, Environment: config.EnvironmentDevelopment,
+			},
 		},
 		{
 			name: "valid with empty level defaults to info",
-			cfg:  config.BaseConfig{ServiceName: serviceName},
+			cfg:  config.BaseConfig{ServiceName: serviceName, Environment: config.EnvironmentProduction},
 		},
 		{
 			name:    "missing service name",
-			cfg:     config.BaseConfig{LogLevel: "info"},
+			cfg:     config.BaseConfig{LogLevel: "info", Environment: config.EnvironmentDevelopment},
 			wantErr: "serviceName is required",
 		},
 		{
 			name:    "unknown log level",
 			cfg:     config.BaseConfig{ServiceName: serviceName, LogLevel: "verbose"},
 			wantErr: `logLevel: unknown level "verbose"`,
+		},
+		{
+			name:    "missing environment",
+			cfg:     config.BaseConfig{ServiceName: serviceName},
+			wantErr: `environment: unknown value ""`,
+		},
+		{
+			name:    "unknown environment",
+			cfg:     config.BaseConfig{ServiceName: serviceName, Environment: "prod"},
+			wantErr: `environment: unknown value "prod"`,
 		},
 	}
 
@@ -58,6 +70,31 @@ func TestBaseConfig_Validate(t *testing.T) {
 			}
 			if err == nil || err.Error() != tt.wantErr {
 				t.Fatalf("Validate() = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestEnvironment_Valid(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		env  config.Environment
+		want bool
+	}{
+		{env: config.EnvironmentDevelopment, want: true},
+		{env: config.EnvironmentStaging, want: true},
+		{env: config.EnvironmentProduction, want: true},
+		{env: "", want: false},
+		{env: "prod", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.env), func(t *testing.T) {
+			t.Parallel()
+
+			if got := tt.env.Valid(); got != tt.want {
+				t.Errorf("Environment(%q).Valid() = %v, want %v", tt.env, got, tt.want)
 			}
 		})
 	}
@@ -133,6 +170,7 @@ func TestLoad_ExtendedServiceConfig(t *testing.T) {
 	path := writeYAML(t, `
 serviceName: airlock-gateway
 logLevel: debug
+environment: staging
 gateway:
   id: gw-1
 `)
@@ -150,6 +188,9 @@ gateway:
 	}
 	if cfg.LogLevel != levelDebug {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, levelDebug)
+	}
+	if cfg.Environment != config.EnvironmentStaging {
+		t.Errorf("Environment = %q, want %q", cfg.Environment, config.EnvironmentStaging)
 	}
 	if cfg.Gateway.ID != "gw-1" {
 		t.Errorf("Gateway.ID = %q, want %q", cfg.Gateway.ID, "gw-1")

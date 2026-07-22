@@ -12,6 +12,33 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Environment identifies the deployment tier a service is running in.
+// Several services independently reimplement this as a freeform string
+// (e.g. for gating dev-only behavior); Environment gives them one validated
+// type instead.
+type Environment string
+
+const (
+	// EnvironmentDevelopment is a local or shared development deployment.
+	EnvironmentDevelopment Environment = "development"
+
+	// EnvironmentStaging is a pre-production deployment.
+	EnvironmentStaging Environment = "staging"
+
+	// EnvironmentProduction is a production deployment.
+	EnvironmentProduction Environment = "production"
+)
+
+// Valid reports whether e is one of the defined Environment values.
+func (e Environment) Valid() bool {
+	switch e {
+	case EnvironmentDevelopment, EnvironmentStaging, EnvironmentProduction:
+		return true
+	default:
+		return false
+	}
+}
+
 // BaseConfig holds configuration fields common to every ToolHive-ecosystem
 // service. Consuming services embed it inline in their own config struct
 // rather than referencing it as a nested field, so the fields decode at the
@@ -29,6 +56,12 @@ type BaseConfig struct {
 	// LogLevel is the minimum log level: "debug", "info", "warn", or
 	// "error". Defaults to "info" when empty.
 	LogLevel string `yaml:"logLevel"`
+
+	// Environment is the deployment tier: "development", "staging", or
+	// "production". Required — callers that gate behavior on Environment
+	// (e.g. relaxing TLS verification only in development) need an
+	// explicit value rather than a silently-defaulted one.
+	Environment Environment `yaml:"environment"`
 }
 
 // Validate checks the base fields and returns the first violation
@@ -43,6 +76,9 @@ func (c *BaseConfig) Validate() error {
 	}
 	if _, err := c.SlogLevel(); err != nil {
 		return err
+	}
+	if !c.Environment.Valid() {
+		return fmt.Errorf("environment: unknown value %q", c.Environment)
 	}
 	return nil
 }
