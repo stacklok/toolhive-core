@@ -353,6 +353,37 @@ func TestNewHandler_ProducesSameOutputAsNew(t *testing.T) {
 	assert.Equal(t, entry1["key"], entry2["key"])
 }
 
+func TestParseLevel(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		level   string
+		want    slog.Level
+		wantErr bool
+	}{
+		{level: "", want: slog.LevelInfo},
+		{level: "info", want: slog.LevelInfo},
+		{level: "debug", want: slog.LevelDebug},
+		{level: "warn", want: slog.LevelWarn},
+		{level: "error", want: slog.LevelError},
+		{level: "bogus", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.level, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := ParseLevel(tc.level)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
 func TestReplaceAttr(t *testing.T) {
 	t.Parallel()
 
