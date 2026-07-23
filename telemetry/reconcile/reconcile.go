@@ -58,7 +58,10 @@ const (
 const (
 	// LabelComponent identifies which operator emitted the series (e.g.
 	// "ai_gateway", "operator"). It is fixed per binary and set once at
-	// construction.
+	// construction. This bare key is deliberately distinct from
+	// metrics.AttrStacklokComponent (a resource attribute, not a per-datapoint
+	// label); see metrics.AttrStacklokComponent's doc comment for why the two
+	// must not collide.
 	LabelComponent = "component"
 	// LabelNamespace and LabelName identify the reconciled object.
 	LabelNamespace = "namespace"
@@ -86,8 +89,8 @@ type Emitter struct {
 	reconcileErrors  metric.Int64Counter
 	managedResources metric.Int64ObservableGauge
 
-	managedResourcesOnce sync.Once
-	managedResourcesErr  error
+	managedResourcesMu         sync.Mutex
+	managedResourcesRegistered bool
 }
 
 // New constructs the reconcile triplet on meter and returns an Emitter that
@@ -187,9 +190,17 @@ type ManagedResource struct {
 // concurrent, reentrant invocation, per the OTel callback contract. The
 // component label is stamped automatically.
 //
-// RegisterManagedResources may be called at most once per Emitter; a second
-// call returns an error rather than silently registering a duplicate callback
-// against the same gauge, which would double-count observations.
+// RegisterManagedResources may succeed at most once per Emitter; a call made
+// after a prior successful registration returns an error rather than
+// silently registering a duplicate callback against the same gauge, which
+// would double-count observations. A call that fails (e.g. a transient SDK
+// error) leaves the Emitter free to retry: only a successful registration
+// is latched.
+//
+// meter must be the same meter instance passed to New — RegisterCallback is
+// invoked on meter, but it observes the gauge instrument created against
+// New's meter, so a mismatched meter registers the callback against the
+// wrong instrument's collection cycle.
 func (e *Emitter) RegisterManagedResources(
 	meter metric.Meter, observe func(context.Context) []ManagedResource,
 ) (metric.Registration, error) {
@@ -197,31 +208,30 @@ func (e *Emitter) RegisterManagedResources(
 		return nil, fmt.Errorf("reconcile: observe callback must not be nil")
 	}
 
-	var (
-		reg    metric.Registration
-		regErr error
-	)
-	registered := false
-	e.managedResourcesOnce.Do(func() {
-		registered = true
-		reg, regErr = meter.RegisterCallback(
-			func(ctx context.Context, obs metric.Observer) error {
-				for _, r := range observe(ctx) {
-					obs.ObserveInt64(e.managedResources, r.Count, metric.WithAttributes(
-						attribute.String(LabelComponent, e.component),
-						attribute.String(LabelNamespace, r.Namespace),
-						attribute.String(LabelName, r.Name),
-						attribute.String(LabelKind, r.Kind),
-					))
-				}
-				return nil
-			},
-			e.managedResources,
-		)
-		e.managedResourcesErr = regErr
-	})
-	if !registered {
+	e.managedResourcesMu.Lock()
+	defer e.managedResourcesMu.Unlock()
+
+	if e.managedResourcesRegistered {
 		return nil, fmt.Errorf("reconcile: managed-resources callback already registered")
 	}
-	return reg, e.managedResourcesErr
+
+	reg, err := meter.RegisterCallback(
+		func(ctx context.Context, obs metric.Observer) error {
+			for _, r := range observe(ctx) {
+				obs.ObserveInt64(e.managedResources, r.Count, metric.WithAttributes(
+					attribute.String(LabelComponent, e.component),
+					attribute.String(LabelNamespace, r.Namespace),
+					attribute.String(LabelName, r.Name),
+					attribute.String(LabelKind, r.Kind),
+				))
+			}
+			return nil
+		},
+		e.managedResources,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("reconcile: register managed-resources callback: %w", err)
+	}
+	e.managedResourcesRegistered = true
+	return reg, nil
 }

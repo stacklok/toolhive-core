@@ -11,7 +11,11 @@ package metrics
 // stacklok_component distinguishes emitters.
 //
 // These are resource attributes, not metric labels: they are set once on the
-// provider, not per instrument.
+// provider, not per instrument. Do not attach them via attribute.String on an
+// individual Record/Add call — that would collide with the exporter-promoted
+// per-series label of the same name. See buildinfo.go's RegisterBuildInfo and
+// telemetry/reconcile's Emitter for the parallel, deliberately distinct
+// bare-string labels ("component") those packages attach per data point.
 const (
 	// AttrStacklokComponent is the resource-attribute key naming the emitting
 	// component. Its value is one of the Component* roster below.

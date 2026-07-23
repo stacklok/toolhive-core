@@ -203,6 +203,44 @@ func TestRegisterManagedResourcesRejectsSecondCall(t *testing.T) {
 	}
 }
 
+// TestRegisterManagedResourcesRetriesAfterFailure forces the first
+// RegisterCallback attempt to fail (by passing a gauge instrument from a
+// different meter than the one used in New) and confirms a subsequent call
+// with the correct meter still succeeds, rather than being permanently
+// rejected as "already registered".
+func TestRegisterManagedResourcesRetriesAfterFailure(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(ctx) })
+	meter := mp.Meter("test-retry-after-failure")
+
+	otherMP := sdkmetric.NewMeterProvider(sdkmetric.WithReader(sdkmetric.NewManualReader()))
+	t.Cleanup(func() { _ = otherMP.Shutdown(ctx) })
+	otherMeter := otherMP.Meter("test-retry-after-failure-other")
+
+	e, err := New(meter, "operator")
+	require.NoError(t, err)
+
+	observe := func(context.Context) []ManagedResource {
+		return []ManagedResource{{Namespace: "ns2", Name: "obj2", Kind: "secret", Count: 1}}
+	}
+
+	_, err = e.RegisterManagedResources(otherMeter, observe)
+	require.Error(t, err, "registering against a mismatched meter must fail")
+	assert.NotContains(t, err.Error(), "already registered",
+		"a failed attempt must surface the real error, not a stale already-registered message")
+
+	reg, err := e.RegisterManagedResources(meter, observe)
+	require.NoError(t, err, "a retry with the correct meter must succeed after a prior failure")
+	t.Cleanup(func() { _ = reg.Unregister() })
+
+	_, err = e.RegisterManagedResources(meter, observe)
+	assert.Error(t, err, "a second call after a successful registration must still be rejected")
+}
+
 // firstDataPointKeys returns the attribute keys on the first data point of m,
 // regardless of aggregation type.
 func firstDataPointKeys(t *testing.T, m metricdata.Metrics) []string {

@@ -6,6 +6,10 @@ Package metrics provides shared histogram bucket presets, label-key
 constants, and emitter-ownership vocabulary for OpenTelemetry metrics across
 the ToolHive ecosystem.
 
+The section and decision numbers cited throughout this package (e.g. "RFC
+§3.3", "D8") refer to the internal Stacklok Platform Metrics Standardization
+RFC, which defines the canonical vocabulary this package pins.
+
 This package is construction helpers and vocabulary only: importing it
 installs no global providers and emits no metrics of its own. The one
 exception is RegisterBuildInfo, which registers an observable gauge on the
