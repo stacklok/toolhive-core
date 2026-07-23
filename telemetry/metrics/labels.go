@@ -35,3 +35,22 @@ const (
 	// metric (coexists with semconv error.type on OTel semconv metrics).
 	LabelErrorType = "error_type"
 )
+
+// Canonical outcome-label values. The LabelOutcome key carries one of these on
+// a Stacklok-authored counter, distinguishing success from failure without a
+// separate _succeed/_failed metric name (RFC §3.4 / D4). A metric may extend
+// this set with a documented, bounded per-metric outcome where the standard
+// three do not capture a distinct terminal state (e.g. the journal lifecycle
+// outcomes, the vMCP optimizer's "not_found"); such extensions are owned by the
+// emitting component, not exported here.
+const (
+	// OutcomeSuccess marks a successful operation.
+	OutcomeSuccess = "success"
+
+	// OutcomeError marks a failed operation.
+	OutcomeError = "error"
+
+	// OutcomeRejected marks an operation refused before execution (e.g. rate
+	// limited, circuit open, admission denied).
+	OutcomeRejected = "rejected"
+)
