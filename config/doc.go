@@ -14,6 +14,12 @@ those belong in each consuming service's own config struct. It also does
 not impose a fixed vocabulary for values that vary by deployment, such as
 Environment — those stay freeform strings.
 
+Env-var interpolation (e.g. expanding "${VAR}" in YAML values) is
+deliberately out of scope for now. Several open questions (syntax,
+missing-variable behavior, which fields are eligible, whether it should
+take an env.Reader for testability) are better decided against the actual
+loader this package is meant to absorb than designed speculatively here.
+
 # Basic Usage
 
 A service defines its own config struct and embeds [BaseConfig] inline so

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stacklok/toolhive-core/config"
@@ -178,6 +179,62 @@ gateway:
 	err := config.Load(path, &cfg)
 	if err == nil {
 		t.Fatal("Load() = nil error, want error for unknown field")
+	}
+}
+
+func TestLoad_AllowUnknownFields(t *testing.T) {
+	t.Parallel()
+
+	path := writeYAML(t, `
+serviceName: airlock-gateway
+gateway:
+  id: gw-1
+  typoField: oops
+`)
+
+	var cfg serviceConfig
+	if err := config.Load(path, &cfg, config.AllowUnknownFields()); err != nil {
+		t.Fatalf("Load() = %v, want nil", err)
+	}
+	if cfg.Gateway.ID != "gw-1" {
+		t.Errorf("Gateway.ID = %q, want %q", cfg.Gateway.ID, "gw-1")
+	}
+}
+
+func TestDecode_ReaderBased(t *testing.T) {
+	t.Parallel()
+
+	r := strings.NewReader(`
+serviceName: airlock-gateway
+gateway:
+  id: gw-1
+`)
+
+	var cfg serviceConfig
+	if err := config.Decode(r, &cfg); err != nil {
+		t.Fatalf("Decode() = %v, want nil", err)
+	}
+	if cfg.ServiceName != "airlock-gateway" {
+		t.Errorf("ServiceName = %q, want %q", cfg.ServiceName, "airlock-gateway")
+	}
+	if cfg.Gateway.ID != "gw-1" {
+		t.Errorf("Gateway.ID = %q, want %q", cfg.Gateway.ID, "gw-1")
+	}
+}
+
+func TestDecode_UnknownFieldRejectedByDefault(t *testing.T) {
+	t.Parallel()
+
+	r := strings.NewReader(`
+serviceName: airlock-gateway
+gateway:
+  id: gw-1
+  typoField: oops
+`)
+
+	var cfg serviceConfig
+	if err := config.Decode(r, &cfg); err == nil {
+		t.Fatal("Decode() = nil error, want error for unknown field")
 	}
 }
 
