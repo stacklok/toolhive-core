@@ -13,12 +13,17 @@ package metrics
 // These are resource attributes, not metric labels: they are set once on the
 // provider, not per instrument. Do not attach them via attribute.String on an
 // individual Record/Add call — that would collide with the exporter-promoted
-// per-series label of the same name. See buildinfo.go's RegisterBuildInfo and
-// telemetry/reconcile's Emitter for the parallel, deliberately distinct
-// bare-string labels ("component") those packages attach per data point.
+// per-series label of the same name. See buildinfo.go's RegisterBuildInfo for a
+// parallel, deliberately distinct bare-string "component" label attached per
+// data point.
+//
+// This package defines only the attribute keys, not the per-component value
+// strings: each component supplies its own AttrStacklokComponent value (e.g.
+// "toolhive", "registry", "ai_gateway"). A foundational library names the
+// concept, not the roster of apps that consume it.
 const (
 	// AttrStacklokComponent is the resource-attribute key naming the emitting
-	// component. Its value is one of the Component* roster below.
+	// component. Each component supplies its own value.
 	AttrStacklokComponent = "stacklok.component"
 
 	// AttrStacklokProduct is the resource-attribute key naming the product.
@@ -27,23 +32,11 @@ const (
 )
 
 // ProductStacklokPlatform is the frozen stacklok.product value stamped by every
-// component. It is deliberately "stacklok-platform" (not "stacklok-enterprise")
-// so it survives the toolhive-enterprise to toolhive-platform rename; the value
-// lands in customer dashboards and must not churn.
+// component. Unlike the per-component AttrStacklokComponent value, this one
+// string is shared verbatim across the whole fleet: a single selector
+// stacklok_product="stacklok-platform" spans every emitter, so the value must
+// not drift per component. It is deliberately "stacklok-platform" (not
+// "stacklok-enterprise") so it survives the toolhive-enterprise to
+// toolhive-platform rename; the value lands in customer dashboards and must not
+// churn.
 const ProductStacklokPlatform = "stacklok-platform"
-
-// Component roster: the canonical stacklok.component values. This is an open
-// set (a new component picks its own value), but the known values are listed
-// here so cross-component dashboards and this package's guard test share one
-// source of truth. Each emitter passes its own value; the roster does not force
-// a closed enum.
-const (
-	ComponentToolhive         = "toolhive"
-	ComponentVMCP             = "vmcp"
-	ComponentRegistry         = "registry"
-	ComponentAIGateway        = "ai_gateway"
-	ComponentOperator         = "operator"
-	ComponentConnectorGateway = "connector_gateway"
-	ComponentDirectory        = "directory"
-	ComponentConfigServer     = "config_server"
-)

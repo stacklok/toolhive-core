@@ -95,36 +95,16 @@ func TestOutcomeValues(t *testing.T) {
 	assert.Equal(t, "rejected", OutcomeRejected)
 }
 
-// TestOwnershipAttrs pins the D8 ownership attribute keys, the frozen product
-// value, and the known component roster. The product value is frozen at
-// "stacklok-platform" and must not revert to "stacklok-enterprise".
+// TestOwnershipAttrs pins the D8 ownership attribute keys and the frozen
+// product value. The product value is frozen at "stacklok-platform" and must
+// not revert to "stacklok-enterprise". The per-component AttrStacklokComponent
+// value is supplied by each component, not defined here.
 func TestOwnershipAttrs(t *testing.T) {
 	t.Parallel()
 
 	assert.Equal(t, "stacklok.component", AttrStacklokComponent)
 	assert.Equal(t, "stacklok.product", AttrStacklokProduct)
 	assert.Equal(t, "stacklok-platform", ProductStacklokPlatform)
-
-	roster := []struct{ name, got string }{
-		{"ComponentToolhive", ComponentToolhive},
-		{"ComponentVMCP", ComponentVMCP},
-		{"ComponentRegistry", ComponentRegistry},
-		{"ComponentAIGateway", ComponentAIGateway},
-		{"ComponentOperator", ComponentOperator},
-		{"ComponentConnectorGateway", ComponentConnectorGateway},
-		{"ComponentDirectory", ComponentDirectory},
-		{"ComponentConfigServer", ComponentConfigServer},
-	}
-	seen := make(map[string]bool, len(roster))
-	for _, c := range roster {
-		// D3 bans the unqualified word "gateway" as a component value on its
-		// own; a qualified compound like "ai_gateway" or "connector_gateway"
-		// is the RFC-sanctioned form (RFC §3.1 glossary), so only the exact,
-		// bare value is rejected here.
-		assert.NotEqual(t, "gateway", c.got, "%s must not be the banned unqualified 'gateway' value", c.name)
-		assert.False(t, seen[c.got], "duplicate component value: %q", c.got)
-		seen[c.got] = true
-	}
 }
 
 // TestBuildInfoMetricName pins the fleet-wide build_info metric name.

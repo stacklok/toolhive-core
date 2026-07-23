@@ -53,15 +53,15 @@ AttrStacklokComponent and AttrStacklokProduct are resource attributes (RFC
 §3.3, D8), not metric labels: a component sets them once on its OTel resource,
 and the Prometheus exporter promotes them to per-series labels via
 WithResourceAsConstantLabels. ProductStacklokPlatform is the frozen value
-every component stamps; the Component* constants are the known roster of
-stacklok.component values.
+every component stamps verbatim; the per-component stacklok.component value is
+supplied by each component, not enumerated here.
 
 # Build Info
 
 RegisterBuildInfo registers the fleet-wide stacklok.build_info observable
 gauge on a caller-provided meter, for release correlation across components:
 
-	err := metrics.RegisterBuildInfo(meter, metrics.ComponentToolhive, version, commit)
+	err := metrics.RegisterBuildInfo(meter, "toolhive", version, commit)
 
 # Stability
 

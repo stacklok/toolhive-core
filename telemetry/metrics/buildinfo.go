@@ -26,7 +26,8 @@ const unknownBuildInfoValue = "unknown"
 // The component label uses the bare "component" key, not the dotted
 // stacklok.component resource attribute (AttrStacklokComponent), so it does not
 // collide with the stacklok_component constant label the Prometheus exporter
-// promotes from the resource (D8). Pass a Component* roster value.
+// promotes from the resource (D8). Pass the caller's own component value (the
+// same string it stamps as AttrStacklokComponent).
 //
 // As with the rest of this package, RegisterBuildInfo is a construction helper:
 // the caller supplies the meter (typically otel.Meter(scope) after installing
