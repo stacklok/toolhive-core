@@ -16,6 +16,7 @@ import (
 const (
 	levelDebug  = "debug"
 	serviceName = "gateway"
+	gatewayID   = "gw-1"
 )
 
 func TestBaseConfig_Validate(t *testing.T) {
@@ -160,8 +161,8 @@ gateway:
 	if cfg.Environment != "staging" {
 		t.Errorf("Environment = %q, want %q", cfg.Environment, "staging")
 	}
-	if cfg.Gateway.ID != "gw-1" {
-		t.Errorf("Gateway.ID = %q, want %q", cfg.Gateway.ID, "gw-1")
+	if cfg.Gateway.ID != gatewayID {
+		t.Errorf("Gateway.ID = %q, want %q", cfg.Gateway.ID, gatewayID)
 	}
 }
 
@@ -196,8 +197,8 @@ gateway:
 	if err := config.Load(path, &cfg, config.AllowUnknownFields()); err != nil {
 		t.Fatalf("Load() = %v, want nil", err)
 	}
-	if cfg.Gateway.ID != "gw-1" {
-		t.Errorf("Gateway.ID = %q, want %q", cfg.Gateway.ID, "gw-1")
+	if cfg.Gateway.ID != gatewayID {
+		t.Errorf("Gateway.ID = %q, want %q", cfg.Gateway.ID, gatewayID)
 	}
 }
 
@@ -217,8 +218,8 @@ gateway:
 	if cfg.ServiceName != "airlock-gateway" {
 		t.Errorf("ServiceName = %q, want %q", cfg.ServiceName, "airlock-gateway")
 	}
-	if cfg.Gateway.ID != "gw-1" {
-		t.Errorf("Gateway.ID = %q, want %q", cfg.Gateway.ID, "gw-1")
+	if cfg.Gateway.ID != gatewayID {
+		t.Errorf("Gateway.ID = %q, want %q", cfg.Gateway.ID, gatewayID)
 	}
 }
 
