@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -38,6 +37,19 @@ type BaseConfig struct {
 	Environment string `yaml:"env"`
 }
 
+// validLogLevels are the LogLevel values Validate accepts. This package
+// deliberately has no dependency on log/slog or any other logging
+// package — it only knows these are valid strings; parsing a level name
+// into a concrete logger's level type is that logger's job (see, e.g.,
+// the sibling logging package's ParseLevel).
+var validLogLevels = map[string]bool{
+	"":      true,
+	"debug": true,
+	"info":  true,
+	"warn":  true,
+	"error": true,
+}
+
 // Validate checks the base fields and returns the first violation
 // encountered. It does not know about, and does not validate, any fields a
 // consuming service adds alongside it.
@@ -48,27 +60,10 @@ func (c *BaseConfig) Validate() error {
 	if c.ServiceName == "" {
 		return errors.New("serviceName is required")
 	}
-	if _, err := c.SlogLevel(); err != nil {
-		return err
+	if !validLogLevels[c.LogLevel] {
+		return fmt.Errorf("logLevel: unknown level %q", c.LogLevel)
 	}
 	return nil
-}
-
-// SlogLevel parses LogLevel into a [log/slog.Level]. An empty LogLevel
-// resolves to [log/slog.LevelInfo].
-func (c *BaseConfig) SlogLevel() (slog.Level, error) {
-	switch c.LogLevel {
-	case "", "info":
-		return slog.LevelInfo, nil
-	case "debug":
-		return slog.LevelDebug, nil
-	case "warn":
-		return slog.LevelWarn, nil
-	case "error":
-		return slog.LevelError, nil
-	default:
-		return 0, fmt.Errorf("logLevel: unknown level %q", c.LogLevel)
-	}
 }
 
 // decodeOptions holds the resolved options for [Load] and [Decode].

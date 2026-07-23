@@ -4,7 +4,6 @@
 package config_test
 
 import (
-	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +35,14 @@ func TestBaseConfig_Validate(t *testing.T) {
 			cfg:  config.BaseConfig{ServiceName: serviceName},
 		},
 		{
+			name: "valid with warn level",
+			cfg:  config.BaseConfig{ServiceName: serviceName, LogLevel: "warn"},
+		},
+		{
+			name: "valid with error level",
+			cfg:  config.BaseConfig{ServiceName: serviceName, LogLevel: "error"},
+		},
+		{
 			name: "valid with freeform environment",
 			cfg:  config.BaseConfig{ServiceName: serviceName, Environment: "qa-shared-3"},
 		},
@@ -64,44 +71,6 @@ func TestBaseConfig_Validate(t *testing.T) {
 			}
 			if err == nil || err.Error() != tt.wantErr {
 				t.Fatalf("Validate() = %v, want %q", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestBaseConfig_SlogLevel(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		level   string
-		want    slog.Level
-		wantErr bool
-	}{
-		{level: "", want: slog.LevelInfo},
-		{level: "info", want: slog.LevelInfo},
-		{level: levelDebug, want: slog.LevelDebug},
-		{level: "warn", want: slog.LevelWarn},
-		{level: "error", want: slog.LevelError},
-		{level: "bogus", wantErr: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.level, func(t *testing.T) {
-			t.Parallel()
-
-			c := config.BaseConfig{LogLevel: tt.level}
-			got, err := c.SlogLevel()
-			if tt.wantErr {
-				if err == nil {
-					t.Fatalf("SlogLevel(%q) = nil error, want error", tt.level)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("SlogLevel(%q) = %v, want nil error", tt.level, err)
-			}
-			if got != tt.want {
-				t.Fatalf("SlogLevel(%q) = %v, want %v", tt.level, got, tt.want)
 			}
 		})
 	}

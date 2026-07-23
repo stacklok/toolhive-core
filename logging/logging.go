@@ -4,6 +4,7 @@
 package logging
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -111,6 +112,24 @@ func NewHandler(opts ...Option) slog.Handler {
 //   - Timestamps: [time.RFC3339]
 func New(opts ...Option) *slog.Logger {
 	return slog.New(NewHandler(opts...))
+}
+
+// ParseLevel parses a level name ("debug", "info", "warn", or "error")
+// into a [log/slog.Level]. An empty string resolves to [log/slog.LevelInfo],
+// matching [New]'s default.
+func ParseLevel(level string) (slog.Level, error) {
+	switch level {
+	case "", "info":
+		return slog.LevelInfo, nil
+	case "debug":
+		return slog.LevelDebug, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("unknown level %q", level)
+	}
 }
 
 // replaceAttr formats the time attribute to RFC3339.
