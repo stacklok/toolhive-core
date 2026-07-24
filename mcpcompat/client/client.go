@@ -12,6 +12,14 @@
 // own types happens at this boundary via JSON round-trips, which is robust
 // because both encode the identical MCP wire format.
 //
+// LIMITATION: the shim cannot force a per-backend protocol version. go-sdk's
+// Connect negotiates the version to use from an unexported field
+// (ClientSessionOptions.protocolVersion) reachable only through the
+// *gosdk.ClientSessionOptions parameter of Client.Connect, and this shim's
+// Initialize always passes nil there, so it cannot pin a backend to, say,
+// 2025-11-25 even when that would be desirable. See issue #5911; the fix would
+// be to ask upstream to export that field (or add an option to set it).
+//
 // Stability: Alpha.
 package client
 
@@ -63,6 +71,11 @@ type Client struct {
 	// server->client sampling/createMessage requests. It mirrors mcp-go's
 	// client.WithSamplingHandler.
 	samplingHandler SamplingHandler
+
+	// disableMultiRoundTrip, when true, opts the client out of go-sdk's
+	// automatic multi round-trip (MRTR, SEP-2322) handling. See
+	// WithoutMultiRoundTrip.
+	disableMultiRoundTrip bool
 }
 
 // ElicitationHandler handles server->client elicitation/create requests. It
@@ -154,6 +167,30 @@ func WithSamplingHandler(h SamplingHandler) ClientOption {
 	return func(c *Client) { c.samplingHandler = h }
 }
 
+// WithoutMultiRoundTrip disables go-sdk's automatic multi round-trip (MRTR,
+// SEP-2322) handling. MRTR is on by default for MCP 2026-07-28+ backends: when
+// a tool/prompt/resource call returns an input-required result, the go-sdk
+// client automatically invokes the appropriate client handler (e.g. the
+// elicitation handler) and retries the original call, so the caller only ever
+// observes the final, completed result.
+//
+// Disabling MRTR surfaces the input-required result to the caller instead of
+// auto-fulfilling and retrying: the client returns the input-required result
+// directly, and the caller can detect it via mcp.CallToolResult.NeedsInput
+// (which reports the underlying gosdk result's wire "resultType" field).
+//
+// NOTE: reading the input requests and fulfilling/retrying the call through
+// the shim is NOT yet supported — the shim's CallToolResult does not model
+// go-sdk's InputRequests/RequestState fields, only the NeedsInput
+// classification.
+//
+// Must be set before Initialize; the underlying go-sdk option
+// (gosdk.ClientOptions.MultiRoundTrip) is only consulted when the client
+// connects.
+func WithoutMultiRoundTrip() ClientOption {
+	return func(c *Client) { c.disableMultiRoundTrip = true }
+}
+
 // applyClientOptions applies the client-level options to c.
 func applyClientOptions(c *Client, opts []ClientOption) {
 	for _, opt := range opts {
@@ -236,6 +273,9 @@ func (c *Client) Initialize(ctx context.Context, request mcp.InitializeRequest) 
 	c.installNotificationHandlers(opts)
 	c.installElicitationHandler(opts)
 	c.installSamplingHandler(opts)
+	if c.disableMultiRoundTrip {
+		opts.MultiRoundTrip = &gosdk.MultiRoundTripOptions{Disabled: true}
+	}
 
 	gc := gosdk.NewClient(impl, opts)
 

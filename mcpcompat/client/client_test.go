@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -355,4 +356,104 @@ func TestSetLevel_CompatAlias(t *testing.T) {
 		Params: mcp.SetLevelParams{Level: mcp.LoggingLevelDebug},
 	})
 	assert.NoError(t, err, "SetLevel compat alias must succeed")
+}
+
+// needsInputToolName is the tool name used by the MRTR (SEP-2322) opt-out
+// tests: every call requires further client input and is never fulfilled by
+// the test server.
+const needsInputToolName = "needs-input"
+
+// newMRTRTestServer stands up a real go-sdk MCP server, served stateless (so
+// the shim client negotiates MCP 2026-07-28 rather than falling back to the
+// legacy handshake; see TestInitialize_StatefulServerNegotiatesLegacyProtocolVersion),
+// exposing a single tool whose handler always returns an input-required
+// result (InputRequests set, no Content) and increments calls on every
+// invocation.
+func newMRTRTestServer(t *testing.T, calls *int32) *httptest.Server {
+	t.Helper()
+	srv := gosdk.NewServer(&gosdk.Implementation{Name: "mrtr-server", Version: testClientVersion}, nil)
+	srv.AddTool(&gosdk.Tool{
+		Name:        needsInputToolName,
+		Description: "always requires further client input",
+		InputSchema: map[string]any{"type": "object"},
+	},
+		func(_ context.Context, _ *gosdk.CallToolRequest) (*gosdk.CallToolResult, error) {
+			atomic.AddInt32(calls, 1)
+			return &gosdk.CallToolResult{
+				InputRequests: gosdk.InputRequestMap{
+					"q1": &gosdk.ElicitParams{Mode: "form", Message: "need more info"},
+				},
+			}, nil
+		})
+	handler := gosdk.NewStreamableHTTPHandler(
+		func(*http.Request) *gosdk.Server { return srv }, &gosdk.StreamableHTTPOptions{Stateless: true},
+	)
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// TestWithoutMultiRoundTrip verifies the client.WithoutMultiRoundTrip opt-out:
+// with it set, the input-required result from the server is surfaced directly
+// to the caller (mcp.CallToolResult.NeedsInput true, err nil, handler invoked
+// once); without it (the default), go-sdk's automatic MRTR loop engages and,
+// lacking an elicitation handler to fulfill the server's request, CallTool
+// returns a non-nil error.
+//
+// The two subtests intentionally run sequentially (not in t.Parallel()):
+// both exercise the same server-side tool and atomic call counter, and the
+// opt-out subtest asserts an exact invocation count, which would be racy
+// against a concurrently-running sibling subtest.
+//
+//nolint:tparallel // subtests share server-side state (atomic call counter); see doc comment.
+func TestWithoutMultiRoundTrip(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	var calls int32
+	ts := newMRTRTestServer(t, &calls)
+
+	t.Run("opt-out surfaces input-required result", func(t *testing.T) { //nolint:paralleltest // shares call counter; see doc comment.
+		c, err := client.NewStreamableHttpClientWithOpts(
+			ts.URL, nil, []client.ClientOption{client.WithoutMultiRoundTrip()},
+		)
+		require.NoError(t, err)
+		require.NoError(t, c.Start(ctx))
+		t.Cleanup(func() { _ = c.Close() })
+
+		_, err = c.Initialize(ctx, mcp.InitializeRequest{
+			Params: mcp.InitializeParams{
+				ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+				ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+			},
+		})
+		require.NoError(t, err)
+
+		before := atomic.LoadInt32(&calls)
+		res, err := c.CallTool(ctx, mcp.CallToolRequest{
+			Params: mcp.CallToolParams{Name: needsInputToolName},
+		})
+		require.NoError(t, err)
+		assert.True(t, res.NeedsInput())
+		assert.Equal(t, before+1, atomic.LoadInt32(&calls), "handler must be invoked exactly once")
+	})
+
+	t.Run("default MRTR errors without a fulfilling handler", func(t *testing.T) { //nolint:paralleltest // shares call counter; see doc comment.
+		c, err := client.NewStreamableHttpClient(ts.URL)
+		require.NoError(t, err)
+		require.NoError(t, c.Start(ctx))
+		t.Cleanup(func() { _ = c.Close() })
+
+		_, err = c.Initialize(ctx, mcp.InitializeRequest{
+			Params: mcp.InitializeParams{
+				ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+				ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+			},
+		})
+		require.NoError(t, err)
+
+		_, err = c.CallTool(ctx, mcp.CallToolRequest{
+			Params: mcp.CallToolParams{Name: needsInputToolName},
+		})
+		assert.Error(t, err, "the auto MRTR loop must fail without an elicitation handler")
+	})
 }

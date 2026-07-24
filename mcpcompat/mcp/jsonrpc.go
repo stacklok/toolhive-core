@@ -326,6 +326,18 @@ const (
 
 	// URL_ELICITATION_REQUIRED is the error code for when URL elicitation is required.
 	URL_ELICITATION_REQUIRED = -32042
+
+	// HEADER_MISMATCH indicates that HTTP headers do not match the
+	// corresponding values sent in the initial InitializeRequest.
+	HEADER_MISMATCH = -32020
+
+	// MISSING_REQUIRED_CLIENT_CAPABILITIES indicates that the client did not
+	// declare one or more capabilities required by the server for the request.
+	MISSING_REQUIRED_CLIENT_CAPABILITIES = -32021
+
+	// UNSUPPORTED_PROTOCOL_VERSION indicates that the requested protocol
+	// version is not supported by the receiving party.
+	UNSUPPORTED_PROTOCOL_VERSION = -32022
 )
 
 // EmptyResult represents a response that indicates success but carries no data.

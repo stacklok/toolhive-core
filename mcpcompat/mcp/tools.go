@@ -13,6 +13,14 @@ import (
 
 var errToolSchemaConflict = errors.New("provide either InputSchema or RawInputSchema, not both")
 
+// resultTypeInputRequired mirrors the "resultType" wire field go-sdk emits on
+// CallToolResult (and GetPromptResult/ReadResourceResult) for MCP 2026-07-28+
+// multi round-trip requests (SEP-2322) when the server needs additional
+// client input before the call can complete; go-sdk's counterpart wire value
+// for a normal completion is "complete", which NeedsInput does not need to
+// test for explicitly. See NeedsInput.
+const resultTypeInputRequired = "input_required"
+
 // ListToolsRequest is sent from the client to request a list of tools the
 // server has.
 type ListToolsRequest struct {
@@ -48,6 +56,13 @@ type CallToolResult struct {
 	//
 	// If not set, this is assumed to be false (the call was successful).
 	IsError bool `json:"isError,omitempty"`
+
+	// resultType captures the "resultType" wire field go-sdk emits for MCP
+	// 2026-07-28+ multi round-trip requests (SEP-2322): "complete" or
+	// "input_required". It is populated by UnmarshalJSON but not re-emitted by
+	// MarshalJSON — this shim type is a consumed/classification value, not a
+	// server-constructed one; see NeedsInput.
+	resultType string
 }
 
 // CallToolRequest is used by the client to invoke a tool provided by the server.
@@ -249,7 +264,26 @@ func (r *CallToolResult) UnmarshalJSON(data []byte) error {
 		}
 	}
 
+	// Capture resultType (SEP-2322 multi round-trip classification), if present.
+	if rt, ok := raw["resultType"].(string); ok {
+		r.resultType = rt
+	}
+
 	return nil
+}
+
+// NeedsInput reports whether this result requires further client input before
+// the tool call can complete. It mirrors go-sdk's CallToolResult.NeedsInput,
+// which classifies MCP 2026-07-28+ multi round-trip requests (SEP-2322)
+// results via the wire "resultType" field ("input_required" vs "complete").
+//
+// NeedsInput is only meaningful when multi round-trip handling is disabled on
+// the client (see client.WithoutMultiRoundTrip): with it enabled (the
+// default), the client auto-fulfills server input requests and retries
+// internally, so a CallToolResult reaching the caller never reports
+// NeedsInput true.
+func (r CallToolResult) NeedsInput() bool {
+	return r.resultType == resultTypeInputRequired
 }
 
 // TaskSupport indicates how a tool supports task augmentation.
