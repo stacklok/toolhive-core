@@ -258,6 +258,75 @@ func TestOnNotification_ProgressAndLogging(t *testing.T) {
 	require.GreaterOrEqual(t, len(got), 2, "at least progress and logging notifications expected")
 }
 
+// TestInitialize_StatefulServerNegotiatesLegacyProtocolVersion verifies that
+// Initialize() against a stateful (non-stateless) shim server still
+// negotiates the shim-owned 2025-11-25 protocol version, and that subsequent
+// calls succeed.
+//
+// go-sdk v1.7 changed (*gosdk.Client).Connect to be "Modern-first": per
+// SEP-2575 it always tries the stateless server/discover RPC first, because
+// the client's default protocol version is now the SDK's latest
+// (2026-07-28). This shim's client does not opt into that (WithStateless is
+// out of scope for this PR; see PR2/PR3), so the discover probe against a
+// stateful server is rejected and go-sdk correctly falls back to the legacy
+// initialize handshake, negotiating down to LATEST_PROTOCOL_VERSION exactly
+// as it did on go-sdk v1.6. This test pins that fallback so a future go-sdk
+// bump cannot silently break it.
+func TestInitialize_StatefulServerNegotiatesLegacyProtocolVersion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := newTestServer(t)
+
+	c, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	initRes, err := c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+	// go-sdk v1.7's discover-first Connect must still fall back to the legacy
+	// handshake and negotiate the shim-owned 2025-11-25 constant against a
+	// stateful server.
+	assert.Equal(t, mcp.LATEST_PROTOCOL_VERSION, initRes.ProtocolVersion)
+
+	tests := []struct {
+		name string
+	}{
+		{name: "ListTools"},
+		{name: "CallTool"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			switch tc.name {
+			case "ListTools":
+				tools, err := c.ListTools(ctx, mcp.ListToolsRequest{})
+				require.NoError(t, err)
+				require.Len(t, tools.Tools, 1)
+				assert.Equal(t, echoToolName, tools.Tools[0].Name)
+			case "CallTool":
+				callRes, err := c.CallTool(ctx, mcp.CallToolRequest{
+					Params: mcp.CallToolParams{
+						Name:      echoToolName,
+						Arguments: map[string]any{"message": "hi"},
+					},
+				})
+				require.NoError(t, err)
+				assert.False(t, callRes.IsError)
+				require.Len(t, callRes.Content, 1)
+				txt, ok := mcp.AsTextContent(callRes.Content[0])
+				require.True(t, ok)
+				assert.Equal(t, "echo: hi", txt.Text)
+			}
+		})
+	}
+}
+
 // TestSetLevel_CompatAlias verifies that the SetLevel compatibility alias
 // (mcp-go's client.Client.SetLevel idiom) delegates to SetLoggingLevel and
 // successfully sets the server's logging level. This guards against the
