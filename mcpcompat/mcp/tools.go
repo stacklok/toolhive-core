@@ -369,6 +369,14 @@ type ToolArgumentsSchema struct {
 	Properties           map[string]any `json:"properties"`
 	Required             []string       `json:"required,omitempty"`
 	AdditionalProperties any            `json:"additionalProperties,omitempty"`
+	// Extra preserves top-level JSON Schema keywords that are not modeled by
+	// the fields above — e.g. oneOf, anyOf, allOf, $ref, enum, const,
+	// patternProperties. Without it, such keywords are silently dropped on an
+	// unmarshal -> marshal round-trip (a schema like {"oneOf": [...]} would be
+	// gutted). Populated by UnmarshalJSON and re-emitted by MarshalJSON; keys
+	// here never overlap the modeled fields. Not a JSON field itself (json:"-");
+	// its contents are inlined at the top level.
+	Extra map[string]json.RawMessage `json:"-"`
 }
 
 // ToolInputSchema remains a named type for retro-compatibility, so its JSON
@@ -390,24 +398,41 @@ func (tos ToolOutputSchema) MarshalJSON() ([]byte, error) {
 
 // MarshalJSON implements the json.Marshaler interface for ToolArgumentsSchema.
 func (tas ToolArgumentsSchema) MarshalJSON() ([]byte, error) {
-	m := make(map[string]any)
-	m["type"] = tas.Type
+	m := make(map[string]any, len(tas.Extra)+5)
+
+	// Re-emit preserved unmodeled keywords first; the modeled fields below take
+	// precedence on the (spec-wise impossible) chance of a key collision.
+	for k, v := range tas.Extra {
+		m[k] = v
+	}
+
+	// Emit "type" only when set. Emitting it unconditionally fabricated
+	// "type":"" for schemas that legitimately omit a top-level type (e.g. a
+	// top-level oneOf), which is not valid JSON Schema and misleads consumers.
+	if tas.Type != "" {
+		m["type"] = tas.Type
+	}
 
 	if tas.Defs != nil {
 		m["$defs"] = tas.Defs
 	}
 
-	// Marshal Properties to '{}' rather than `nil` when its length equals zero
-	if tas.Properties != nil {
+	// For object schemas keep the historical behavior of always emitting an
+	// explicit (possibly empty) properties/required, which clients rely on for
+	// no-argument object tools. A schema that is not object-typed and carries
+	// no properties/required of its own (e.g. a top-level oneOf/anyOf) is left
+	// alone rather than being polluted with a spurious empty properties/required.
+	isObjectSchema := tas.Type == "object"
+	switch {
+	case tas.Properties != nil:
 		m["properties"] = tas.Properties
-	} else {
+	case isObjectSchema:
 		m["properties"] = map[string]any{}
 	}
-
-	// Marshal Required to '[]' rather than `nil` when its length equals zero
-	if len(tas.Required) > 0 {
+	switch {
+	case len(tas.Required) > 0:
 		m["required"] = tas.Required
-	} else {
+	case isObjectSchema:
 		m["required"] = []string{}
 	}
 
@@ -446,6 +471,20 @@ func (tas *ToolArgumentsSchema) UnmarshalJSON(data []byte) error {
 	// If $defs wasn't provided but definitions was, use definitions
 	if tas.Defs == nil && aux.Definitions != nil {
 		tas.Defs = aux.Definitions
+	}
+
+	// Preserve any top-level keywords not modeled by the struct fields (oneOf,
+	// anyOf, allOf, $ref, enum, const, patternProperties, ...) so they survive
+	// an unmarshal -> marshal round-trip instead of being silently dropped.
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(data, &all); err != nil {
+		return err
+	}
+	for _, modeled := range []string{"$defs", "definitions", "type", "properties", "required", "additionalProperties"} {
+		delete(all, modeled)
+	}
+	if len(all) > 0 {
+		tas.Extra = all
 	}
 
 	return nil
