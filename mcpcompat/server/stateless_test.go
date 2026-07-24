@@ -84,6 +84,132 @@ func TestStateless_BasicRequestResponse(t *testing.T) {
 	})
 }
 
+// TestStateless_ListAndDiscoverCacheScopePrivate verifies the fix for the
+// cacheScope cross-identity hazard: go-sdk's setDefaultCacheableValues stamps
+// every list/discover result's IN-BODY Cacheable.CacheScope with "public",
+// with no awareness that, under stateless serving, that same result is
+// produced by the shim's per-identity before-hook projection
+// (sessionDispatchMiddleware). sessionDispatchMiddleware must rewrite that
+// hint to "private" on the stateless path before the response is serialized,
+// so an MCP-aware cache never treats one identity's projected list/discover
+// result as shareable with another identity.
+func TestStateless_ListAndDiscoverCacheScopePrivate(t *testing.T) {
+	t.Parallel()
+
+	const resourceURI = "file:///r"
+	mcpSrv := server.NewMCPServer("stateless-cachescope", "1.0.0")
+	addGreetTool(mcpSrv)
+	mcpSrv.AddResource(
+		mcp.Resource{URI: resourceURI, Name: "r", MIMEType: "text/plain"},
+		func(context.Context, mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+			return []mcp.ResourceContents{
+				mcp.TextResourceContents{URI: resourceURI, MIMEType: "text/plain", Text: "hi"},
+			}, nil
+		},
+	)
+	s := server.NewStreamableHTTPServer(mcpSrv, server.WithStateless(true))
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+
+	t.Run("tools/list", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		resp := postRPC(ctx, t, ts.URL, "", `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
+		r := readFirstResult(t, resp)
+		require.Nil(t, r.Error, "tools/list should not error")
+		var res struct {
+			CacheScope string `json:"cacheScope"`
+		}
+		require.NoError(t, json.Unmarshal(r.Result, &res))
+		assert.Equal(t, "private", res.CacheScope,
+			"a stateless tools/list result is per-identity projected and must never be marked cacheScope:public")
+	})
+
+	t.Run("server/discover", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		// server/discover is only recognized when the request's _meta carries
+		// io.modelcontextprotocol/protocolVersion:"2026-07-28" (SEP-2575's
+		// per-request new-protocol signal; see go-sdk's ServerSession.handle),
+		// so this is sent via a raw request rather than postRPC: postRPC always
+		// sets Mcp-Protocol-Version: 2025-06-18, which go-sdk rejects as
+		// mismatched against a 2026-07-28 _meta on the very same request.
+		body := `{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{"_meta":{` +
+			`"io.modelcontextprotocol/protocolVersion":"2026-07-28",` +
+			`"io.modelcontextprotocol/clientInfo":{"name":"test","version":"1.0"},` +
+			`"io.modelcontextprotocol/clientCapabilities":{}}}}`
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL, strings.NewReader(body))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", bothAcceptMediaTypesForTest)
+		req.Header.Set("MCP-Protocol-Version", "2026-07-28")
+		// 2026-07-28's standard-headers requirement (SEP-2575) mandates an
+		// Mcp-Method header mirroring the body's method for any request once
+		// Mcp-Protocol-Version >= 2026-07-28.
+		req.Header.Set("Mcp-Method", "server/discover")
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		r := readFirstResult(t, resp)
+		require.Nil(t, r.Error, "server/discover should not error")
+		var res struct {
+			CacheScope string `json:"cacheScope"`
+		}
+		require.NoError(t, json.Unmarshal(r.Result, &res))
+		assert.Equal(t, "private", res.CacheScope,
+			"a stateless server/discover result must never be marked cacheScope:public")
+	})
+
+	t.Run("resources/read", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		// resources/read runs its handler with the caller's bridged identity and
+		// can return per-identity content, so its go-sdk-default cacheScope:"public"
+		// hint is the same cross-identity cache-leak risk as a projected list.
+		resp := postRPC(ctx, t, ts.URL, "",
+			`{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"file:///r"}}`)
+		r := readFirstResult(t, resp)
+		require.Nil(t, r.Error, "resources/read should not error")
+		var res struct {
+			CacheScope string `json:"cacheScope"`
+		}
+		require.NoError(t, json.Unmarshal(r.Result, &res))
+		assert.Equal(t, "private", res.CacheScope,
+			"a stateless resources/read result is served per-identity and must never be marked cacheScope:public")
+	})
+}
+
+// TestStateful_ListToolsCacheScopeUntouched pins the divergence from
+// TestStateless_ListAndDiscoverCacheScopePrivate: a stateful server has no
+// per-identity projection concern (every session is its own, non-shared
+// go-sdk ServerSession, not a per-request ephemeral binding), so
+// sessionDispatchMiddleware must leave go-sdk's default cacheScope:"public"
+// alone on the stateful path.
+func TestStateful_ListToolsCacheScopeUntouched(t *testing.T) {
+	t.Parallel()
+
+	mcpSrv := server.NewMCPServer("stateful-cachescope", "1.0.0")
+	addGreetTool(mcpSrv)
+	s := server.NewStreamableHTTPServer(mcpSrv, server.WithStateless(false))
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+
+	sid := initSession(t, ts.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp := postRPC(ctx, t, ts.URL, sid, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
+	r := readFirstResult(t, resp)
+	require.Nil(t, r.Error, "tools/list should not error")
+	var res struct {
+		CacheScope string `json:"cacheScope"`
+	}
+	require.NoError(t, json.Unmarshal(r.Result, &res))
+	assert.Equal(t, "public", res.CacheScope,
+		"the stateful path must not be touched by the stateless cacheScope rewrite")
+}
+
 // TestStateless_GETAndDELETENotAllowed verifies that a stateless server has no
 // stream to open and no session to terminate, so go-sdk answers both GET and
 // DELETE with 405, carrying the RFC 9110-mandated Allow header.

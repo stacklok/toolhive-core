@@ -766,20 +766,24 @@ func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server, stateless bool)
 			// fireBeforeHooks for the extraction and fallback behavior.
 			s.fireBeforeHooks(ctx, method, req)
 			res, err := next(ctx, method, req)
-			// TODO(cacheScope): go-sdk's setDefaultCacheableValues stamps
-			// cacheScope:"public" (Cacheable.CacheScope, an IN-BODY MCP result
-			// field, NOT an HTTP header) on 2026-07-28 list/discover result
-			// bodies, but leaves ttlMs=0. Per the spec a zero TTL means
-			// "immediately stale", so a bare "public" scope with ttlMs==0 is
-			// inert: nothing may actually cache it yet. The cross-identity
-			// cache-share hazard for a per-identity-projected result only
-			// materializes once something sets a positive ttlMs. When that
-			// happens, the fix is an IN-BODY rewrite of cacheScope to
-			// "private" on per-identity-projected results — either here
-			// (this middleware already holds res) or in the vMCP envelope —
-			// NOT an HTTP Cache-Control header, which cannot neutralize a
-			// cacheScope an MCP-aware cache reads from the body. Deferred:
-			// no consumer sets a positive ttlMs yet. Tracked as follow-up.
+			// go-sdk's setDefaultCacheableValues (mcp/protocol.go) unconditionally
+			// stamps cacheScope:"public" (Cacheable.CacheScope, an IN-BODY MCP
+			// result field, NOT an HTTP header) on every list/discover result,
+			// with no awareness of stateless per-identity projection. Under
+			// stateless, list/discover results are produced by this middleware's
+			// own before-hook projection (fireBeforeHooks) and per-request
+			// ephemeral session binding (bindSessionForDispatch), so the same
+			// request can yield a different, identity-scoped result each time —
+			// a "public" hint on such a result would let an MCP-aware cache serve
+			// one identity's projected list to another. Rewrite it to "private"
+			// here, since cacheScope lives in the body: an HTTP Cache-Control
+			// header cannot neutralize a scope hint an MCP-aware cache reads from
+			// the body. This only narrows the SDK's default; it never widens
+			// cache-sharing. The stateful path is untouched (no per-identity
+			// projection there, so "public" is the SDK's intended default).
+			if err == nil && stateless {
+				stripPublicCacheScope(res)
+			}
 			if err != nil && method == string(mcp.MethodToolsCall) {
 				err = translateUnknownToolError(err, req)
 			}
@@ -796,6 +800,42 @@ func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server, stateless bool)
 			}
 			return res, err
 		}
+	}
+}
+
+// stripPublicCacheScope rewrites an in-body "public" Cacheable.CacheScope hint
+// to "private" on the go-sdk results that carry one.
+//
+// go-sdk stamps a "public" CacheScope (setDefaultCacheableValues,
+// mcp/protocol.go) on every list/discover result AND on resources/read results,
+// regardless of whether the body was produced per-identity — which it is under
+// stateless serving (see sessionDispatchMiddleware). resources/read is included:
+// its handler runs with the caller's bridged identity and can return
+// per-identity content, so a "public" hint on it is the same cross-identity
+// cache-leak as on a projected list. gosdk.GetPromptResult and CompleteResult do
+// not embed Cacheable and are never stamped, so they need no handling here. A
+// nil res, one of an unhandled type, or one already scoped "private", is a
+// no-op.
+func stripPublicCacheScope(res gosdk.Result) {
+	var c *gosdk.Cacheable
+	switch r := res.(type) {
+	case *gosdk.ListToolsResult:
+		c = &r.Cacheable
+	case *gosdk.ListResourcesResult:
+		c = &r.Cacheable
+	case *gosdk.ListResourceTemplatesResult:
+		c = &r.Cacheable
+	case *gosdk.ListPromptsResult:
+		c = &r.Cacheable
+	case *gosdk.DiscoverResult:
+		c = &r.Cacheable
+	case *gosdk.ReadResourceResult:
+		c = &r.Cacheable
+	default:
+		return
+	}
+	if c.CacheScope == "public" {
+		c.CacheScope = "private"
 	}
 }
 
