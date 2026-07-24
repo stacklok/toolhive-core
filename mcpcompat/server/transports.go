@@ -60,7 +60,7 @@ type stdioConfig struct{}
 // ServeStdio runs the MCP server over stdio until the context is done. It
 // mirrors mcp-go's server.ServeStdio.
 func ServeStdio(server *MCPServer, _ ...StdioOption) error {
-	srv, err := server.buildServer(nil)
+	srv, err := server.buildServer(nil, false)
 	if err != nil {
 		return err
 	}
@@ -92,6 +92,11 @@ type StreamableHTTPServer struct {
 	// Host header). mcp-go had no such protection; local proxies with custom Host
 	// headers need it disabled. See WithDisableLocalhostProtection.
 	disableLocalhostProtection bool
+	// stateless enables MCP 2026-07-28 stateless Streamable HTTP serving
+	// (go-sdk's StreamableHTTPOptions.Stateless): every POST is served by a
+	// fresh, temporary session (no initialize handshake, no Mcp-Session-Id) that
+	// go-sdk tears down when the request completes. See WithStateless.
+	stateless bool
 
 	once     sync.Once
 	handler  http.Handler
@@ -207,6 +212,52 @@ func WithDisableLocalhostProtection(disable bool) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.disableLocalhostProtection = disable }
 }
 
+// WithStateless enables MCP 2026-07-28 stateless Streamable HTTP serving.
+// Under go-sdk's stateless mode there is no initialize handshake and no
+// Mcp-Session-Id: every POST is dispatched against a fresh, temporary session
+// that go-sdk discards once the request completes, and GET/DELETE are
+// answered 405 (a stateless server has no stream to open and no session to
+// terminate). See ServeHTTP for how this short-circuits the shim's stateful
+// session bookkeeping (rehydration routing, local-session validation, DELETE
+// handling).
+//
+// Legacy (<2026-07-28) clients are NOT rejected under stateless: go-sdk still
+// answers their requests, just in a degraded, sessionless form — no session
+// id is issued, and there is no elicitation, no server->client notifications,
+// and no resumability, because none of those have anywhere to go without a
+// persistent session/standalone stream. This mode is not Modern-protocol-only;
+// it changes how EVERY client (legacy or modern) is served.
+//
+// A SessionIdManager configured via WithSessionIdManager is inert in this
+// mode: go-sdk's stateless path never consults GetSessionID, and there is no
+// session ID for Validate/Terminate to act on.
+//
+// KNOWN LIMITATION — per-identity projection is TOOLS-only under stateless:
+// ToolHive's per-session capability projection (SessionWithTools/
+// SessionWithResources/SessionWithResourceTemplates/SessionWithPrompts) is
+// normally installed by the OnRegisterSession hook, which fires from
+// registerAndSync on the initialize/notifications-initialized handshake.
+// Stateless serving has no such handshake — every request gets a fresh
+// ephemeral session (see bindSessionForDispatch) and registerAndSync never
+// runs for it — so OnRegisterSession never fires and that overlay path is
+// unavailable. The ONLY per-identity projection seam that survives under
+// stateless is the before-list/before-call TOOLS hooks (fireBeforeHooks),
+// because the shim fires those directly from sessionDispatchMiddleware ahead
+// of every dispatch, independent of registration. mcp-go's Hooks type (which
+// this shim mirrors) has no equivalent before-list-resources/
+// before-list-prompts/before-read-resource/before-get-prompt seam, so
+// resources, resource templates, and prompts are served from the global/
+// server-level set under stateless, not projected per identity — the tools
+// path is projected; those are not. This is a functional scoping gap (results
+// are global/empty, not cross-identity-leaked — isolation is intact) tracked
+// as a known limitation to be addressed when per-identity resource/prompt
+// projection is needed under stateless serving. No consumer currently wires
+// this shim path for stateless projection, so the Hooks API is intentionally
+// NOT expanded to cover it yet.
+func WithStateless(stateless bool) StreamableHTTPOption {
+	return func(s *StreamableHTTPServer) { s.stateless = stateless }
+}
+
 // WithHTTPContextFunc installs a per-request context customizer.
 //
 // Context values injected here are applied to ALL POSTs, including the
@@ -244,12 +295,16 @@ func WithHTTPContextFunc(fn HTTPContextFunc) StreamableHTTPOption {
 func (s *StreamableHTTPServer) build() {
 	s.once.Do(func() {
 		var gen func() string
-		if s.sessionIDMgr != nil {
+		// Belt-and-suspenders: under Stateless, go-sdk's serveStateless never
+		// calls GetSessionID (see WithStateless), so installing the manager's
+		// Generate here would be dead code at best; omitting it makes that
+		// explicit and guarantees the manager is never invoked in this mode.
+		if s.sessionIDMgr != nil && !s.stateless {
 			gen = s.sessionIDMgr.Generate
 		}
 		// Validate the server configuration once up-front so a bad registration
 		// surfaces as a clean 500 rather than a per-request nil.
-		if _, err := s.mcp.buildServer(gen); err != nil {
+		if _, err := s.mcp.buildServer(gen, s.stateless); err != nil {
 			s.buildErr = err
 			return
 		}
@@ -264,13 +319,16 @@ func (s *StreamableHTTPServer) build() {
 			// protection off, restoring mcp-go's acceptance of local proxies
 			// with custom Host headers.
 			DisableLocalhostProtection: s.disableLocalhostProtection,
+			// Stateless propagates MCP 2026-07-28 stateless serving to go-sdk.
+			// See WithStateless.
+			Stateless: s.stateless,
 		}
 		// A fresh go-sdk server per client session lets each session carry its own
 		// tool/resource overlay (mcp-go's per-session projection), synced by the
 		// registration middleware buildServer installs. The heartbeat keep-alive
 		// is applied at the HTTP layer (keepAliveWriter, see WithHeartbeatInterval),
 		// not through go-sdk's active KeepAlive.
-		s.handler = gosdk.NewStreamableHTTPHandler(s.mcp.getServerFunc(gen), opts)
+		s.handler = gosdk.NewStreamableHTTPHandler(s.mcp.getServerFunc(gen, s.stateless), opts)
 	})
 }
 
@@ -336,7 +394,25 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	// is best-effort for notifications. A proper fix awaits go-sdk per-request
 	// context propagation (upstream ask).
 	defer s.mcp.clearPendingRequestContext(nonce)
-	// DELETE terminates the session. mcp-go answered 200 and drove the supplied
+
+	// Stateless short-circuit. The identity contextFunc, the denial gate, and
+	// the nonce bridge above have already run, so per-identity projection and
+	// authz still apply; everything below this point is stateful-only session
+	// bookkeeping (DELETE handling, cross-replica rehydration routing,
+	// local-session revalidation) that does not apply here. go-sdk's
+	// serveStateless builds a brand-new temporary session per POST (never
+	// consulting Mcp-Session-Id or a SessionIdManager) and answers GET/DELETE
+	// with 405, so any Mcp-Session-Id a client sends on a stateless request is
+	// simply ignored — matching go-sdk, and skipping this session machinery
+	// entirely is what makes that safe (see contextWithSession/
+	// bindEphemeralSession in session.go for the per-request isolation this
+	// depends on).
+	if s.stateless {
+		s.handler.ServeHTTP(w, r)
+		return
+	}
+
+	// DELETE terminates the session (stateful only). mcp-go answered 200 and drove the supplied
 	// SessionIdManager's Terminate; go-sdk answers 204 and manages its own session
 	// map. Rewrite the status to 200 for compatibility and forward the termination
 	// to the manager so ToolHive's session storage is cleaned up in lockstep.
@@ -352,7 +428,8 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Cross-replica routing: a request carrying a session ID that was NOT
+	// Cross-replica routing (stateful only; unreachable when s.stateless, which
+	// returns above). A request carrying a session ID that was NOT
 	// initialized on this instance (its initialize handshake happened on another
 	// replica) cannot be served by the go-sdk StreamableHTTPHandler, which 404s
 	// any session ID it did not create. Validate it against the shared
@@ -362,7 +439,8 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Local-session validation (issue #156, item U5): a session initialized on
+	// Local-session validation (stateful only; unreachable when s.stateless,
+	// which returns above) (issue #156, item U5): a session initialized on
 	// THIS instance is trusted by the local go-sdk handler, but mcp-go validated
 	// every request. When a shared SessionIdManager is configured, validate local
 	// sessions on every request too, so a session terminated in the shared store
@@ -429,7 +507,11 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 // safe: it is excluded here by method, and even if wrapped the Content-Type
 // gate (application/json under JSONResponse) would keep the ticker off.
 func (s *StreamableHTTPServer) wrapKeepAlive(w http.ResponseWriter, r *http.Request) (http.ResponseWriter, func()) {
-	if r.Method != http.MethodGet || s.heartbeat <= 0 {
+	// Under Stateless, go-sdk answers every GET with 405 (no session, no
+	// stream to keep alive), so the keep-alive is never legitimate here
+	// regardless of method; excluding it explicitly avoids wrapping a
+	// ResponseWriter that will only ever carry an error body.
+	if r.Method != http.MethodGet || s.heartbeat <= 0 || s.stateless {
 		return w, func() {}
 	}
 	k := newKeepAliveWriter(w, s.heartbeat, s.mcp.logger)
@@ -533,7 +615,11 @@ func (s *StreamableHTTPServer) rehydrate(r *http.Request, sid string) (*rehydrat
 		return rt, nil
 	}
 
-	srv, err := s.mcp.buildServer(nil)
+	// Rehydration only ever runs on the stateful path (ServeHTTP's stateless
+	// short-circuit returns before serveRehydrated could be reached), and the
+	// reconstructed session below is deliberately a full, stateful session
+	// (seeded state, resumable), so this is never stateless.
+	srv, err := s.mcp.buildServer(nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -640,11 +726,12 @@ func WithMessageEndpoint(endpoint string) SSEOption {
 
 func (s *SSEServer) build() {
 	s.once.Do(func() {
-		if _, err := s.mcp.buildServer(nil); err != nil {
+		// The (legacy) SSE transport has no stateless mode of its own.
+		if _, err := s.mcp.buildServer(nil, false); err != nil {
 			s.buildErr = err
 			return
 		}
-		s.handler = gosdk.NewSSEHandler(s.mcp.getServerFunc(nil), nil)
+		s.handler = gosdk.NewSSEHandler(s.mcp.getServerFunc(nil, false), nil)
 	})
 }
 

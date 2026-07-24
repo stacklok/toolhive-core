@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	gosdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -121,7 +122,7 @@ func TestForgetSession_ClosesNotifChannel(t *testing.T) {
 func TestSetSessionTools_NonObjectSchemaDoesNotPanic(t *testing.T) {
 	t.Parallel()
 	s := NewMCPServer("s", "1")
-	srv, err := s.buildServer(nil)
+	srv, err := s.buildServer(nil, false)
 	require.NoError(t, err)
 
 	cs := s.sessionFor("sid-bad-schema")
@@ -195,7 +196,7 @@ func TestBuildServer_GlobalAndSessionTools(t *testing.T) {
 	// Building the global server (with the globally-registered tool) must succeed.
 	// Per-session overlays are no longer baked in here; they are synced onto the
 	// per-session server by syncSessionTools once the session registers.
-	srv, err := s.buildServer(nil)
+	srv, err := s.buildServer(nil, false)
 	require.NoError(t, err)
 	require.NotNil(t, srv)
 
@@ -218,7 +219,7 @@ func TestBuildServer_WithSessionIDGenerator(t *testing.T) {
 	called := false
 	gen := func() string { called = true; return "generated-id" }
 
-	srv, err := s.buildServer(gen)
+	srv, err := s.buildServer(gen, false)
 	require.NoError(t, err)
 	require.NotNil(t, srv)
 	// The generator is installed on the server (invoked by the SDK per new
@@ -366,4 +367,79 @@ func TestNormalizeObjectSchema(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// TestBindSessionForDispatch_StatelessForcesEphemeralRegardlessOfSessionID is
+// the regression for the "allowsessionsinstateless bypass" finding: go-sdk's
+// (off-by-default) allowsessionsinstateless=1 MCPGODEBUG compatibility flag
+// lets a legacy (<2026-07-28) stateless POST carry a client-supplied
+// Mcp-Session-Id all the way to ss.ID(), even though go-sdk still builds a
+// brand-new, per-POST temp session under the hood. Before this fix,
+// bindSessionForDispatch gated on ss.ID()=="" alone, so that non-empty,
+// attacker-or-caller-supplied ID would route through contextWithSession into
+// the SHARED s.sessions registry — meaning two concurrent callers presenting
+// the SAME session id would collapse onto ONE clientSession (cross-identity
+// bleed), silently defeating the isolation this package is built to
+// guarantee.
+//
+// The MCPGODEBUG env var is read once at process init (see go-sdk's
+// mcpgodebug package), so it cannot be toggled from a test to reproduce this
+// via a real HTTP round trip. Instead this test drives the exact shim-level
+// invariant directly: it connects two go-sdk ServerSessions that both carry
+// the SAME non-"" session ID (constructed the same way
+// StreamableHTTPServer.rehydrate builds a session with a caller-chosen ID,
+// via a StreamableServerTransport{SessionID: ...} + Server.Connect) and calls
+// bindSessionForDispatch(..., stateless=true) for each. It asserts:
+//  1. both dispatches take the ephemeral (cleanup-bearing) path despite a
+//     non-empty ss.ID();
+//  2. the shared s.sessions registry is NEVER populated; and
+//  3. the two dispatches get their OWN, independent ClientSession — proving
+//     isolation holds even when both callers present the identical ID.
+func TestBindSessionForDispatch_StatelessForcesEphemeralRegardlessOfSessionID(t *testing.T) {
+	t.Parallel()
+	s := NewMCPServer("s", "1")
+	srv, err := s.buildServer(nil, true)
+	require.NoError(t, err)
+
+	const sharedAttackerID = "attacker-shared-session-id"
+	connect := func() *gosdk.ServerSession {
+		transport := &gosdk.StreamableServerTransport{SessionID: sharedAttackerID, Stateless: true}
+		ss, err := srv.Connect(context.Background(), transport, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = ss.Close() })
+		return ss
+	}
+
+	ssA := connect()
+	ssB := connect()
+	require.Equal(t, sharedAttackerID, ssA.ID(), "test setup: session must carry the shared client-supplied ID")
+	require.Equal(t, sharedAttackerID, ssB.ID(), "test setup: session must carry the shared client-supplied ID")
+
+	ctxA, cleanupA := s.bindSessionForDispatch(context.Background(), ssA, srv, true)
+	require.NotNil(t, cleanupA,
+		"stateless dispatch must always take the ephemeral (cleanup-bearing) path, even with a non-empty ss.ID()")
+	defer cleanupA()
+
+	ctxB, cleanupB := s.bindSessionForDispatch(context.Background(), ssB, srv, true)
+	require.NotNil(t, cleanupB,
+		"stateless dispatch must always take the ephemeral (cleanup-bearing) path, even with a non-empty ss.ID()")
+	defer cleanupB()
+
+	// The shared registry must never have been touched by either dispatch: a
+	// non-empty, client-supplied session id must never route through
+	// contextWithSession/sessionFor into s.sessions when the server is
+	// stateless.
+	sharedRegistryCount := 0
+	s.sessions.Range(func(any, any) bool { sharedRegistryCount++; return true })
+	assert.Zero(t, sharedRegistryCount,
+		"s.sessions must stay empty under stateless dispatch even when requests carry a shared session id")
+
+	// Each dispatch must have been bound its OWN ephemeral ClientSession, not
+	// a shared one keyed by the identical ID.
+	csA := ClientSessionFromContext(ctxA)
+	csB := ClientSessionFromContext(ctxB)
+	require.NotNil(t, csA)
+	require.NotNil(t, csB)
+	assert.NotSame(t, csA, csB,
+		"each stateless dispatch must get its own ephemeral session, even under a shared client-supplied session id")
 }

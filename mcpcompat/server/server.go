@@ -470,7 +470,14 @@ func (s *MCPServer) AddPrompt(prompt mcp.Prompt, handler PromptHandlerFunc) {
 // syncs that session's overlay tools, resources and prompts onto its own server
 // once the OnRegisterSession hooks have run. This mirrors mcp-go, whose
 // per-session tools were dispatched per connection.
-func (s *MCPServer) buildServer(genSessionID func() string) (*gosdk.Server, error) {
+//
+// stateless MUST be true only when this server backs a StreamableHTTPServer
+// configured WithStateless(true); it is threaded through to
+// sessionDispatchMiddleware, which forces the per-request ephemeral session
+// binding for every dispatch in that mode (see bindSessionForDispatch) rather
+// than trusting the go-sdk ServerSession's ID(). Every other call site
+// (ServeStdio, SSEServer, StreamableHTTPServer.rehydrate) passes false.
+func (s *MCPServer) buildServer(genSessionID func() string, stateless bool) (*gosdk.Server, error) {
 	s.mu.RLock()
 	tools := make(map[string]ServerTool, len(s.tools))
 	for k, v := range s.tools {
@@ -549,7 +556,7 @@ func (s *MCPServer) buildServer(genSessionID func() string) (*gosdk.Server, erro
 		return nil, err
 	}
 
-	srv.AddReceivingMiddleware(s.sessionDispatchMiddleware(srv))
+	srv.AddReceivingMiddleware(s.sessionDispatchMiddleware(srv, stateless))
 	return srv, nil
 }
 
@@ -702,11 +709,12 @@ func addGlobalTool(srv *gosdk.Server, gt *gosdk.Tool, h gosdk.ToolHandler, name 
 
 // getServerFunc returns a getServer callback for the go-sdk HTTP/SSE handlers,
 // which invoke it once per new client session. genSessionID (may be nil) is the
-// session-ID generator to install on each per-session server. On a build error
-// it logs and returns nil, which the go-sdk handler surfaces as an HTTP 400.
-func (s *MCPServer) getServerFunc(genSessionID func() string) func(*http.Request) *gosdk.Server {
+// session-ID generator to install on each per-session server. stateless is
+// forwarded to buildServer (see its doc comment). On a build error it logs
+// and returns nil, which the go-sdk handler surfaces as an HTTP 400.
+func (s *MCPServer) getServerFunc(genSessionID func() string, stateless bool) func(*http.Request) *gosdk.Server {
 	return func(*http.Request) *gosdk.Server {
-		srv, err := s.buildServer(genSessionID)
+		srv, err := s.buildServer(genSessionID, stateless)
 		if err != nil {
 			if s.logger != nil {
 				s.logger.Error("building per-session MCP server", "error", err)
@@ -723,12 +731,17 @@ func (s *MCPServer) getServerFunc(genSessionID func() string) func(*http.Request
 // InitializedHandler only fires on the later notifications/initialized — and it
 // fires the before-list/before-call hooks so ToolHive's lazy per-session tool
 // injection runs before the SDK enumerates or dispatches tools.
-func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server) gosdk.Middleware {
+//
+// stateless is threaded through from buildServer/StreamableHTTPServer.build:
+// see bindSessionForDispatch for how it forces the per-request ephemeral
+// binding regardless of the go-sdk ServerSession's ID().
+func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server, stateless bool) gosdk.Middleware {
 	return func(next gosdk.MethodHandler) gosdk.MethodHandler {
 		return func(ctx context.Context, method string, req gosdk.Request) (gosdk.Result, error) {
 			ss, _ := req.GetSession().(*gosdk.ServerSession)
-			if ss != nil {
-				ctx = s.contextWithSession(ctx, ss)
+			ctx, cleanup := s.bindSessionForDispatch(ctx, ss, srv, stateless)
+			if cleanup != nil {
+				defer cleanup()
 			}
 			// Bridge the originating HTTP request's context values (identity,
 			// audit BackendInfo, telemetry) into the handler context. go-sdk
@@ -753,14 +766,86 @@ func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server) gosdk.Middlewar
 			// fireBeforeHooks for the extraction and fallback behavior.
 			s.fireBeforeHooks(ctx, method, req)
 			res, err := next(ctx, method, req)
+			// TODO(cacheScope): go-sdk's setDefaultCacheableValues stamps
+			// cacheScope:"public" (Cacheable.CacheScope, an IN-BODY MCP result
+			// field, NOT an HTTP header) on 2026-07-28 list/discover result
+			// bodies, but leaves ttlMs=0. Per the spec a zero TTL means
+			// "immediately stale", so a bare "public" scope with ttlMs==0 is
+			// inert: nothing may actually cache it yet. The cross-identity
+			// cache-share hazard for a per-identity-projected result only
+			// materializes once something sets a positive ttlMs. When that
+			// happens, the fix is an IN-BODY rewrite of cacheScope to
+			// "private" on per-identity-projected results — either here
+			// (this middleware already holds res) or in the vMCP envelope —
+			// NOT an HTTP Cache-Control header, which cannot neutralize a
+			// cacheScope an MCP-aware cache reads from the body. Deferred:
+			// no consumer sets a positive ttlMs yet. Tracked as follow-up.
 			if err != nil && method == string(mcp.MethodToolsCall) {
 				err = translateUnknownToolError(err, req)
 			}
-			if err == nil && method == string(mcp.MethodInitialize) && ss != nil {
+			// registerAndSync is the OnRegisterSession path (and, transitively,
+			// registers the session in the shared s.sessions registry — see
+			// NOTE(stateless-projection) on bindSessionForDispatch). Skip it
+			// entirely under stateless: a legacy (allowsessionsinstateless=1)
+			// stateless POST can carry a client-supplied Mcp-Session-Id, which
+			// would otherwise make ss.ID() non-empty even here and route this
+			// dispatch's session into the shared registry, defeating the same
+			// isolation guarantee bindSessionForDispatch enforces below.
+			if err == nil && method == string(mcp.MethodInitialize) && ss != nil && !stateless {
 				s.registerAndSync(ctx, ss, srv)
 			}
 			return res, err
 		}
+	}
+}
+
+// bindSessionForDispatch binds the ClientSession for this dispatch into ctx,
+// selecting the binding strategy for the session's shape:
+//   - no go-sdk session at all (ss==nil): nothing to bind.
+//   - the server is serving stateless (stateless==true), OR the session is a
+//     stateless temp session (ss.ID()==""): go-sdk's serveStateless builds a
+//     fresh one of these per POST, so it gets a per-request ephemeral binding
+//     (bindEphemeralSession) that MUST be torn down via the returned cleanup
+//     once this dispatch returns — see contextWithSession for why a stateless
+//     session must never be looked up/created in the shared s.sessions
+//     registry (cross-identity disclosure).
+//   - any other (stateful) session: looked up or created in the shared
+//     registry as before (contextWithSession); no cleanup needed.
+//
+// The stateless check is NOT redundant with ss.ID()=="": go-sdk's
+// allowsessionsinstateless=1 MCPGODEBUG compatibility flag (off by default)
+// makes a legacy (<2026-07-28) stateless POST carry a client-supplied
+// Mcp-Session-Id through to ss.ID(), so ss.ID() can be non-empty even though
+// go-sdk still builds a brand-new, per-POST temp session under the hood. Were
+// the ID()=="" check the only gate, two callers sending that same id would
+// collapse onto ONE clientSession in the shared registry — a cross-identity
+// leak that defeats the isolation this function exists to guarantee. Forcing
+// the ephemeral path whenever stateless is true closes that gap regardless of
+// what ID string go-sdk happens to hand back.
+//
+// NOTE(stateless-projection): per-identity capability projection under
+// stateless only ever reaches the before-list/before-call TOOLS hooks fired
+// by sessionDispatchMiddleware (fireBeforeHooks): resources, resource
+// templates and prompts have no equivalent before-hook seam, and
+// registerAndSync/OnRegisterSession (where those overlays are normally
+// installed) never fires for an ephemeral binding. So under stateless,
+// resources/resource-templates/prompts are served from the global/
+// server-level set, not projected per identity. This is a functional scoping
+// gap, not an isolation leak: no shared state is exposed. See WithStateless's
+// doc comment (transports.go) for the full account and the tracked follow-up.
+//
+// Extracted out of sessionDispatchMiddleware to keep that function under the
+// gocyclo budget.
+func (s *MCPServer) bindSessionForDispatch(
+	ctx context.Context, ss *gosdk.ServerSession, srv *gosdk.Server, stateless bool,
+) (context.Context, func()) {
+	switch {
+	case ss == nil:
+		return ctx, nil
+	case stateless || ss.ID() == "":
+		return s.bindEphemeralSession(ctx, ss, srv)
+	default:
+		return s.contextWithSession(ctx, ss), nil
 	}
 }
 
