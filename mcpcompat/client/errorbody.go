@@ -57,12 +57,21 @@ func capturedErr(ctx context.Context) *errBody {
 // empty-body 4xx left h.status == 0 and classification fell to the
 // best-effort string fallback, which does not map bare "400 Bad Request"/"404
 // Not Found" on initialize to ErrLegacySSEServer.
+//
+// Only the FIRST non-2xx response on the context is captured, so status, body,
+// and WWW-Authenticate all describe the same response (issue #179). Several
+// requests can share one call context: when a server rejects the initialize
+// POST with 401, the go-sdk sends a session-cleanup DELETE before Connect
+// returns, and a non-401 answer to that DELETE (GitLab 404s it) must not
+// overwrite the 401. Otherwise mapConnectError classifies the connect failure
+// by the cleanup response and an auth challenge surfaces as ErrLegacySSEServer
+// instead of ErrUnauthorized. Later non-2xx responses pass through untouched.
 func captureErrorBody(req *http.Request, resp *http.Response) {
 	if resp == nil || resp.StatusCode < 400 || resp.Body == nil {
 		return
 	}
 	h := capturedErr(req.Context())
-	if h == nil {
+	if h == nil || h.status != 0 {
 		return
 	}
 	// Record the status code unconditionally: it is available from the response
@@ -75,14 +84,6 @@ func captureErrorBody(req *http.Request, resp *http.Response) {
 	// RoundTripper is the only place it is available.
 	if vals := resp.Header.Values("WWW-Authenticate"); len(vals) > 0 {
 		h.wwwAuthHdrs = vals
-	}
-	// Only capture the body once (the first non-2xx response on this context).
-	if h.body != "" {
-		// Body already captured; still restore resp.Body for downstream readers.
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
-		resp.Body = io.NopCloser(bytes.NewReader(nil))
-		return
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxCapturedErrBody))
 	_ = resp.Body.Close()
