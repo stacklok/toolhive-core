@@ -248,8 +248,23 @@ type sessionContextKey struct{}
 
 // contextWithSession looks up (or creates) the clientSession for the given
 // go-sdk ServerSession and stores it in the context.
+//
+// SECURITY: a stateless temp session (go-sdk's serveStateless creates one per
+// POST, with ID()=="" — the legacy-id compatibility path that would give it a
+// non-empty ID is off by default) must NEVER be looked up or created here.
+// sessionFor keys its registry by session ID, so calling it with "" would
+// LoadOrStore ONE shared clientSession for every concurrent stateless request,
+// regardless of caller identity — a cross-identity tool/resource/prompt
+// disclosure. The dispatch middleware (sessionDispatchMiddleware ->
+// bindEphemeralSession) already binds THIS request's own ephemeral
+// ClientSession into ctx before any handler that calls this function runs, so
+// returning ctx unchanged for ss.ID()=="" preserves that per-request binding
+// rather than clobbering it with a shared one.
 func (s *MCPServer) contextWithSession(ctx context.Context, ss *gosdk.ServerSession) context.Context {
 	if ss == nil {
+		return ctx
+	}
+	if ss.ID() == "" {
 		return ctx
 	}
 	cs := s.sessionFor(ss.ID())
@@ -257,7 +272,13 @@ func (s *MCPServer) contextWithSession(ctx context.Context, ss *gosdk.ServerSess
 	return context.WithValue(ctx, sessionContextKey{}, ClientSession(cs))
 }
 
-// sessionFor returns the registered clientSession for id, creating it if needed.
+// sessionFor returns the registered clientSession for id, creating it if
+// needed. Callers must never pass "": contextWithSession diverts the
+// stateless (ss.ID()=="") case before it can reach here, and
+// bindEphemeralSession constructs its per-request ephemeral session directly
+// via newClientSession rather than through this shared registry, so a
+// ""-keyed entry — and the cross-identity bleed a shared one would cause — is
+// never created.
 func (s *MCPServer) sessionFor(id string) *clientSession {
 	if v, ok := s.sessions.Load(id); ok {
 		return v.(*clientSession)
@@ -267,14 +288,58 @@ func (s *MCPServer) sessionFor(id string) *clientSession {
 	return actual.(*clientSession)
 }
 
+// bindEphemeralSession binds a per-request ClientSession for a stateless temp
+// session (go-sdk's serveStateless creates one, with ID()=="", for every POST)
+// into ctx, WITHOUT registering it in s.sessions (see contextWithSession):
+// each stateless POST gets its own throwaway clientSession, scoped to this
+// dispatch only, so concurrent requests from different identities never share
+// state.
+//
+// The returned cleanup MUST be invoked (via defer) once this dispatch
+// returns. newClientSession starts a goroutine that drains the session's
+// notification channel for the session's lifetime; because this ephemeral
+// session is never registered, forgetSession never runs for it, so the
+// returned cleanup is the only thing that closes the channel and lets that
+// goroutine exit. Without it, every stateless POST would leak one goroutine.
+func (s *MCPServer) bindEphemeralSession(
+	ctx context.Context, ss *gosdk.ServerSession, srv *gosdk.Server,
+) (context.Context, func()) {
+	cs := newClientSession("")
+	cs.goSession.Store(ss)
+	cs.owner.Store(s)
+	cs.boundServer.Store(srv)
+	cs.Initialize()
+	ctx = context.WithValue(ctx, sessionContextKey{}, ClientSession(cs))
+	return ctx, func() { cs.notifClose.Do(func() { close(cs.notifCh) }) }
+}
+
 // registerAndSync registers the session for the given go-sdk ServerSession,
 // firing the OnRegisterSession hooks exactly once and then reconciling any
 // per-session tool/resource/prompt overlay the hooks installed onto srv (the go-sdk
 // server bound to this session). It is invoked from the initialize dispatch
 // middleware (matching mcp-go's on-initialize timing) and, defensively, from the
 // InitializedHandler; the once-guard makes the second call a cheap no-op.
+//
+// NOTE(stateless-projection): this is also the ONLY path that fires
+// OnRegisterSession, which is where SessionWithResources/
+// SessionWithResourceTemplates/SessionWithPrompts overlays are normally
+// installed. sessionDispatchMiddleware (server.go) never calls this function
+// under stateless (it skips the call outright when stateless is true, and
+// separately this function no-ops for any ss.ID()==""), so under stateless
+// those three overlays are never installed and resources/resource-templates/
+// prompts are served from the global/server-level set rather than projected
+// per identity. Tools are the one exception: fireBeforeHooks (server.go)
+// fires the before-list/before-call TOOLS hooks directly from the dispatch
+// middleware on every request, independent of registration, so per-identity
+// tool projection still works under stateless. See WithStateless's doc
+// comment (transports.go) for the full account of this known limitation.
 func (s *MCPServer) registerAndSync(ctx context.Context, ss *gosdk.ServerSession, srv *gosdk.Server) {
-	if ss == nil {
+	// ss.ID()=="" is a stateless temp session: it has no initialize/
+	// notifications-initialized handshake to register (go-sdk's
+	// serveStateless never calls the InitializedHandler either), and
+	// registering it here would mean sessionFor("") — the exact shared-state
+	// hazard contextWithSession's doc comment describes. No-op.
+	if ss == nil || ss.ID() == "" {
 		return
 	}
 	cs := s.sessionFor(ss.ID())
@@ -455,7 +520,10 @@ func (s *MCPServer) syncSessionPrompts(srv *gosdk.Server, cs *clientSession) {
 }
 
 // isLocalSession reports whether the session ID was initialized on this server
-// instance (see MCPServer.localSessions).
+// instance (see MCPServer.localSessions). Stateless requests never reach the
+// StreamableHTTPServer code paths that call this (ServeHTTP short-circuits
+// stateless serving before any session-ID-keyed lookup), so id=="" is not a
+// case this needs to special-case.
 func (s *MCPServer) isLocalSession(id string) bool {
 	_, ok := s.localSessions.Load(id)
 	return ok
@@ -467,6 +535,13 @@ func (s *MCPServer) isLocalSession(id string) bool {
 // the drain goroutine started in newClientSession exits, preventing a goroutine
 // leak per closed session.
 func (s *MCPServer) forgetSession(id string) {
+	// id=="" would otherwise LoadAndDelete/close the shared entry a stateless
+	// contextWithSession call must never create in the first place; guard
+	// defensively since forgetSession is reachable from the DELETE path with
+	// whatever Mcp-Session-Id header the client sent.
+	if id == "" {
+		return
+	}
 	v, ok := s.sessions.LoadAndDelete(id)
 	s.localSessions.Delete(id)
 	if ok {
