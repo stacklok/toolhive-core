@@ -86,6 +86,18 @@ linters:
       - linters:
           - lll
         path: .golangci.yml
+      # mcpcompat is an intentional drop-in compatibility layer for mcp-go and
+      # must keep exposing sampling/logging/roots surface that go-sdk has
+      # marked Deprecated (SEP-2577) so downstream consumers of the shim keep
+      # working unchanged. This silences ONLY those intentional SEP-2577
+      # parity deprecations, not an evergreen catch-all: every go-sdk bump
+      # MUST be re-audited (`grep -rn "SA1019\|Deprecated" mcpcompat/` against
+      # the new SDK version) to confirm no NEW, unrelated deprecation is
+      # hiding behind this exclusion.
+      - linters:
+          - staticcheck
+        text: "SA1019"
+        path: mcpcompat/
       # These are auto-generated, so it makes no sense including them.
       - linters:
           - dupl
