@@ -766,23 +766,13 @@ func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server, stateless bool)
 			// fireBeforeHooks for the extraction and fallback behavior.
 			s.fireBeforeHooks(ctx, method, req)
 			res, err := next(ctx, method, req)
-			// go-sdk's setDefaultCacheableValues (mcp/protocol.go) unconditionally
-			// stamps cacheScope:"public" (Cacheable.CacheScope, an IN-BODY MCP
-			// result field, NOT an HTTP header) on every list/discover result,
-			// with no awareness of stateless per-identity projection. Under
-			// stateless, list/discover results are produced by this middleware's
-			// own before-hook projection (fireBeforeHooks) and per-request
-			// ephemeral session binding (bindSessionForDispatch), so the same
-			// request can yield a different, identity-scoped result each time —
-			// a "public" hint on such a result would let an MCP-aware cache serve
-			// one identity's projected list to another. Rewrite it to "private"
-			// here, since cacheScope lives in the body: an HTTP Cache-Control
-			// header cannot neutralize a scope hint an MCP-aware cache reads from
-			// the body. This only narrows the SDK's default; it never widens
-			// cache-sharing. The stateful path is untouched (no per-identity
-			// projection there, so "public" is the SDK's intended default).
-			if err == nil && stateless {
-				stripPublicCacheScope(res)
+			// Narrow go-sdk's default in-body cacheScope:"public" hint to
+			// "private" on results this shim serves per-identity — which is
+			// every serving mode, stateful included. See stripPublicCacheScope
+			// for the full rationale and why this is a body rewrite rather than
+			// an HTTP Cache-Control header.
+			if err == nil {
+				s.stripPublicCacheScope(res)
 			}
 			if err != nil && method == string(mcp.MethodToolsCall) {
 				err = translateUnknownToolError(err, req)
@@ -803,20 +793,50 @@ func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server, stateless bool)
 	}
 }
 
+// The two members of the MCP cacheScope union. go-sdk models CacheScope as a
+// bare string and exports no constants for it, so name them here.
+const (
+	cacheScopePublic  = "public"
+	cacheScopePrivate = "private"
+)
+
 // stripPublicCacheScope rewrites an in-body "public" Cacheable.CacheScope hint
 // to "private" on the go-sdk results that carry one.
 //
 // go-sdk stamps a "public" CacheScope (setDefaultCacheableValues,
 // mcp/protocol.go) on every list/discover result AND on resources/read results,
-// regardless of whether the body was produced per-identity — which it is under
-// stateless serving (see sessionDispatchMiddleware). resources/read is included:
-// its handler runs with the caller's bridged identity and can return
-// per-identity content, so a "public" hint on it is the same cross-identity
-// cache-leak as on a projected list. gosdk.GetPromptResult and CompleteResult do
-// not embed Cacheable and are never stamped, so they need no handling here. A
-// nil res, one of an unhandled type, or one already scoped "private", is a
-// no-op.
-func stripPublicCacheScope(res gosdk.Result) {
+// regardless of whether the body was produced per-identity — which, in this
+// shim, it is:
+//
+//   - Every dispatch runs the handler under the caller's bridged identity
+//     (the valueBridgeContext in sessionDispatchMiddleware is not gated on
+//     serving mode), so resources/read can return per-identity content.
+//   - Stateless serving projects per-identity tools via the before-list hooks
+//     (fireBeforeHooks) over a per-request ephemeral session
+//     (bindSessionForDispatch).
+//   - Stateful serving projects MORE, not less: registerAndSync installs the
+//     SessionWithTools/Resources/ResourceTemplates/Prompts overlays onto that
+//     session's own go-sdk server (syncSession*), and that path runs only when
+//     !stateless. ToolHive's vMCP layer is the consumer.
+//
+// A "public" hint on any of those bodies is a cross-identity cache-leak signal:
+// per the 2026-07-28 caching spec it tells any client, shared gateway or
+// caching proxy that it MAY serve the response to a different user, and it does
+// so regardless of the endpoint being authenticated. So the rewrite applies to
+// every serving mode. It must be an in-body rewrite, not an HTTP Cache-Control
+// header, which cannot neutralize a scope hint an MCP-aware cache reads out of
+// the body. It only ever narrows the SDK's default; it never widens
+// cache-sharing.
+//
+// gosdk.GetPromptResult, CompleteResult and CallToolResult do not embed
+// Cacheable and are never stamped, so they need no handling here. A res of an
+// unhandled type, or one already scoped "private", is a no-op — as is an
+// untyped-nil gosdk.Result, which matches no case arm. A typed-nil pointer of a
+// covered type would panic on the field read, but go-sdk cannot hand one back on
+// a success path: its own pointer-receiver setDefaultCacheableValues would have
+// panicked on it first, and wrapResourceHandler always allocates a non-nil
+// result.
+func (s *MCPServer) stripPublicCacheScope(res gosdk.Result) {
 	var c *gosdk.Cacheable
 	switch r := res.(type) {
 	case *gosdk.ListToolsResult:
@@ -832,10 +852,24 @@ func stripPublicCacheScope(res gosdk.Result) {
 	case *gosdk.ReadResourceResult:
 		c = &r.Cacheable
 	default:
+		// Anything that embeds Cacheable satisfies gosdk.CacheableResult for
+		// free (GetCacheScope/GetTTLMs are promoted from the embedded struct),
+		// so a result landing here while reporting a "public" scope is one a
+		// newer go-sdk started stamping and the switch above does not cover —
+		// the one way a go-sdk bump could silently reintroduce the leak this
+		// function exists to prevent. Warn rather than panic: a missed cache
+		// hint must not take down a request on a goroutine go-sdk never
+		// recovers. Log the type only, never the body.
+		if cr, ok := res.(gosdk.CacheableResult); ok && cr.GetCacheScope() == cacheScopePublic {
+			if s.logger != nil {
+				s.logger.Warn("unhandled cacheable MCP result type: leaving cacheScope public",
+					"type", fmt.Sprintf("%T", res))
+			}
+		}
 		return
 	}
-	if c.CacheScope == "public" {
-		c.CacheScope = "private"
+	if c.CacheScope == cacheScopePublic {
+		c.CacheScope = cacheScopePrivate
 	}
 }
 

@@ -90,9 +90,10 @@ func TestStateless_BasicRequestResponse(t *testing.T) {
 // with no awareness that, under stateless serving, that same result is
 // produced by the shim's per-identity before-hook projection
 // (sessionDispatchMiddleware). sessionDispatchMiddleware must rewrite that
-// hint to "private" on the stateless path before the response is serialized,
-// so an MCP-aware cache never treats one identity's projected list/discover
-// result as shareable with another identity.
+// hint to "private" before the response is serialized, so an MCP-aware cache
+// never treats one identity's projected list/discover result as shareable with
+// another identity. See TestStateful_ListToolsCacheScopePrivate for the same
+// guarantee on the stateful path.
 func TestStateless_ListAndDiscoverCacheScopePrivate(t *testing.T) {
 	t.Parallel()
 
@@ -181,13 +182,15 @@ func TestStateless_ListAndDiscoverCacheScopePrivate(t *testing.T) {
 	})
 }
 
-// TestStateful_ListToolsCacheScopeUntouched pins the divergence from
-// TestStateless_ListAndDiscoverCacheScopePrivate: a stateful server has no
-// per-identity projection concern (every session is its own, non-shared
-// go-sdk ServerSession, not a per-request ephemeral binding), so
-// sessionDispatchMiddleware must leave go-sdk's default cacheScope:"public"
-// alone on the stateful path.
-func TestStateful_ListToolsCacheScopeUntouched(t *testing.T) {
+// TestStateful_ListToolsCacheScopePrivate pins that the rewrite is NOT
+// stateless-only. A stateful server is per-identity projected at least as much
+// as a stateless one: registerAndSync installs the SessionWithTools/Resources/
+// ResourceTemplates/Prompts overlays onto that session's own go-sdk server
+// (syncSession*), and that path runs only when !stateless — stateless projects
+// tools alone. The identity bridge in sessionDispatchMiddleware is likewise not
+// gated on serving mode. So go-sdk's default cacheScope:"public" is just as
+// wrong here, and must be narrowed to "private" on this path too.
+func TestStateful_ListToolsCacheScopePrivate(t *testing.T) {
 	t.Parallel()
 
 	mcpSrv := server.NewMCPServer("stateful-cachescope", "1.0.0")
@@ -206,8 +209,8 @@ func TestStateful_ListToolsCacheScopeUntouched(t *testing.T) {
 		CacheScope string `json:"cacheScope"`
 	}
 	require.NoError(t, json.Unmarshal(r.Result, &res))
-	assert.Equal(t, "public", res.CacheScope,
-		"the stateful path must not be touched by the stateless cacheScope rewrite")
+	assert.Equal(t, "private", res.CacheScope,
+		"a stateful tools/list result carries this session's tool overlay and must never be marked cacheScope:public")
 }
 
 // TestStateless_GETAndDELETENotAllowed verifies that a stateless server has no

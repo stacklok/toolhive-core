@@ -443,3 +443,98 @@ func TestBindSessionForDispatch_StatelessForcesEphemeralRegardlessOfSessionID(t 
 	assert.NotSame(t, csA, csB,
 		"each stateless dispatch must get its own ephemeral session, even under a shared client-supplied session id")
 }
+
+// TestStripPublicCacheScope covers the mapping directly, so all six go-sdk
+// result types that embed Cacheable are exercised without standing up an HTTP
+// server per type (the blackbox tests in stateless_test.go cover three of them
+// end-to-end and cannot reach this unexported helper at all). The go-sdk
+// version is pinned to a PRE-RELEASE, so the completeness of this switch is
+// exactly what a version bump can silently break.
+func TestStripPublicCacheScope(t *testing.T) {
+	t.Parallel()
+
+	// Every gosdk result type that embeds Cacheable, i.e. every type
+	// setDefaultCacheableValues is called on. Keep in sync with the switch.
+	covered := map[string]gosdk.Result{
+		"ListToolsResult":             &gosdk.ListToolsResult{},
+		"ListResourcesResult":         &gosdk.ListResourcesResult{},
+		"ListResourceTemplatesResult": &gosdk.ListResourceTemplatesResult{},
+		"ListPromptsResult":           &gosdk.ListPromptsResult{},
+		"DiscoverResult":              &gosdk.DiscoverResult{},
+		"ReadResourceResult":          &gosdk.ReadResourceResult{},
+	}
+
+	s := NewMCPServer("strip-cachescope", "1.0.0")
+
+	for name, res := range covered {
+		t.Run(name+"/public is narrowed", func(t *testing.T) {
+			t.Parallel()
+			cr, ok := res.(gosdk.CacheableResult)
+			require.True(t, ok, "%s must satisfy CacheableResult via its embedded Cacheable", name)
+			// Stamp it the way go-sdk's setDefaultCacheableValues would.
+			setCacheScopeForTest(t, res, cacheScopePublic)
+			s.stripPublicCacheScope(res)
+			assert.Equal(t, cacheScopePrivate, cr.GetCacheScope(),
+				"%s is served per-identity and must be narrowed to private", name)
+		})
+	}
+
+	t.Run("already private is a no-op", func(t *testing.T) {
+		t.Parallel()
+		res := &gosdk.ListToolsResult{Cacheable: gosdk.Cacheable{CacheScope: cacheScopePrivate, TTLMs: 5}}
+		s.stripPublicCacheScope(res)
+		assert.Equal(t, cacheScopePrivate, res.CacheScope)
+		assert.Equal(t, 5, res.TTLMs, "ttlMs must never be touched")
+	})
+
+	t.Run("unset scope is left alone", func(t *testing.T) {
+		t.Parallel()
+		// Only the literal "public" is narrowed: an unset scope is not a
+		// cache-share signal, and inventing one is not this function's job.
+		res := &gosdk.ListToolsResult{}
+		s.stripPublicCacheScope(res)
+		assert.Empty(t, res.CacheScope)
+	})
+
+	t.Run("non-cacheable result is a no-op", func(t *testing.T) {
+		t.Parallel()
+		// CallToolResult, GetPromptResult and CompleteResult do not embed
+		// Cacheable, so they have no scope to narrow and must not trip the
+		// unhandled-type warning either.
+		for _, res := range []gosdk.Result{
+			&gosdk.CallToolResult{}, &gosdk.GetPromptResult{}, &gosdk.CompleteResult{},
+		} {
+			assert.NotImplements(t, (*gosdk.CacheableResult)(nil), res,
+				"%T must not embed Cacheable, or it belongs in the switch", res)
+			s.stripPublicCacheScope(res)
+		}
+	})
+
+	t.Run("untyped nil result is a no-op", func(t *testing.T) {
+		t.Parallel()
+		assert.NotPanics(t, func() { s.stripPublicCacheScope(nil) })
+	})
+}
+
+// setCacheScopeForTest stamps a CacheScope onto a result the way go-sdk's
+// unexported setDefaultCacheableValues does, without duplicating the switch
+// under test.
+func setCacheScopeForTest(t *testing.T, res gosdk.Result, scope string) {
+	t.Helper()
+	switch r := res.(type) {
+	case *gosdk.ListToolsResult:
+		r.CacheScope = scope
+	case *gosdk.ListResourcesResult:
+		r.CacheScope = scope
+	case *gosdk.ListResourceTemplatesResult:
+		r.CacheScope = scope
+	case *gosdk.ListPromptsResult:
+		r.CacheScope = scope
+	case *gosdk.DiscoverResult:
+		r.CacheScope = scope
+	case *gosdk.ReadResourceResult:
+		r.CacheScope = scope
+	default:
+		t.Fatalf("setCacheScopeForTest: unsupported result type %T", res)
+	}
+}
