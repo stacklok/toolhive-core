@@ -65,3 +65,19 @@ func TestCallToolResult_NeedsInput_ZeroValue(t *testing.T) {
 	var r mcp.CallToolResult
 	assert.False(t, r.NeedsInput())
 }
+
+// TestCallToolResult_MarshalJSON_DropsResultType guards the documented
+// contract that resultType is populated by UnmarshalJSON but not re-emitted
+// by MarshalJSON (see the resultType field doc on CallToolResult): an
+// unmarshal -> marshal round-trip must not resurface it on the wire.
+func TestCallToolResult_MarshalJSON_DropsResultType(t *testing.T) {
+	t.Parallel()
+
+	var r mcp.CallToolResult
+	require.NoError(t, json.Unmarshal([]byte(`{"content":[],"resultType":"input_required"}`), &r))
+	require.True(t, r.NeedsInput())
+
+	data, err := json.Marshal(r)
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), "resultType")
+}

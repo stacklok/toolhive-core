@@ -282,6 +282,12 @@ func (r *CallToolResult) UnmarshalJSON(data []byte) error {
 // default), the client auto-fulfills server input requests and retries
 // internally, so a CallToolResult reaching the caller never reports
 // NeedsInput true.
+//
+// A present-but-unrecognized resultType (neither "complete" nor
+// "input_required") also reports false here, even though the spec requires
+// clients to treat such a value as invalid rather than as a completed
+// result. A caller needing strict conformance cannot rely on NeedsInput
+// alone to detect that case, since resultType is not otherwise exposed.
 func (r CallToolResult) NeedsInput() bool {
 	return r.resultType == resultTypeInputRequired
 }

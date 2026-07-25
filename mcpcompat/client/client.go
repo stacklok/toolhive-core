@@ -17,7 +17,7 @@
 // (ClientSessionOptions.protocolVersion) reachable only through the
 // *gosdk.ClientSessionOptions parameter of Client.Connect, and this shim's
 // Initialize always passes nil there, so it cannot pin a backend to, say,
-// 2025-11-25 even when that would be desirable. See issue #5911; the fix would
+// 2025-11-25 even when that would be desirable. See stacklok/toolhive#5911; the fix would
 // be to ask upstream to export that field (or add an option to set it).
 //
 // Stability: Alpha.
@@ -176,17 +176,19 @@ func WithSamplingHandler(h SamplingHandler) ClientOption {
 //
 // Disabling MRTR surfaces the input-required result to the caller instead of
 // auto-fulfilling and retrying: the client returns the input-required result
-// directly, and the caller can detect it via mcp.CallToolResult.NeedsInput
-// (which reports the underlying gosdk result's wire "resultType" field).
+// directly, and the caller can detect it via mcp.CallToolResult.NeedsInput,
+// mcp.GetPromptResult.NeedsInput, or mcp.ReadResourceResult.NeedsInput
+// (each reporting the underlying gosdk result's wire "resultType" field) for
+// tools/call, prompts/get, and resources/read respectively.
 //
 // NOTE: reading the input requests and fulfilling/retrying the call through
-// the shim is NOT yet supported — the shim's CallToolResult does not model
+// the shim is NOT yet supported — the shim's result types do not model
 // go-sdk's InputRequests/RequestState fields, only the NeedsInput
 // classification.
 //
-// Must be set before Initialize; the underlying go-sdk option
-// (gosdk.ClientOptions.MultiRoundTrip) is only consulted when the client
-// connects.
+// Must be set before Initialize: the shim calls gosdk.NewClient — which reads
+// gosdk.ClientOptions.MultiRoundTrip to decide whether to install its
+// multi-round-trip middleware — inside Initialize, before Connect runs.
 func WithoutMultiRoundTrip() ClientOption {
 	return func(c *Client) { c.disableMultiRoundTrip = true }
 }
@@ -452,6 +454,7 @@ func (c *Client) ReadResource(ctx context.Context, request mcp.ReadResourceReque
 // explicitly to the concrete text/blob mcp-go type instead.
 func convertReadResourceResult(res *gosdk.ReadResourceResult) *mcp.ReadResourceResult {
 	out := &mcp.ReadResourceResult{}
+	out.SetNeedsInput(res.NeedsInput())
 	if len(res.Meta) > 0 {
 		out.Meta = mcp.NewMetaFromMap(map[string]any(res.Meta))
 	}
@@ -512,6 +515,7 @@ func (c *Client) GetPrompt(ctx context.Context, request mcp.GetPromptRequest) (*
 // content is re-marshaled and decoded via mcp.UnmarshalContent instead.
 func convertGetPromptResult(res *gosdk.GetPromptResult) (*mcp.GetPromptResult, error) {
 	out := &mcp.GetPromptResult{Description: res.Description}
+	out.SetNeedsInput(res.NeedsInput())
 	if len(res.Meta) > 0 {
 		out.Meta = mcp.NewMetaFromMap(map[string]any(res.Meta))
 	}
