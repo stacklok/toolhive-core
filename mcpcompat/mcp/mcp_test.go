@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	gosdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -228,6 +229,19 @@ func TestProtocolConstants(t *testing.T) {
 	assert.Equal(t, "accept", string(mcp.ElicitationResponseActionAccept))
 	assert.Equal(t, "decline", string(mcp.ElicitationResponseActionDecline))
 	assert.Equal(t, "cancel", string(mcp.ElicitationResponseActionCancel))
+}
+
+// TestModernErrorCodes pins the shim-owned MCP 2026-07-28 (SEP-2322 and
+// related) error code constants to go-sdk's exported constants
+// (CodeHeaderMismatch, CodeMissingRequiredClientCapabilities,
+// CodeUnsupportedProtocolVersion), so a go-sdk renumber fails this test loudly
+// instead of silently drifting from the shim's hardcoded values.
+func TestModernErrorCodes(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, int(gosdk.CodeHeaderMismatch), mcp.HEADER_MISMATCH)
+	assert.Equal(t, int(gosdk.CodeMissingRequiredClientCapabilities), mcp.MISSING_REQUIRED_CLIENT_CAPABILITIES)
+	assert.Equal(t, int(gosdk.CodeUnsupportedProtocolVersion), mcp.UNSUPPORTED_PROTOCOL_VERSION)
 }
 
 // Handler signature guards. These package-level assignments will fail to compile

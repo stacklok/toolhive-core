@@ -322,9 +322,29 @@ const (
 // MCP error codes
 const (
 	// RESOURCE_NOT_FOUND indicates that the requested resource was not found.
+	//
+	// Legacy: replaced by INVALID_PARAMS. Implementations of MCP 2026-07-28+
+	// MUST NOT emit this code, but clients SHOULD still accept it from older
+	// servers.
 	RESOURCE_NOT_FOUND = -32002
 
+	// HEADER_MISMATCH indicates that HTTP headers do not match the
+	// corresponding values in the request body, or that required headers
+	// are missing or malformed.
+	HEADER_MISMATCH = -32020
+
+	// MISSING_REQUIRED_CLIENT_CAPABILITIES indicates that the client did not
+	// declare one or more capabilities required by the server for the request.
+	MISSING_REQUIRED_CLIENT_CAPABILITIES = -32021
+
+	// UNSUPPORTED_PROTOCOL_VERSION indicates that the requested protocol
+	// version is not supported by the receiving party.
+	UNSUPPORTED_PROTOCOL_VERSION = -32022
+
 	// URL_ELICITATION_REQUIRED is the error code for when URL elicitation is required.
+	//
+	// Legacy: MCP 2025-11-25 only. Implementations of MCP 2026-07-28+ MUST NOT
+	// emit this code.
 	URL_ELICITATION_REQUIRED = -32042
 )
 
