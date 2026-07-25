@@ -4,8 +4,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
+	"strings"
 	"testing"
 
 	gosdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -514,6 +517,56 @@ func TestStripPublicCacheScope(t *testing.T) {
 		t.Parallel()
 		assert.NotPanics(t, func() { s.stripPublicCacheScope(nil) })
 	})
+
+	t.Run("unhandled cacheable type is left public and warned about", func(t *testing.T) {
+		t.Parallel()
+		// The scenario the default arm exists for: a go-sdk version newer than
+		// the pinned pre-release embeds Cacheable into a result type the switch
+		// does not cover. Such a type satisfies gosdk.CacheableResult for free,
+		// so the arm must notice it, leave the body alone, and say so — this is
+		// the one backstop against a version bump silently reintroducing the
+		// cross-identity leak, since the covered map above is hand-maintained.
+		var buf bytes.Buffer
+		logged := NewMCPServer("strip-cachescope-warn", "1.0.0",
+			WithLogger(slog.New(slog.NewTextHandler(&buf, nil))))
+		res := &fakeCacheableResult{Cacheable: gosdk.Cacheable{CacheScope: cacheScopePublic}}
+		require.Implements(t, (*gosdk.CacheableResult)(nil), res,
+			"the fake must satisfy CacheableResult, or it is not exercising the default arm")
+
+		logged.stripPublicCacheScope(res)
+
+		assert.Equal(t, cacheScopePublic, res.CacheScope,
+			"an unhandled type cannot be narrowed; the arm only reports it")
+		assert.Contains(t, buf.String(), "unhandled cacheable MCP result type",
+			"an unhandled cacheable result must be reported, not silently skipped")
+		assert.Contains(t, buf.String(), "fakeCacheableResult",
+			"the warning must name the offending type so the switch can be updated")
+		assert.NotContains(t, strings.ToLower(buf.String()), "cachescope=public",
+			"the warning must log the type only, never result body fields")
+	})
+
+	t.Run("unhandled cacheable type with no logger does not panic", func(t *testing.T) {
+		t.Parallel()
+		// WithLogger is optional, so the warn path must tolerate a nil logger.
+		unlogged := NewMCPServer("strip-cachescope-nolog", "1.0.0")
+		require.Nil(t, unlogged.logger, "this subtest is only meaningful without a logger")
+		assert.NotPanics(t, func() {
+			unlogged.stripPublicCacheScope(&fakeCacheableResult{
+				Cacheable: gosdk.Cacheable{CacheScope: cacheScopePublic},
+			})
+		})
+	})
+}
+
+// fakeCacheableResult stands in for a result type that a future go-sdk embeds
+// Cacheable into without stripPublicCacheScope's switch being updated to match.
+// gosdk.ResultBase supplies the unexported marker method that makes it a
+// gosdk.Result; the embedded Cacheable promotes GetCacheScope/GetTTLMs, which is
+// what makes it a gosdk.CacheableResult too — exactly as a real new SDK type
+// would.
+type fakeCacheableResult struct {
+	gosdk.ResultBase
+	gosdk.Cacheable
 }
 
 // setCacheScopeForTest stamps a CacheScope onto a result the way go-sdk's
