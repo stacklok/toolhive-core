@@ -5,6 +5,7 @@ package client_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	gosdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -363,6 +365,13 @@ func TestSetLevel_CompatAlias(t *testing.T) {
 // the test server.
 const needsInputToolName = "needs-input"
 
+// elicitModeForm and needsInputMessage are the ElicitParams fields shared by
+// the MRTR opt-out test servers below.
+const (
+	elicitModeForm    = "form"
+	needsInputMessage = "need more info"
+)
+
 // newMRTRTestServer stands up a real go-sdk MCP server, served stateless (so
 // the shim client negotiates MCP 2026-07-28 rather than falling back to the
 // legacy handshake; see TestInitialize_StatefulServerNegotiatesLegacyProtocolVersion),
@@ -381,7 +390,7 @@ func newMRTRTestServer(t *testing.T, calls *int32) *httptest.Server {
 			atomic.AddInt32(calls, 1)
 			return &gosdk.CallToolResult{
 				InputRequests: gosdk.InputRequestMap{
-					"q1": &gosdk.ElicitParams{Mode: "form", Message: "need more info"},
+					"q1": &gosdk.ElicitParams{Mode: elicitModeForm, Message: needsInputMessage},
 				},
 			}, nil
 		})
@@ -454,6 +463,90 @@ func TestWithoutMultiRoundTrip(t *testing.T) {
 		_, err = c.CallTool(ctx, mcp.CallToolRequest{
 			Params: mcp.CallToolParams{Name: needsInputToolName},
 		})
-		assert.Error(t, err, "the auto MRTR loop must fail without an elicitation handler")
+		require.Error(t, err, "the auto MRTR loop must fail without an elicitation handler")
+		// Pin the actual go-sdk contract ((*Client).elicit's rejection when no
+		// elicitation handler is registered) rather than accepting any error, so
+		// an unrelated failure (e.g. a transport EOF) can't satisfy this test.
+		var wireErr *jsonrpc.Error
+		require.True(t, errors.As(err, &wireErr), "expected a *jsonrpc.Error, got %T: %v", err, err)
+		assert.Equal(t, int64(jsonrpc.CodeInvalidParams), wireErr.Code)
+		assert.Equal(t, "client does not support elicitation", wireErr.Message)
 	})
+}
+
+// needsInputPromptName and needsInputResourceURI are the prompt/resource used
+// by the prompts/get and resources/read MRTR opt-out tests below.
+const (
+	needsInputPromptName  = "needs-input-prompt"
+	needsInputResourceURI = "test://needs-input-resource"
+)
+
+// newMRTRPromptResourceTestServer stands up a real go-sdk MCP server, served
+// stateless (see newMRTRTestServer), exposing a prompt and a resource whose
+// handlers always return an input-required result (InputRequests set, no
+// Messages/Contents).
+func newMRTRPromptResourceTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := gosdk.NewServer(&gosdk.Implementation{Name: "mrtr-server", Version: testClientVersion}, nil)
+	srv.AddPrompt(&gosdk.Prompt{Name: needsInputPromptName, Description: "always requires further client input"},
+		func(context.Context, *gosdk.GetPromptRequest) (*gosdk.GetPromptResult, error) {
+			return &gosdk.GetPromptResult{
+				InputRequests: gosdk.InputRequestMap{
+					"q1": &gosdk.ElicitParams{Mode: elicitModeForm, Message: needsInputMessage},
+				},
+			}, nil
+		})
+	srv.AddResource(&gosdk.Resource{URI: needsInputResourceURI, Name: "needs-input-resource"},
+		func(context.Context, *gosdk.ReadResourceRequest) (*gosdk.ReadResourceResult, error) {
+			return &gosdk.ReadResourceResult{
+				InputRequests: gosdk.InputRequestMap{
+					"q1": &gosdk.ElicitParams{Mode: elicitModeForm, Message: needsInputMessage},
+				},
+			}, nil
+		})
+	handler := gosdk.NewStreamableHTTPHandler(
+		func(*http.Request) *gosdk.Server { return srv }, &gosdk.StreamableHTTPOptions{Stateless: true},
+	)
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// TestWithoutMultiRoundTrip_PromptAndResource verifies the client.
+// WithoutMultiRoundTrip opt-out also surfaces input-required results for
+// prompts/get and resources/read (not just tools/call): go-sdk's MRTR
+// middleware intercepts all three methods, and the shim's GetPromptResult and
+// ReadResourceResult must classify them via NeedsInput just like
+// CallToolResult does.
+func TestWithoutMultiRoundTrip_PromptAndResource(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ts := newMRTRPromptResourceTestServer(t)
+
+	c, err := client.NewStreamableHttpClientWithOpts(
+		ts.URL, nil, []client.ClientOption{client.WithoutMultiRoundTrip()},
+	)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	promptRes, err := c.GetPrompt(ctx, mcp.GetPromptRequest{
+		Params: mcp.GetPromptParams{Name: needsInputPromptName},
+	})
+	require.NoError(t, err)
+	assert.True(t, promptRes.NeedsInput())
+
+	resourceRes, err := c.ReadResource(ctx, mcp.ReadResourceRequest{
+		Params: mcp.ReadResourceParams{URI: needsInputResourceURI},
+	})
+	require.NoError(t, err)
+	assert.True(t, resourceRes.NeedsInput())
 }

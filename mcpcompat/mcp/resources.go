@@ -191,4 +191,39 @@ type ReadResourceParams struct {
 type ReadResourceResult struct {
 	Result
 	Contents []ResourceContents `json:"contents"` // Can be TextResourceContents or BlobResourceContents
+
+	// resultType captures the "resultType" wire field go-sdk emits for MCP
+	// 2026-07-28+ multi round-trip requests (SEP-2322): "complete" or
+	// "input_required". Unlike CallToolResult, this type has no custom
+	// UnmarshalJSON, so it cannot be populated that way; instead
+	// mcpcompat/client's converter (which constructs this type directly from a
+	// go-sdk result) populates it via SetNeedsInput. See NeedsInput.
+	resultType string
+}
+
+// NeedsInput reports whether this result requires further client input before
+// the resource read can be resolved. It mirrors go-sdk's
+// ReadResourceResult.NeedsInput, which classifies MCP 2026-07-28+ multi
+// round-trip requests (SEP-2322) results via the wire "resultType" field
+// ("input_required" vs "complete").
+//
+// NeedsInput is only meaningful when multi round-trip handling is disabled on
+// the client (see client.WithoutMultiRoundTrip): with it enabled (the
+// default), the client auto-fulfills server input requests and retries
+// internally, so a ReadResourceResult reaching the caller never reports
+// NeedsInput true.
+func (r ReadResourceResult) NeedsInput() bool {
+	return r.resultType == resultTypeInputRequired
+}
+
+// SetNeedsInput marks whether this result requires further client input
+// (SEP-2322 multi round-trip). It exists so mcpcompat/client can populate the
+// classification when constructing this type directly from a go-sdk result;
+// see NeedsInput.
+func (r *ReadResourceResult) SetNeedsInput(needsInput bool) {
+	if needsInput {
+		r.resultType = resultTypeInputRequired
+		return
+	}
+	r.resultType = ""
 }
