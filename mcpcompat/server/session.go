@@ -443,7 +443,7 @@ func (s *MCPServer) syncSessionResources(srv *gosdk.Server, cs *clientSession) {
 		if err := jsonConvert(sr.Resource, gr); err != nil {
 			continue
 		}
-		srv.AddResource(gr, s.wrapResourceHandler(sr.Handler))
+		srv.AddResource(gr, s.wrapResourceHandler(sr.resultHandler()))
 	}
 }
 
@@ -467,7 +467,7 @@ func (s *MCPServer) syncSessionResourceTemplates(srv *gosdk.Server, cs *clientSe
 			}
 			continue
 		}
-		if !s.addSessionResourceTemplate(srv, grt, ResourceHandlerFunc(srt.Handler)) {
+		if !s.addSessionResourceTemplate(srv, grt, srt.resultHandler()) {
 			if s.logger != nil {
 				s.logger.Warn("skipping per-session resource template: AddResourceTemplate rejected its URI template",
 					"template", name)
@@ -482,7 +482,7 @@ func (s *MCPServer) syncSessionResourceTemplates(srv *gosdk.Server, cs *clientSe
 // the template could not be registered, so the caller skips it rather than
 // crashing the session. Mirrors addSessionTool.
 func (s *MCPServer) addSessionResourceTemplate(
-	srv *gosdk.Server, grt *gosdk.ResourceTemplate, h ResourceHandlerFunc,
+	srv *gosdk.Server, grt *gosdk.ResourceTemplate, h ResourceResultHandlerFunc,
 ) (ok bool) {
 	defer func() {
 		if r := recover(); r != nil {

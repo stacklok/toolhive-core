@@ -1172,6 +1172,279 @@ func TestSessionResourceTemplates_ListAndRead_EndToEnd(t *testing.T) {
 	require.Error(t, err, "resources/read must fail on a session without the template")
 }
 
+// TestResourceWithResult_EndToEnd is the regression anchor for the
+// result-returning resource handlers (AddResourceWithResult /
+// AddResourceTemplateWithResult): wrapResourceHandler now jsonConverts the
+// handler's whole *mcp.ReadResourceResult onto the wire instead of just
+// Contents, so a handler-set _meta key must survive a real streamable-HTTP
+// round trip alongside the contents. It also pins that the pre-existing
+// contents-only AddResource/AddResourceTemplate handlers are unaffected and
+// still produce no _meta, guarding the shared wrapResourceHandler path
+// against a regression that would leak or drop metadata.
+func TestResourceWithResult_EndToEnd(t *testing.T) {
+	t.Parallel()
+
+	const (
+		metaKey = "trace-id"
+		metaVal = "abc-123"
+
+		plainURI  = "file:///plain"
+		plainText = "plain body"
+
+		resultURI  = "file:///with-result"
+		resultText = "result body"
+
+		templateName   = "item-template"
+		uriTemplate    = "file:///items/{id}"
+		templateURI    = "file:///items/7"
+		plainTmplName  = "plain-item-template"
+		plainURITmpl   = "file:///plain-items/{id}"
+		plainTemplURI  = "file:///plain-items/7"
+		plainTemplText = "plain template body for 7"
+		resultTmplText = "result template body for 7"
+	)
+
+	tests := []struct {
+		name     string
+		register func(srv *server.MCPServer)
+		readURI  string
+		wantText string
+		wantMeta bool
+	}{
+		{
+			name: "resource: ResultHandler carries _meta",
+			register: func(srv *server.MCPServer) {
+				srv.AddResourceWithResult(mcp.Resource{URI: resultURI, Name: "with-result"},
+					func(_ context.Context, req mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+						res := &mcp.ReadResourceResult{
+							Contents: []mcp.ResourceContents{mcp.TextResourceContents{URI: req.Params.URI, Text: resultText}},
+						}
+						res.Meta = mcp.NewMetaFromMap(map[string]any{metaKey: metaVal})
+						return res, nil
+					})
+			},
+			readURI:  resultURI,
+			wantText: resultText,
+			wantMeta: true,
+		},
+		{
+			name: "resource: plain Handler still works, no _meta",
+			register: func(srv *server.MCPServer) {
+				srv.AddResource(mcp.Resource{URI: plainURI, Name: "plain"},
+					func(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+						return []mcp.ResourceContents{mcp.TextResourceContents{URI: req.Params.URI, Text: plainText}}, nil
+					})
+			},
+			readURI:  plainURI,
+			wantText: plainText,
+			wantMeta: false,
+		},
+		{
+			name: "resource template: ResultHandler carries _meta",
+			register: func(srv *server.MCPServer) {
+				srv.AddResourceTemplateWithResult(mcp.ResourceTemplate{Name: templateName, URITemplate: uriTemplate},
+					func(_ context.Context, req mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+						res := &mcp.ReadResourceResult{
+							Contents: []mcp.ResourceContents{mcp.TextResourceContents{URI: req.Params.URI, Text: resultTmplText}},
+						}
+						res.Meta = mcp.NewMetaFromMap(map[string]any{metaKey: metaVal})
+						return res, nil
+					})
+			},
+			readURI:  templateURI,
+			wantText: resultTmplText,
+			wantMeta: true,
+		},
+		{
+			name: "resource template: plain Handler still works, no _meta",
+			register: func(srv *server.MCPServer) {
+				srv.AddResourceTemplate(mcp.ResourceTemplate{Name: plainTmplName, URITemplate: plainURITmpl},
+					func(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+						return []mcp.ResourceContents{mcp.TextResourceContents{URI: req.Params.URI, Text: plainTemplText}}, nil
+					})
+			},
+			readURI:  plainTemplURI,
+			wantText: plainTemplText,
+			wantMeta: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := t.Context()
+
+			srv := server.NewMCPServer("resource-result-server", testClientVersion,
+				server.WithResourceCapabilities(true, true))
+			tt.register(srv)
+
+			httpSrv := server.NewStreamableHTTPServer(srv)
+			ts := httptest.NewServer(httpSrv)
+			t.Cleanup(ts.Close)
+
+			c, err := client.NewStreamableHttpClient(ts.URL)
+			require.NoError(t, err)
+			require.NoError(t, c.Start(ctx))
+			t.Cleanup(func() { _ = c.Close() })
+
+			_, err = c.Initialize(ctx, mcp.InitializeRequest{
+				Params: mcp.InitializeParams{
+					ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+					ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+				},
+			})
+			require.NoError(t, err)
+
+			read, err := c.ReadResource(ctx, mcp.ReadResourceRequest{Params: mcp.ReadResourceParams{URI: tt.readURI}})
+			require.NoError(t, err)
+			require.Len(t, read.Contents, 1)
+			tc, ok := read.Contents[0].(mcp.TextResourceContents)
+			require.True(t, ok, "resources/read must return text contents")
+			assert.Equal(t, tt.wantText, tc.Text, "resources/read must return the handler's contents")
+
+			if tt.wantMeta {
+				require.NotNil(t, read.Meta, "a ResultHandler's _meta must reach the client")
+				assert.Equal(t, metaVal, read.Meta.AdditionalFields[metaKey],
+					"a custom _meta key set by the handler must survive the round trip")
+			} else {
+				assert.True(t, read.Meta == nil || read.Meta.AdditionalFields[metaKey] == nil,
+					"a plain contents-only handler must not set the handler's _meta key")
+			}
+		})
+	}
+}
+
+// TestSessionResourceWithResult_EndToEnd covers the per-session resource
+// overlay path ToolHive's vMCP actually uses (SetSessionResources /
+// SetSessionResourceTemplates). It pins two things: (1) a ServerResource or
+// ServerResourceTemplate injected via the session hook with only
+// ResultHandler set carries its _meta to the client exactly like a global
+// AddResourceWithResult registration, and (2) when both Handler and
+// ResultHandler are set on the same ServerResource or ServerResourceTemplate,
+// ResultHandler takes precedence — its contents (and _meta) are what the
+// client sees, never Handler's.
+func TestSessionResourceWithResult_EndToEnd(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	const (
+		metaKey = "trace-id"
+		metaVal = "session-abc"
+
+		resultOnlyURI  = "file:///result-only"
+		resultOnlyText = "result-only body"
+
+		precedenceURI    = "file:///precedence"
+		handlerLoserText = "handler body (must lose)"
+		resultWinnerText = "result body (must win)"
+
+		templateName             = "session-template"
+		uriTemplate              = "file:///session-items/{id}"
+		templateReadURI          = "file:///session-items/9"
+		templateText             = "session template body for 9"
+		templateHandlerLoserText = "session template handler body (must lose)"
+	)
+
+	hooks := &server.Hooks{}
+	hooks.AddOnRegisterSession(func(_ context.Context, s server.ClientSession) {
+		swr, ok := s.(server.SessionWithResources)
+		require.True(t, ok, "session must implement SessionWithResources")
+		swr.SetSessionResources(map[string]server.ServerResource{
+			resultOnlyURI: {
+				Resource: mcp.Resource{URI: resultOnlyURI, Name: "result-only"},
+				ResultHandler: func(_ context.Context, req mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+					res := &mcp.ReadResourceResult{
+						Contents: []mcp.ResourceContents{mcp.TextResourceContents{URI: req.Params.URI, Text: resultOnlyText}},
+					}
+					res.Meta = mcp.NewMetaFromMap(map[string]any{metaKey: metaVal})
+					return res, nil
+				},
+			},
+			precedenceURI: {
+				Resource: mcp.Resource{URI: precedenceURI, Name: "precedence"},
+				Handler: func(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+					return []mcp.ResourceContents{mcp.TextResourceContents{URI: req.Params.URI, Text: handlerLoserText}}, nil
+				},
+				ResultHandler: func(_ context.Context, req mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+					return &mcp.ReadResourceResult{
+						Contents: []mcp.ResourceContents{mcp.TextResourceContents{URI: req.Params.URI, Text: resultWinnerText}},
+					}, nil
+				},
+			},
+		})
+
+		swrt, ok := s.(server.SessionWithResourceTemplates)
+		require.True(t, ok, "session must implement SessionWithResourceTemplates")
+		swrt.SetSessionResourceTemplates(map[string]server.ServerResourceTemplate{
+			templateName: {
+				Template: mcp.ResourceTemplate{Name: templateName, URITemplate: uriTemplate},
+				Handler: func(_ context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+					return []mcp.ResourceContents{mcp.TextResourceContents{URI: req.Params.URI, Text: templateHandlerLoserText}}, nil
+				},
+				ResultHandler: func(_ context.Context, req mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+					res := &mcp.ReadResourceResult{
+						Contents: []mcp.ResourceContents{mcp.TextResourceContents{URI: req.Params.URI, Text: templateText}},
+					}
+					res.Meta = mcp.NewMetaFromMap(map[string]any{metaKey: metaVal})
+					return res, nil
+				},
+			},
+		})
+	})
+
+	srv := server.NewMCPServer("session-result-server", testClientVersion,
+		server.WithResourceCapabilities(true, true),
+		server.WithHooks(hooks),
+	)
+
+	httpSrv := server.NewStreamableHTTPServer(srv)
+	ts := httptest.NewServer(httpSrv)
+	t.Cleanup(ts.Close)
+
+	c, err := client.NewStreamableHttpClient(ts.URL)
+	require.NoError(t, err)
+	require.NoError(t, c.Start(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	_, err = c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: testClientName, Version: testClientVersion},
+		},
+	})
+	require.NoError(t, err)
+
+	// Per-session ResultHandler-only resource: contents AND _meta must arrive.
+	read, err := c.ReadResource(ctx, mcp.ReadResourceRequest{Params: mcp.ReadResourceParams{URI: resultOnlyURI}})
+	require.NoError(t, err)
+	require.Len(t, read.Contents, 1)
+	tc, ok := read.Contents[0].(mcp.TextResourceContents)
+	require.True(t, ok, "resources/read must return text contents")
+	assert.Equal(t, resultOnlyText, tc.Text)
+	require.NotNil(t, read.Meta, "a per-session ResultHandler's _meta must reach the client")
+	assert.Equal(t, metaVal, read.Meta.AdditionalFields[metaKey])
+
+	// Precedence: both Handler and ResultHandler set on the same ServerResource
+	// -> ResultHandler must win.
+	precRead, err := c.ReadResource(ctx, mcp.ReadResourceRequest{Params: mcp.ReadResourceParams{URI: precedenceURI}})
+	require.NoError(t, err)
+	require.Len(t, precRead.Contents, 1)
+	ptc, ok := precRead.Contents[0].(mcp.TextResourceContents)
+	require.True(t, ok, "resources/read must return text contents")
+	assert.Equal(t, resultWinnerText, ptc.Text, "ResultHandler must take precedence over Handler")
+
+	// Per-session template with both Handler and ResultHandler set: ResultHandler
+	// must win, and its contents AND _meta must arrive.
+	tmplRead, err := c.ReadResource(ctx, mcp.ReadResourceRequest{Params: mcp.ReadResourceParams{URI: templateReadURI}})
+	require.NoError(t, err)
+	require.Len(t, tmplRead.Contents, 1)
+	ttc, ok := tmplRead.Contents[0].(mcp.TextResourceContents)
+	require.True(t, ok, "resources/read must return text contents")
+	assert.Equal(t, templateText, ttc.Text, "ResultHandler must take precedence over Handler")
+	require.NotNil(t, tmplRead.Meta, "a per-session template ResultHandler's _meta must reach the client")
+	assert.Equal(t, metaVal, tmplRead.Meta.AdditionalFields[metaKey])
+}
+
 // TestCompletion_EndToEnd verifies WithCompletionHandler end-to-end: a server
 // built with a completion handler that returns fixed values for a given prompt
 // reference must (1) advertise the completions capability at initialize and (2)
