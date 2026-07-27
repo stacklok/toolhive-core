@@ -281,7 +281,7 @@ func getBundleMsgSignature(simpleSigningLayer v1.Descriptor) (*protobundle.Bundl
 	// 1. Get the message digest algorithm
 	var msgHashAlg protocommon.HashAlgorithm
 	switch simpleSigningLayer.Digest.Algorithm {
-	case "sha256":
+	case DigestAlgorithmSHA256:
 		msgHashAlg = protocommon.HashAlgorithm_SHA2_256
 	default:
 		return nil, fmt.Errorf("unknown digest algorithm: %s", simpleSigningLayer.Digest.Algorithm)
