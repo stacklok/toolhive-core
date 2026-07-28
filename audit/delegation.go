@@ -7,14 +7,16 @@ import (
 	"reflect"
 )
 
-// DefaultMaxDelegationDepth is the default defensive cap on delegation-chain
-// parsing. It bounds the work done on attacker-influenceable input: RFC 8693
-// sets no limit on chain length, so a maliciously crafted token could
-// otherwise force unbounded work. Callers should pass their own minting-side
-// cap as maxDepth to [ParseDelegationChain] when they have one; the default is
-// intentionally larger than any known consumer's minting cap, so that for
-// consumers passing their (smaller) mint cap, Truncated=true is a genuine
-// signal that a token came from outside their own issuance path.
+// DefaultMaxDelegationDepth is the default cap on how many delegation hops
+// [ParseDelegationChain] retains. It is a parse ceiling, not a minting cap:
+// RFC 8693 sets no limit on chain length, so this bounds the size of the
+// retained chain and of the emitted audit record on attacker-influenceable
+// input. It does not bound parsing work — the caller has already decoded the
+// claim. Callers should pass their own minting-side cap as maxDepth when they
+// have one; the default is intentionally larger than any known consumer's
+// minting cap, so that for consumers passing their (smaller) mint cap,
+// Truncated=true is a genuine signal that a token came from outside their own
+// issuance path.
 const DefaultMaxDelegationDepth = 16
 
 // hopClaimIss, hopClaimSub, and hopClaimAct are the RFC 8693 claim keys
@@ -88,13 +90,13 @@ func (a DelegatedActor) Extra() map[string]any {
 
 // DelegationChain holds a flattened, ordered RFC 8693 delegation chain.
 //
-// The chain is ordered OUTERMOST-FIRST: Chain[0] is the current actor (the
-// immediate actor of the event), and the last entry is the least recent
-// (earliest) actor. The delegating end user is NOT part of the chain: per
-// RFC 8693 it is the token's top-level sub, recorded in the event's Subjects
-// map. Per RFC 8693 §4.1, only the top-level event claims and Chain[0] may
-// drive access-control decisions; prior hops are informational only and exist
-// for audit.
+// The chain is ordered OUTERMOST-FIRST: Chain[0] is the current actor — the
+// party that presented the token — and the last entry is the least recent
+// (original) actor. The party on whose behalf they acted is NOT part of the
+// chain: per RFC 8693 it is the token's top-level sub, carried by the event's
+// own Subjects map; the chain never repeats it. Per RFC 8693 §4.1, only the
+// top-level event claims and Chain[0] may drive access-control decisions;
+// prior hops are informational only and exist for audit.
 //
 // Ordering rationale — do not assume, and do not "fix": current-actor-first
 // matches the read order of RFC 8693's nested act structure, and it keeps
