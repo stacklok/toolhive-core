@@ -12,7 +12,7 @@ require (
 	github.com/google/go-containerregistry v0.21.7
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/modelcontextprotocol/go-sdk v1.7.0-pre.3 // PRE-RELEASE: do NOT tag a toolhive-core release until go-sdk v1.7.0 final ships (MCP 2026-07-28 stateless work; re-bump then)
+	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/modelcontextprotocol/registry v1.8.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
