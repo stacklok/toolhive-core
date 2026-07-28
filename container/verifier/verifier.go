@@ -4,6 +4,7 @@
 package verifier
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -88,8 +89,10 @@ func (s *Sigstore) WithKeychain(keychain authn.Keychain) *Sigstore {
 func (s *Sigstore) GetVerificationResults(
 	imageRef string,
 ) ([]*verify.VerificationResult, error) {
-	// Construct the bundle(s) for the image reference
-	bundles, err := getSigstoreBundles(imageRef, s.keychain)
+	// Construct the bundle(s) for the image reference. The exported
+	// signature predates context plumbing, so the fetch is not cancellable
+	// from here; RetrieveBundles is the context-aware entry point.
+	bundles, err := getSigstoreBundles(context.Background(), imageRef, s.keychain)
 	if err != nil && !errors.Is(err, ErrProvenanceNotFoundOrIncomplete) {
 		// We got some other unexpected error prior to querying for the signature/attestation
 		return nil, err

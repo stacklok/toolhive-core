@@ -97,6 +97,7 @@ func TestKeySignedBundleRejectsWrongKey(t *testing.T) {
 		DigestAlgo: DigestAlgorithmSHA256,
 		DigestHex:  digestHex,
 	}, []byte(otherPubPEM))
+	assert.ErrorIs(t, err, ErrVerificationFailed)
 	require.Error(t, err)
 }
 
@@ -119,14 +120,21 @@ func TestVerifyBundleOfflineParsesStoredBundles(t *testing.T) {
 	// certificate), but must fail at verification — not at parsing — which
 	// proves the offline path round-trips the stored Raw form.
 	raw, _, digestHex := signTestBundle(t, []byte("content"))
-	_, err := VerifyBundleOffline(raw, DigestAlgorithmSHA256, digestHex, nil)
+	_, err := VerifyBundleOffline(raw, DigestAlgorithmSHA256+":"+digestHex, nil)
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), "parsing stored bundle",
 		"a well-formed stored bundle must reach verification")
+	assert.ErrorIs(t, err, ErrVerificationFailed,
+		"a verification failure must be branchable via the sentinel")
 
-	_, err = VerifyBundleOffline([]byte("not json"), DigestAlgorithmSHA256, digestHex, nil)
+	_, err = VerifyBundleOffline([]byte("not json"), DigestAlgorithmSHA256+":"+digestHex, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parsing stored bundle")
+	assert.NotErrorIs(t, err, ErrVerificationFailed,
+		"malformed input is not a verification failure")
+
+	_, err = VerifyBundleOffline(raw, digestHex, nil)
+	require.Error(t, err, "a digest without an <algorithm>: prefix must be rejected")
 }
 
 func TestIdentityPolicyOption(t *testing.T) {
@@ -190,4 +198,39 @@ func TestKeySignedBundleIdentityPolicyRejects(t *testing.T) {
 		CertIssuer:     "https://accounts.example.com",
 	}, verify.WithNoObserverTimestamps())
 	require.Error(t, err, "an expected identity must not verify against a certificate-less bundle")
+}
+
+// TestVerifyBundleRequiresExplicitOptions guards the opts/material contract:
+// passing trusted material without matching verifier options must fail
+// loudly instead of silently applying public-good defaults to the wrong
+// root.
+func TestVerifyBundleRequiresExplicitOptions(t *testing.T) {
+	t.Parallel()
+
+	raw, pubPEM, digestHex := signTestBundle(t, []byte("content"))
+	tm, err := PublicKeyMaterial([]byte(pubPEM))
+	require.NoError(t, err)
+
+	parsed := &bundle.Bundle{}
+	require.NoError(t, parsed.UnmarshalJSON(raw))
+
+	_, err = VerifyBundle(Bundle{
+		Parsed:     parsed,
+		DigestAlgo: DigestAlgorithmSHA256,
+		DigestHex:  digestHex,
+	}, tm, nil)
+	require.ErrorContains(t, err, "verifier options are required")
+}
+
+func TestDefaultVerifierOptions(t *testing.T) {
+	t.Parallel()
+	opts, err := DefaultVerifierOptions()
+	require.NoError(t, err)
+	assert.NotEmpty(t, opts)
+}
+
+func TestRetrieveBundlesUnreachableRegistry(t *testing.T) {
+	t.Parallel()
+	_, err := RetrieveBundles(t.Context(), "invalid.invalid/org/artifact:v1", nil)
+	require.Error(t, err)
 }

@@ -4,12 +4,13 @@
 package verifier
 
 import (
+	"context"
 	"crypto"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -28,6 +29,12 @@ const DigestAlgorithmSHA256 = "sha256"
 // Sigstore signature or attestation in any supported layout — i.e. the
 // artifact is unsigned as far as this package can tell.
 var ErrNoBundles = errors.New("no sigstore bundles found for artifact")
+
+// ErrVerificationFailed wraps every cryptographic verification failure
+// returned by the VerifyBundle* functions, so callers can distinguish
+// "signed but failed verification" from malformed input with errors.Is
+// instead of matching sigstore-go's (unstable) error strings.
+var ErrVerificationFailed = errors.New("sigstore bundle verification failed")
 
 // Bundle is a Sigstore bundle retrieved for an artifact, in both parsed and
 // serialized form. Raw is the canonical JSON encoding, suitable for durable
@@ -60,15 +67,15 @@ type Identity struct {
 }
 
 // IdentityFromResult extracts the signer Identity from a verification result.
-func IdentityFromResult(r *verify.VerificationResult) (*Identity, error) {
+func IdentityFromResult(r *verify.VerificationResult) (Identity, error) {
 	if r == nil || r.Signature == nil || r.Signature.Certificate == nil {
-		return nil, errors.New("verification result carries no certificate summary")
+		return Identity{}, errors.New("verification result carries no certificate summary")
 	}
 	signer, err := signerIdentityFromCertificate(r.Signature.Certificate)
 	if err != nil {
-		return nil, fmt.Errorf("extracting signer identity: %w", err)
+		return Identity{}, fmt.Errorf("extracting signer identity: %w", err)
 	}
-	return &Identity{
+	return Identity{
 		SignerIdentity:      signer,
 		CertIssuer:          r.Signature.Certificate.Issuer,
 		SourceRepositoryURI: r.Signature.Certificate.SourceRepositoryURI,
@@ -80,10 +87,10 @@ func IdentityFromResult(r *verify.VerificationResult) (*Identity, error) {
 // (the "sha256-<hex>.sig" tag) and attestation manifests. It returns
 // ErrNoBundles when the artifact has no discoverable signature material —
 // the caller's signal that the artifact is unsigned.
-func RetrieveBundles(imageRef string, keychain authn.Keychain) ([]Bundle, error) {
-	internal, err := getSigstoreBundles(imageRef, keychain)
+func RetrieveBundles(ctx context.Context, imageRef string, keychain authn.Keychain) ([]Bundle, error) {
+	internal, err := getSigstoreBundles(ctx, imageRef, keychain)
 	if errors.Is(err, ErrProvenanceNotFoundOrIncomplete) {
-		return nil, ErrNoBundles
+		return nil, fmt.Errorf("%w: %w", ErrNoBundles, err)
 	}
 	if err != nil {
 		return nil, err
@@ -94,7 +101,10 @@ func RetrieveBundles(imageRef string, keychain authn.Keychain) ([]Bundle, error)
 
 	bundles := make([]Bundle, 0, len(internal))
 	for _, b := range internal {
-		raw, marshalErr := json.Marshal(b.bundle)
+		// MarshalJSON is protojson under the hood — the canonical bundle
+		// encoding; called explicitly so it doesn't rely on json.Marshal's
+		// interface dispatch.
+		raw, marshalErr := b.bundle.MarshalJSON()
 		if marshalErr != nil {
 			return nil, fmt.Errorf("serializing sigstore bundle: %w", marshalErr)
 		}
@@ -112,8 +122,13 @@ func RetrieveBundles(imageRef string, keychain authn.Keychain) ([]Bundle, error)
 // public-good instance built entirely from the trusted root embedded in this
 // package — no network access, no TUF refresh. The embedded root is a
 // point-in-time snapshot: key rotations in the public-good instance require
-// a package update to pick up. Callers that need live freshness should use
-// New (which performs a TUF fetch) instead.
+// a package update to pick up. This cuts both ways — newly rotated-in keys
+// are unknown (verification of fresh signatures fails until the snapshot is
+// updated), and a key rotated out BECAUSE OF COMPROMISE keeps being trusted
+// here until a new release ships and consumers bump. Callers that need live
+// freshness or timely compromise revocation should use New (which performs
+// a TUF fetch) instead; offline verification trades that for hermeticity.
+// See tufroots/README.md for the snapshot's provenance.
 func OfflineTrustedMaterial() (root.TrustedMaterial, error) {
 	rawRoot, err := embeddedTufRoots.ReadFile(
 		"tufroots/" + TrustedRootSigstorePublicGoodInstance + "/trusted_root.json")
@@ -153,11 +168,14 @@ func PublicKeyMaterial(pubKeyPEM []byte) (root.TrustedMaterial, error) {
 // trust-on-first-use case — verifies the chain of trust only, and the
 // caller records the identity from the returned result.
 //
-// verifierOpts configure the verifier; when empty, the public-good
-// instance defaults are used (SCT + transparency log + observer
-// timestamps). Key-material verification (PublicKeyMaterial) must pass its
-// own options, since key-signed bundles carry no certificate transparency
-// or Fulcio timestamps.
+// verifierOpts configure the verifier and MUST match the trusted material:
+// pass DefaultVerifierOptions() with public-good material (SCT +
+// transparency log + observer timestamps), and
+// verify.WithNoObserverTimestamps() with PublicKeyMaterial (key-signed
+// bundles carry no certificate transparency or Fulcio timestamps).
+// Requiring the options explicitly prevents public-good defaults being fed
+// to a different root, which surfaces as confusing sigstore-go internals
+// rather than a clear mismatch.
 func VerifyBundle(
 	b Bundle,
 	tm root.TrustedMaterial,
@@ -168,11 +186,10 @@ func VerifyBundle(
 		return nil, errors.New("bundle is not parsed")
 	}
 	if len(verifierOpts) == 0 {
-		defaults, err := verifierOptions(TrustedRootSigstorePublicGoodInstance)
-		if err != nil {
-			return nil, err
-		}
-		verifierOpts = defaults
+		return nil, errors.New(
+			"verifier options are required and must match the trusted material: " +
+				"use DefaultVerifierOptions() for the Sigstore public-good instance " +
+				"or verify.WithNoObserverTimestamps() for key material")
 	}
 	sev, err := verify.NewVerifier(tm, verifierOpts...)
 	if err != nil {
@@ -195,9 +212,17 @@ func VerifyBundle(
 		policyOpts...,
 	))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrVerificationFailed, err)
 	}
 	return result, nil
+}
+
+// DefaultVerifierOptions returns the verifier options matching the Sigstore
+// public-good instance trust root (SCT, transparency log, and observer
+// timestamp requirements). Pass these to VerifyBundle together with
+// OfflineTrustedMaterial (or the live public-good root).
+func DefaultVerifierOptions() ([]verify.VerifierOption, error) {
+	return verifierOptions(TrustedRootSigstorePublicGoodInstance)
 }
 
 // VerifyBundleWithKey verifies a bundle signed with a plain key pair (the
@@ -220,22 +245,35 @@ func VerifyBundleWithKey(b Bundle, pubKeyPEM []byte) (*verify.VerificationResult
 	if err != nil {
 		return nil, fmt.Errorf("decoding artifact digest: %w", err)
 	}
-	return sev.Verify(b.Parsed, verify.NewPolicy(
+	result, err := sev.Verify(b.Parsed, verify.NewPolicy(
 		verify.WithArtifactDigest(b.DigestAlgo, digestBytes),
 		verify.WithKey(),
 	))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrVerificationFailed, err)
+	}
+	return result, nil
 }
 
 // VerifyBundleOffline re-verifies a stored bundle (the Raw form produced by
-// RetrieveBundles or a signing flow) against the artifact digest, using
-// only the embedded trusted root — no network. See OfflineTrustedMaterial
-// for the freshness trade-off. expected behaves as in VerifyBundle.
+// RetrieveBundles or a signing flow) against the artifact digest
+// ("sha256:<hex>"), using only the embedded trusted root — no network. See
+// OfflineTrustedMaterial for the freshness trade-off. expected behaves as
+// in VerifyBundle.
 func VerifyBundleOffline(
 	rawBundle []byte,
-	digestAlgo, digestHex string,
+	artifactDigest string,
 	expected *Identity,
 ) (*verify.VerificationResult, error) {
+	digestAlgo, digestHex, ok := strings.Cut(artifactDigest, ":")
+	if !ok || digestAlgo == "" || digestHex == "" {
+		return nil, fmt.Errorf("artifact digest %q is not in <algorithm>:<hex> form", artifactDigest)
+	}
 	tm, err := OfflineTrustedMaterial()
+	if err != nil {
+		return nil, err
+	}
+	opts, err := DefaultVerifierOptions()
 	if err != nil {
 		return nil, err
 	}
@@ -248,7 +286,7 @@ func VerifyBundleOffline(
 		Raw:        rawBundle,
 		DigestAlgo: digestAlgo,
 		DigestHex:  digestHex,
-	}, tm, expected)
+	}, tm, expected, opts...)
 }
 
 // identityPolicyOption translates an expected Identity into a Sigstore

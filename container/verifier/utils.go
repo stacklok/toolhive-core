@@ -4,6 +4,7 @@
 package verifier
 
 import (
+	"context"
 	"embed"
 	"errors"
 	"fmt"
@@ -126,15 +127,16 @@ func embeddedRootJson(tufRootURL string) ([]byte, error) {
 
 // getSigstoreBundles returns the sigstore bundles, either through the OCI registry or the GitHub attestation endpoint
 func getSigstoreBundles(
+	ctx context.Context,
 	imageRef string,
 	keychain authn.Keychain,
 ) ([]sigstoreBundle, error) {
 	// Try to build a bundle from a Sigstore signed image
-	bundles, err := bundleFromSigstoreSignedImage(imageRef, keychain)
+	bundles, err := bundleFromSigstoreSignedImage(ctx, imageRef, keychain)
 	if errors.Is(err, ErrProvenanceNotFoundOrIncomplete) {
 		// If we get this error, it means that the image is not signed
 		// or the signature is incomplete. Let's try to see if we can find attestation for the image.
-		return bundleFromAttestation(imageRef, keychain)
+		return bundleFromAttestation(ctx, imageRef, keychain)
 	} else if err != nil {
 		return nil, err
 	}
