@@ -4,6 +4,7 @@
 package audit
 
 import (
+	"log/slog"
 	"reflect"
 )
 
@@ -122,19 +123,45 @@ type DelegationChain struct {
 	MalformedReason MalformedReason  `json:"malformedReason,omitempty"`
 }
 
-// IsEmpty reports whether the chain is nil or contains no hops. Note that a
-// chain with no hops may still carry audit-relevant state (Malformed); use
-// [DelegationChain.IsZero] to decide whether a chain is worth recording.
-func (c *DelegationChain) IsEmpty() bool {
-	return c == nil || len(c.Chain) == 0
-}
-
 // IsZero reports whether the chain carries no information at all: no hops,
 // no truncation, and no malformation. A zero chain is omitted from JSON and
 // log output; a non-zero chain — including a hopless but malformed one — is
 // always recorded.
 func (c *DelegationChain) IsZero() bool {
 	return c == nil || (len(c.Chain) == 0 && !c.Truncated && !c.Malformed)
+}
+
+// LogValue implements [log/slog.LogValuer] so that every handler — not just
+// JSONHandler, which happens to skip unexported fields via encoding/json —
+// sees only the promoted iss/sub of each hop. Handing the struct to a handler
+// directly would let a text or other fmt-based handler render the unexported
+// extra claims via %+v, defeating the PII guard. The emitted shape mirrors the
+// struct's JSON tags (including omitempty on iss/sub and malformedReason) so
+// slog and JSON output stay structurally identical.
+func (c *DelegationChain) LogValue() slog.Value {
+	hops := make([]map[string]string, 0, len(c.Chain))
+	for _, hop := range c.Chain {
+		// Mirror the omitempty tags on DelegatedActor so the shapes stay
+		// identical for hops with an absent iss or sub.
+		logged := make(map[string]string, 2)
+		if hop.Issuer != "" {
+			logged[hopClaimIss] = hop.Issuer
+		}
+		if hop.Subject != "" {
+			logged[hopClaimSub] = hop.Subject
+		}
+		hops = append(hops, logged)
+	}
+	attrs := []slog.Attr{
+		slog.Any("chain", hops),
+		slog.Bool("truncated", c.Truncated),
+		slog.Int("omitted", c.Omitted),
+		slog.Bool("malformed", c.Malformed),
+	}
+	if c.MalformedReason != "" {
+		attrs = append(attrs, slog.String("malformedReason", string(c.MalformedReason)))
+	}
+	return slog.GroupValue(attrs...)
 }
 
 // flagMalformed marks the chain malformed with the given reason. The first

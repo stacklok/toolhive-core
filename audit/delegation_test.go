@@ -447,7 +447,6 @@ func checkTopLevelMalformed(t *testing.T, c *DelegationChain) {
 	assert.Equal(t, MalformedReasonActNotObject, c.MalformedReason)
 	assert.False(t, c.Truncated)
 	assert.Equal(t, 0, c.Omitted)
-	assert.True(t, c.IsEmpty())
 	assert.False(t, c.IsZero(), "a malformed chain carries information and is not zero")
 }
 
@@ -480,34 +479,30 @@ func TestDelegatedActor_Extra(t *testing.T) {
 	})
 }
 
-func TestDelegationChain_IsEmptyIsZero(t *testing.T) {
+func TestDelegationChain_IsZero(t *testing.T) {
 	t.Parallel()
 
-	t.Run("nil chain is empty and zero", func(t *testing.T) {
+	t.Run("nil chain is zero", func(t *testing.T) {
 		t.Parallel()
 		var c *DelegationChain
-		assert.True(t, c.IsEmpty())
 		assert.True(t, c.IsZero())
 	})
 
-	t.Run("zero value is empty and zero", func(t *testing.T) {
+	t.Run("zero value is zero", func(t *testing.T) {
 		t.Parallel()
 		var c DelegationChain
-		assert.True(t, c.IsEmpty())
 		assert.True(t, c.IsZero())
 	})
 
-	t.Run("one empty hop is not empty and not zero", func(t *testing.T) {
+	t.Run("one empty hop is not zero", func(t *testing.T) {
 		t.Parallel()
 		c := &DelegationChain{Chain: []DelegatedActor{{}}}
-		assert.False(t, c.IsEmpty())
 		assert.False(t, c.IsZero())
 	})
 
-	t.Run("hopless malformed chain is empty but not zero", func(t *testing.T) {
+	t.Run("hopless malformed chain is not zero", func(t *testing.T) {
 		t.Parallel()
 		c := &DelegationChain{Chain: []DelegatedActor{}, Malformed: true}
-		assert.True(t, c.IsEmpty())
 		assert.False(t, c.IsZero())
 	})
 }
@@ -644,14 +639,22 @@ func TestAuditEventLogTo_Delegation(t *testing.T) {
 // TestAuditEventLogTo_SlogMatchesJSON pins the contract that the "delegation"
 // object in slog output is structurally equal to the "delegation" object in
 // json.Marshal(event) output, so consumers can use one parser for both wire
-// shapes.
+// shapes — and that no handler, including fmt-based ones, can render the
+// unexported extra claims.
 func TestAuditEventLogTo_SlogMatchesJSON(t *testing.T) {
 	t.Parallel()
 
+	// The outer hop carries a PII extra claim; the inner hop has no sub. The
+	// extra must reach no handler at all, and an absent sub must be omitted
+	// rather than emitted as "" so both wire shapes stay identical.
 	chain := ParseDelegationChain(map[string]any{
-		hopClaimIss: testIss1,
-		hopClaimSub: testSub1,
-		hopClaimAct: "broken", // exercises malformed + malformedReason too
+		hopClaimIss:     testIss1,
+		hopClaimSub:     testSub1,
+		extraClaimEmail: testAliceEmail,
+		hopClaimAct: map[string]any{
+			hopClaimIss: testHopInner,
+			hopClaimAct: "broken", // exercises malformed + malformedReason too
+		},
 	}, 0)
 
 	event := NewAuditEvent("t", EventSource{}, OutcomeSuccess, map[string]string{}, "svc")
@@ -661,17 +664,28 @@ func TestAuditEventLogTo_SlogMatchesJSON(t *testing.T) {
 	require.NoError(t, err)
 	var fromJSON map[string]any
 	require.NoError(t, json.Unmarshal(data, &fromJSON))
+	require.Contains(t, fromJSON, "delegation")
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	event.LogTo(context.Background(), logger, LevelAudit)
 	var fromSlog map[string]any
 	require.NoError(t, json.Unmarshal(buf.Bytes(), &fromSlog))
-
-	require.Contains(t, fromJSON, "delegation")
 	require.Contains(t, fromSlog, "delegation")
 	assert.Equal(t, fromJSON["delegation"], fromSlog["delegation"],
 		"slog and JSON delegation shapes must be identical")
+
+	// Every handler, not only JSONHandler: a fmt-based handler must not be able
+	// to render the unexported extra claims, and must keep the chain structured.
+	var text bytes.Buffer
+	event.LogTo(context.Background(),
+		slog.New(slog.NewTextHandler(&text, &slog.HandlerOptions{Level: slog.LevelDebug})), LevelAudit)
+	assert.NotContains(t, text.String(), testAliceEmail,
+		"extra claim values must not reach a text handler")
+	assert.NotContains(t, text.String(), extraClaimEmail,
+		"extra claim keys must not reach a text handler")
+	assert.Contains(t, text.String(), "delegation.chain=",
+		"the chain must stay structured in text output")
 }
 
 func TestAuditEventJSON_RoundTrip(t *testing.T) {

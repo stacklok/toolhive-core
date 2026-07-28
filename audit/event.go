@@ -209,10 +209,10 @@ func (e *AuditEvent) LogTo(ctx context.Context, logger *slog.Logger, level slog.
 	// Add delegation chain if present and non-zero. The IsZero gate plus the
 	// field's omitempty tag together guarantee that, when no chain is set,
 	// the log output is identical to before this field existed (no "delegation"
-	// key is emitted). The chain is emitted via its JSON marshaling so the
-	// slog and JSON wire shapes of the same event are structurally identical:
-	// a "chain" array of {iss,sub} hops plus truncated/omitted/malformed.
-	// Extra per-hop claims are never serialized (PII guard).
+	// key is emitted). The chain resolves through [DelegationChain.LogValue],
+	// which mirrors its JSON shape, so the slog and JSON wire forms of the same
+	// event are structurally identical and no handler — JSON, text, or custom —
+	// ever sees the unexported extra claims (PII guard).
 	if !e.DelegationChain.IsZero() {
 		attrs = append(attrs, slog.Any("delegation", e.DelegationChain))
 	}

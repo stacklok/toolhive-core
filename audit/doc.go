@@ -44,8 +44,9 @@ chain is additive to the flat [AuditEvent.Subjects] map; Subjects remains the
 backward-compatible identity map and is not modified by setting a chain.
 
 Parse raw `act` claims with [ParseDelegationChain], which applies a defensive
-depth cap ([DefaultMaxDelegationDepth], overridable via maxDepth) to bound
-work on attacker-influenceable input, and reports explicit truncation
+depth cap ([DefaultMaxDelegationDepth], overridable via maxDepth) to bound the
+size of the retained chain and of the emitted record — not parsing work, since
+the caller has already decoded the claim — and reports explicit truncation
 (Truncated/Omitted are never silently omitted). Per-hop identity is the issuer
 (iss) and subject (sub) pair only: (iss, sub) is the only stable, unique actor
 identifier (OpenID Connect Core §5.7), and RFC 8693 §6 calls for data
