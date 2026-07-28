@@ -58,6 +58,11 @@ type AuditEvent struct {
 	// Data: enhances the audit event with extra information that may be
 	// useful for forensic analysis.
 	Data *json.RawMessage `json:"data,omitempty"`
+	// DelegationChain holds the RFC 8693 `act` delegation chain when the event's
+	// actor acted on behalf of a prior actor. Additive to Subjects; Subjects
+	// remains the flat backward-compatible identity map. Omitted when zero
+	// (no hops, no truncation, no malformation).
+	DelegationChain *DelegationChain `json:"delegation,omitempty"`
 }
 
 // EventMetadata contains metadata about the audit event.
@@ -145,6 +150,22 @@ func (e *AuditEvent) WithDataFromString(data string) *AuditEvent {
 	return e.WithData(&rawMsg)
 }
 
+// WithDelegationChain sets the RFC 8693 delegation chain for the event's actor.
+// The chain is attached as-is; parsing raw `act` claims is the caller's
+// responsibility (see ParseDelegationChain). Passing a nil or zero chain
+// (no hops, no truncation, no malformation — see [DelegationChain.IsZero])
+// clears any previously set chain. A hopless but malformed chain is kept:
+// "the caller asserted delegation we could not read" is audit-relevant and
+// distinct from "no delegation". Subjects is not modified.
+func (e *AuditEvent) WithDelegationChain(chain *DelegationChain) *AuditEvent {
+	if chain.IsZero() {
+		e.DelegationChain = nil
+		return e
+	}
+	e.DelegationChain = chain
+	return e
+}
+
 // LevelAudit is a custom slog level for audit events, sitting between
 // [slog.LevelInfo] (0) and [slog.LevelWarn] (4). Logging audit events at this
 // dedicated level lets log infrastructure filter them independently from
@@ -183,6 +204,17 @@ func (e *AuditEvent) LogTo(ctx context.Context, logger *slog.Logger, level slog.
 	// Add data if present
 	if e.Data != nil {
 		attrs = append(attrs, slog.Any("data", e.Data))
+	}
+
+	// Add delegation chain if present and non-zero. The IsZero gate plus the
+	// field's omitempty tag together guarantee that, when no chain is set,
+	// the log output is identical to before this field existed (no "delegation"
+	// key is emitted). The chain resolves through [DelegationChain.LogValue],
+	// which mirrors its JSON shape, so the slog and JSON wire forms of the same
+	// event are structurally identical and no handler — JSON, text, or custom —
+	// ever sees the unexported extra claims (PII guard).
+	if !e.DelegationChain.IsZero() {
+		attrs = append(attrs, slog.Any("delegation", e.DelegationChain))
 	}
 
 	// Log with the specified level
