@@ -289,4 +289,12 @@ func TestAuditEventLogTo(t *testing.T) {
 	assert.Equal(t, targetTypeTool, targetData[targetKeyType])
 	assert.Equal(t, "calculator", targetData[targetKeyName])
 	assert.Equal(t, "/api/tools/calculator", targetData[targetKeyEndpt])
+
+	// No delegation chain is attached to this event; the log output must NOT
+	// contain a "delegation" key. This guards the omitempty field tag plus the
+	// IsEmpty gate in LogTo so that, when no chain is set, output is identical
+	// to before the delegation field existed.
+	assert.NotContains(t, logOutput, "delegation", "no delegation key when chain is unset")
+	_, hasDelegation := logEntry["delegation"]
+	assert.False(t, hasDelegation, "parsed log entry must not have a delegation key")
 }

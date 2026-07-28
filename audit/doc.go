@@ -26,15 +26,36 @@ Each audit event records:
 Events support a fluent builder pattern for optional fields:
 
 	event := audit.NewAuditEvent(
-		audit.EventTypeMCPToolCall,
+		"mcp_tool_call",
 		audit.EventSource{Type: audit.SourceTypeNetwork, Value: "10.0.0.1"},
 		audit.OutcomeSuccess,
-		map[string]string{audit.SubjectKeyUser: "alice"},
+		map[string]string{"user": "alice"},
 		"my-service",
 	).WithTarget(map[string]string{
-		audit.TargetKeyType: audit.TargetTypeTool,
-		audit.TargetKeyName: "calculator",
+		"type": "tool",
+		"name": "calculator",
 	})
+
+# Delegation Chains
+
+When an actor acted on behalf of another actor (RFC 8693 `act` claim), attach
+a [DelegationChain] to the event via [AuditEvent.WithDelegationChain]. The
+chain is additive to the flat [AuditEvent.Subjects] map; Subjects remains the
+backward-compatible identity map and is not modified by setting a chain.
+
+Parse raw `act` claims with [ParseDelegationChain], which applies a defensive
+depth cap ([DefaultMaxDelegationDepth], overridable via maxDepth) to bound
+recursion on attacker-influenceable input, and reports explicit truncation
+(Truncated/Omitted are never silently omitted). Per-hop identity is the issuer
+(iss) and subject (sub) pair only, as specified by RFC 8693 §6. Any extra
+claims present on a hop are retained in memory for inspection via
+[DelegatedActor.Extra] but are never serialized or logged, to avoid leaking
+Personally Identifiable Information.
+
+The chain is ordered outermost-first: Chain[0] is the current actor and the
+last entry is the least recent (original) actor. Only the top-level event
+claims and Chain[0] should drive access-control decisions; prior hops are
+informational only.
 
 # Logging
 

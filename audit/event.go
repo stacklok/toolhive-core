@@ -6,6 +6,7 @@ package audit
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -58,6 +59,10 @@ type AuditEvent struct {
 	// Data: enhances the audit event with extra information that may be
 	// useful for forensic analysis.
 	Data *json.RawMessage `json:"data,omitempty"`
+	// DelegationChain holds the RFC 8693 `act` delegation chain when the event's
+	// actor acted on behalf of a prior actor. Additive to Subjects; Subjects
+	// remains the flat backward-compatible identity map. Omitted when empty.
+	DelegationChain *DelegationChain `json:"delegation,omitempty"`
 }
 
 // EventMetadata contains metadata about the audit event.
@@ -145,6 +150,19 @@ func (e *AuditEvent) WithDataFromString(data string) *AuditEvent {
 	return e.WithData(&rawMsg)
 }
 
+// WithDelegationChain sets the RFC 8693 delegation chain for the event's actor.
+// The chain is attached as-is; parsing raw `act` claims is the caller's
+// responsibility (see ParseDelegationChain). Passing a nil or empty chain
+// clears any previously set chain. Subjects is not modified.
+func (e *AuditEvent) WithDelegationChain(chain *DelegationChain) *AuditEvent {
+	if chain == nil || chain.IsEmpty() {
+		e.DelegationChain = nil
+		return e
+	}
+	e.DelegationChain = chain
+	return e
+}
+
 // LevelAudit is a custom slog level for audit events, sitting between
 // [slog.LevelInfo] (0) and [slog.LevelWarn] (4). Logging audit events at this
 // dedicated level lets log infrastructure filter them independently from
@@ -185,8 +203,38 @@ func (e *AuditEvent) LogTo(ctx context.Context, logger *slog.Logger, level slog.
 		attrs = append(attrs, slog.Any("data", e.Data))
 	}
 
+	// Add delegation chain if present and non-empty. The IsEmpty gate plus the
+	// field's omitempty tag together guarantee that, when no chain is set,
+	// the log output is identical to before this field existed (no "delegation"
+	// key is emitted). Only iss+sub per hop are logged; extra claims are never
+	// serialized (PII guard).
+	if e.DelegationChain != nil && !e.DelegationChain.IsEmpty() {
+		attrs = append(attrs, delegationLogAttrs(e.DelegationChain))
+	}
+
 	// Log with the specified level
 	logger.LogAttrs(ctx, level, "audit_event", attrs...)
+}
+
+// delegationLogAttrs builds the slog attribute group for a delegation chain.
+// Each hop is emitted as a nested slog.Group named hop_0, hop_1, ... inside a
+// "hops" group, containing only iss and sub. The chain's Truncated and
+// Omitted fields are emitted alongside the hops. Extra per-hop claims are
+// deliberately omitted (PII guard).
+func delegationLogAttrs(c *DelegationChain) slog.Attr {
+	hopAttrs := make([]slog.Attr, 0, len(c.Chain))
+	for i, hop := range c.Chain {
+		hopAttrs = append(hopAttrs, slog.Group(
+			fmt.Sprintf("hop_%d", i),
+			slog.String("iss", hop.Issuer),
+			slog.String("sub", hop.Subject),
+		))
+	}
+	return slog.Group("delegation",
+		slog.Any("hops", hopAttrs),
+		slog.Bool("truncated", c.Truncated),
+		slog.Int("omitted", c.Omitted),
+	)
 }
 
 // Common event outcomes
