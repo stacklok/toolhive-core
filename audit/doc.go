@@ -45,17 +45,30 @@ backward-compatible identity map and is not modified by setting a chain.
 
 Parse raw `act` claims with [ParseDelegationChain], which applies a defensive
 depth cap ([DefaultMaxDelegationDepth], overridable via maxDepth) to bound
-recursion on attacker-influenceable input, and reports explicit truncation
+work on attacker-influenceable input, and reports explicit truncation
 (Truncated/Omitted are never silently omitted). Per-hop identity is the issuer
-(iss) and subject (sub) pair only, as specified by RFC 8693 §6. Any extra
-claims present on a hop are retained in memory for inspection via
-[DelegatedActor.Extra] but are never serialized or logged, to avoid leaking
-Personally Identifiable Information.
+(iss) and subject (sub) pair only: (iss, sub) is the only stable, unique actor
+identifier (OpenID Connect Core §5.7), and RFC 8693 §6 calls for data
+minimization. Any extra claims present on a hop are retained in memory for
+inspection via [DelegatedActor.Extra] but are never serialized or logged, to
+avoid leaking Personally Identifiable Information.
 
 The chain is ordered outermost-first: Chain[0] is the current actor and the
-last entry is the least recent (original) actor. Only the top-level event
-claims and Chain[0] should drive access-control decisions; prior hops are
-informational only.
+last entry is the least recent (earliest) actor. The delegating end user is
+not part of the chain — it is the token's top-level sub, recorded in Subjects.
+Only the top-level event claims and Chain[0] should drive access-control
+decisions; prior hops are informational only (RFC 8693 §4.1) and exist for
+audit.
+
+Parsing never fails: an audit record must be producible for exactly the
+tokens that violate expectations, since a malformed delegation assertion from
+a signature-validated token is itself security-relevant (it indicates an
+issuer bug or tampering), and dropping the record would let malformed input
+suppress audit (CWE-223, CWE-778). Non-conformant input is recorded on the
+chain via Malformed and a low-cardinality MalformedReason, with all hops that
+parsed successfully preserved. Strict rejection of malformed `act` claims
+belongs on the token-issuance path, not in the audit sink; consumers that
+alert can key on the malformed field.
 
 # Logging
 

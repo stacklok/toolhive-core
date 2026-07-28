@@ -17,11 +17,19 @@ import (
 // Test-local constants to satisfy goconst across repeated use in fixtures.
 const (
 	testAliceEmail  = "alice@example.com"
+	testHopOuter    = "outer"
+	testHopInner    = "inner"
+	testIss1        = "iss-1"
+	testSub1        = "sub-1"
 	testAdminRole   = "admin"
 	testSourceIP    = "10.0.0.1"
 	testActorAlice  = "alice"
 	extraClaimEmail = "email"
 )
+
+// mapClaims mimics jwt.MapClaims: a named map type that does not satisfy a
+// direct .(map[string]any) type assertion.
+type mapClaims map[string]any
 
 // nestedAct builds a deeply nested act chain map of the given depth where
 // each hop has iss=<label>. The outermost hop is labeled with labels[0].
@@ -58,57 +66,52 @@ func TestParseDelegationChain(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		raw         any
-		maxDepth    int
-		wantErr     bool
-		errContains string
-		wantErrIs   error
-		check       func(t *testing.T, c *DelegationChain)
+		name     string
+		raw      any
+		maxDepth int
+		check    func(t *testing.T, c *DelegationChain)
 	}{
 		{
-			name:     "nil input returns empty non-nil chain",
+			name:     "nil input returns zero non-nil chain",
 			raw:      nil,
 			maxDepth: DefaultMaxDelegationDepth,
 			check: func(t *testing.T, c *DelegationChain) {
 				t.Helper()
-				require.NotNil(t, c)
-				assert.True(t, c.IsEmpty(), "nil input should yield empty chain")
-				assert.False(t, c.Truncated)
-				assert.Equal(t, 0, c.Omitted)
+				assert.True(t, c.IsZero(), "nil input should yield zero chain")
+				assert.NotNil(t, c.Chain, "Chain must be allocated, never nil")
+				assert.False(t, c.Malformed)
+				assert.Empty(t, c.MalformedReason)
 			},
 		},
 		{
-			name:        "string scalar returns error naming kind",
-			raw:         "not-an-object",
-			maxDepth:    DefaultMaxDelegationDepth,
-			wantErr:     true,
-			errContains: "string",
-			wantErrIs:   ErrNotJSONObject,
+			name:     "string scalar flags act_not_object",
+			raw:      "not-an-object",
+			maxDepth: DefaultMaxDelegationDepth,
+			check:    checkTopLevelMalformed,
 		},
 		{
-			name:        "float64 scalar returns error naming kind",
-			raw:         float64(3.14),
-			maxDepth:    DefaultMaxDelegationDepth,
-			wantErr:     true,
-			errContains: "float64",
-			wantErrIs:   ErrNotJSONObject,
+			name:     "float64 scalar flags act_not_object",
+			raw:      float64(3.14),
+			maxDepth: DefaultMaxDelegationDepth,
+			check:    checkTopLevelMalformed,
 		},
 		{
-			name:        "bool scalar returns error naming kind",
-			raw:         true,
-			maxDepth:    DefaultMaxDelegationDepth,
-			wantErr:     true,
-			errContains: "bool",
-			wantErrIs:   ErrNotJSONObject,
+			name:     "bool scalar flags act_not_object",
+			raw:      true,
+			maxDepth: DefaultMaxDelegationDepth,
+			check:    checkTopLevelMalformed,
 		},
 		{
-			name:        "slice returns error naming kind",
-			raw:         []any{"x"},
-			maxDepth:    DefaultMaxDelegationDepth,
-			wantErr:     true,
-			errContains: "[]interface",
-			wantErrIs:   ErrNotJSONObject,
+			name:     "slice flags act_not_object",
+			raw:      []any{"x"},
+			maxDepth: DefaultMaxDelegationDepth,
+			check:    checkTopLevelMalformed,
+		},
+		{
+			name:     "json.Number scalar flags act_not_object",
+			raw:      json.Number("123"),
+			maxDepth: DefaultMaxDelegationDepth,
+			check:    checkTopLevelMalformed,
 		},
 		{
 			name:     "empty map yields one hop with empty subject/issuer",
@@ -116,11 +119,11 @@ func TestParseDelegationChain(t *testing.T) {
 			maxDepth: DefaultMaxDelegationDepth,
 			check: func(t *testing.T, c *DelegationChain) {
 				t.Helper()
-				require.NotNil(t, c)
 				require.Len(t, c.Chain, 1)
 				assert.Empty(t, c.Chain[0].Subject)
 				assert.Empty(t, c.Chain[0].Issuer)
 				assert.False(t, c.Truncated)
+				assert.False(t, c.Malformed)
 			},
 		},
 		{
@@ -132,6 +135,7 @@ func TestParseDelegationChain(t *testing.T) {
 				require.Len(t, c.Chain, 1)
 				assert.Equal(t, testActorAlice, c.Chain[0].Subject)
 				assert.Empty(t, c.Chain[0].Issuer)
+				assert.False(t, c.Malformed)
 			},
 		},
 		{
@@ -148,10 +152,10 @@ func TestParseDelegationChain(t *testing.T) {
 		{
 			name: "one hop with nested act yields two entries outermost-first",
 			raw: map[string]any{
-				hopClaimIss: "outer",
+				hopClaimIss: testHopOuter,
 				hopClaimSub: "outer-sub",
 				hopClaimAct: map[string]any{
-					hopClaimIss: "inner",
+					hopClaimIss: testHopInner,
 					hopClaimSub: "inner-sub",
 				},
 			},
@@ -159,8 +163,8 @@ func TestParseDelegationChain(t *testing.T) {
 			check: func(t *testing.T, c *DelegationChain) {
 				t.Helper()
 				require.Len(t, c.Chain, 2)
-				assert.Equal(t, "outer", c.Chain[0].Issuer)
-				assert.Equal(t, "inner", c.Chain[1].Issuer)
+				assert.Equal(t, testHopOuter, c.Chain[0].Issuer)
+				assert.Equal(t, testHopInner, c.Chain[1].Issuer)
 				assert.False(t, c.Truncated)
 				assert.Equal(t, 0, c.Omitted)
 			},
@@ -206,54 +210,20 @@ func TestParseDelegationChain(t *testing.T) {
 				// innermost. labelsABC(20) => [C,B,A,Z,Y,X,W,V,U,T,S,R,Q,P,O,N,...]
 				// so index 15 (the 16th) is "N".
 				assert.Equal(t, "N", c.Chain[15].Issuer)
+				assert.False(t, c.Malformed, "well-formed truncated chain must not be malformed")
 			},
 		},
 		{
-			name: "act present but not a map returns error",
-			raw: map[string]any{
-				hopClaimSub: "x",
-				hopClaimAct: "not-a-map",
-			},
-			maxDepth:    DefaultMaxDelegationDepth,
-			wantErr:     true,
-			errContains: "act claim must be a JSON object",
-			wantErrIs:   ErrNestedActNotObject,
-		},
-		{
-			name: "extra claims retained in memory",
-			raw: map[string]any{
-				hopClaimSub:     testActorAlice,
-				extraClaimEmail: testAliceEmail,
-				"role":          testAdminRole,
-			},
-			maxDepth: DefaultMaxDelegationDepth,
+			name:     "depth one over cap Omits exactly 1 outermost preserved",
+			raw:      nestedAct(17, labelsABC(17)),
+			maxDepth: 16,
 			check: func(t *testing.T, c *DelegationChain) {
 				t.Helper()
-				require.Len(t, c.Chain, 1)
-				extra := c.Chain[0].Extra()
-				require.NotNil(t, extra)
-				assert.Equal(t, testAliceEmail, extra[extraClaimEmail])
-				assert.Equal(t, testAdminRole, extra["role"])
-			},
-		},
-		{
-			name:     "maxDepth 0 uses default 16 no truncation at depth 3",
-			raw:      nestedAct(3, labelsABC(3)),
-			maxDepth: 0,
-			check: func(t *testing.T, c *DelegationChain) {
-				t.Helper()
-				require.Len(t, c.Chain, 3)
-				assert.False(t, c.Truncated)
-			},
-		},
-		{
-			name:     "negative maxDepth uses default 16 no truncation at depth 3",
-			raw:      nestedAct(3, labelsABC(3)),
-			maxDepth: -5,
-			check: func(t *testing.T, c *DelegationChain) {
-				t.Helper()
-				require.Len(t, c.Chain, 3)
-				assert.False(t, c.Truncated)
+				require.Len(t, c.Chain, 16)
+				assert.True(t, c.Truncated, "must be truncated at depth 17 vs cap 16")
+				assert.Equal(t, 1, c.Omitted, "exactly one hop must be omitted")
+				// Chain[0] is the outermost actor, preserved.
+				assert.Equal(t, "C", c.Chain[0].Issuer)
 			},
 		},
 		{
@@ -270,24 +240,140 @@ func TestParseDelegationChain(t *testing.T) {
 			},
 		},
 		{
-			name:        "json.Number scalar returns ErrNotJSONObject",
-			raw:         json.Number("123"),
-			maxDepth:    DefaultMaxDelegationDepth,
-			wantErr:     true,
-			errContains: "json.Number",
-			wantErrIs:   ErrNotJSONObject,
-		},
-		{
-			name:     "depth one over cap Omits exactly 1 outermost preserved",
-			raw:      nestedAct(17, labelsABC(17)),
-			maxDepth: 16,
+			name: "nested act not a map keeps parsed hops and flags malformed",
+			raw: map[string]any{
+				hopClaimSub: "x",
+				hopClaimAct: "not-a-map",
+			},
+			maxDepth: DefaultMaxDelegationDepth,
 			check: func(t *testing.T, c *DelegationChain) {
 				t.Helper()
-				require.Len(t, c.Chain, 16)
-				assert.True(t, c.Truncated, "must be truncated at depth 17 vs cap 16")
-				assert.Equal(t, 1, c.Omitted, "exactly one hop must be omitted")
-				// Chain[0] is the outermost actor, preserved.
-				assert.Equal(t, "C", c.Chain[0].Issuer)
+				require.Len(t, c.Chain, 1, "the outer hop must be preserved")
+				assert.Equal(t, "x", c.Chain[0].Subject)
+				assert.True(t, c.Malformed)
+				assert.Equal(t, MalformedReasonNestedActNotObject, c.MalformedReason)
+				assert.False(t, c.Truncated)
+				assert.Equal(t, 0, c.Omitted)
+			},
+		},
+		{
+			name: "explicit null act ends the chain without malformation",
+			raw: map[string]any{
+				hopClaimSub: "x",
+				hopClaimAct: nil,
+			},
+			maxDepth: DefaultMaxDelegationDepth,
+			check: func(t *testing.T, c *DelegationChain) {
+				t.Helper()
+				require.Len(t, c.Chain, 1)
+				assert.False(t, c.Malformed, "JSON null act asserts no delegation, like absence")
+			},
+		},
+		{
+			name: "non-string sub flags malformed and retains raw value in extra",
+			raw: map[string]any{
+				hopClaimSub: float64(123),
+				hopClaimIss: "issuer-1",
+			},
+			maxDepth: DefaultMaxDelegationDepth,
+			check: func(t *testing.T, c *DelegationChain) {
+				t.Helper()
+				require.Len(t, c.Chain, 1)
+				assert.Empty(t, c.Chain[0].Subject, "non-string sub must not be coerced")
+				assert.Equal(t, "issuer-1", c.Chain[0].Issuer)
+				assert.True(t, c.Malformed)
+				assert.Equal(t, MalformedReasonSubNotString, c.MalformedReason)
+				extra := c.Chain[0].Extra()
+				require.NotNil(t, extra, "raw non-string sub must stay inspectable in memory")
+				assert.Equal(t, float64(123), extra[hopClaimSub])
+			},
+		},
+		{
+			name: "non-string iss flags malformed and retains raw value in extra",
+			raw: map[string]any{
+				hopClaimIss: []any{"not", "a", "string"},
+				hopClaimSub: "subject-1",
+			},
+			maxDepth: DefaultMaxDelegationDepth,
+			check: func(t *testing.T, c *DelegationChain) {
+				t.Helper()
+				require.Len(t, c.Chain, 1)
+				assert.Empty(t, c.Chain[0].Issuer)
+				assert.Equal(t, "subject-1", c.Chain[0].Subject)
+				assert.True(t, c.Malformed)
+				assert.Equal(t, MalformedReasonIssNotString, c.MalformedReason)
+				extra := c.Chain[0].Extra()
+				require.NotNil(t, extra)
+				assert.Equal(t, []any{"not", "a", "string"}, extra[hopClaimIss])
+			},
+		},
+		{
+			name: "first malformed reason wins",
+			raw: map[string]any{
+				hopClaimSub: float64(1), // sub_not_string, encountered first
+				hopClaimAct: "scalar",   // nested_act_not_object, encountered second
+			},
+			maxDepth: DefaultMaxDelegationDepth,
+			check: func(t *testing.T, c *DelegationChain) {
+				t.Helper()
+				assert.True(t, c.Malformed)
+				assert.Equal(t, MalformedReasonSubNotString, c.MalformedReason)
+			},
+		},
+		{
+			name: "malformed node past the cap flags malformed without counting it",
+			raw: map[string]any{
+				hopClaimSub: testHopOuter,
+				hopClaimAct: map[string]any{
+					hopClaimSub: "mid",
+					hopClaimAct: map[string]any{
+						hopClaimSub: testHopInner,
+						hopClaimAct: "scalar-tail",
+					},
+				},
+			},
+			maxDepth: 2,
+			check: func(t *testing.T, c *DelegationChain) {
+				t.Helper()
+				require.Len(t, c.Chain, 2)
+				assert.True(t, c.Truncated)
+				assert.Equal(t, 1, c.Omitted, "only the well-formed inner hop counts as omitted")
+				assert.True(t, c.Malformed)
+				assert.Equal(t, MalformedReasonNestedActNotObject, c.MalformedReason)
+			},
+		},
+		{
+			name: "named map type is accepted at top level and nested",
+			raw: mapClaims{
+				hopClaimSub: testHopOuter,
+				hopClaimAct: mapClaims{
+					hopClaimSub: testHopInner,
+				},
+			},
+			maxDepth: DefaultMaxDelegationDepth,
+			check: func(t *testing.T, c *DelegationChain) {
+				t.Helper()
+				require.Len(t, c.Chain, 2, "jwt.MapClaims-shaped input must parse, not vanish")
+				assert.Equal(t, testHopOuter, c.Chain[0].Subject)
+				assert.Equal(t, testHopInner, c.Chain[1].Subject)
+				assert.False(t, c.Malformed)
+			},
+		},
+		{
+			name: "extra claims retained in memory",
+			raw: map[string]any{
+				hopClaimSub:     testActorAlice,
+				extraClaimEmail: testAliceEmail,
+				"role":          testAdminRole,
+			},
+			maxDepth: DefaultMaxDelegationDepth,
+			check: func(t *testing.T, c *DelegationChain) {
+				t.Helper()
+				require.Len(t, c.Chain, 1)
+				extra := c.Chain[0].Extra()
+				require.NotNil(t, extra)
+				assert.Equal(t, testAliceEmail, extra[extraClaimEmail])
+				assert.Equal(t, testAdminRole, extra["role"])
 			},
 		},
 		{
@@ -318,29 +404,51 @@ func TestParseDelegationChain(t *testing.T) {
 				assert.Equal(t, float64(42), num)
 			},
 		},
+		{
+			name:     "maxDepth 0 uses default 16 no truncation at depth 3",
+			raw:      nestedAct(3, labelsABC(3)),
+			maxDepth: 0,
+			check: func(t *testing.T, c *DelegationChain) {
+				t.Helper()
+				require.Len(t, c.Chain, 3)
+				assert.False(t, c.Truncated)
+			},
+		},
+		{
+			name:     "negative maxDepth uses default 16 no truncation at depth 3",
+			raw:      nestedAct(3, labelsABC(3)),
+			maxDepth: -5,
+			check: func(t *testing.T, c *DelegationChain) {
+				t.Helper()
+				require.Len(t, c.Chain, 3)
+				assert.False(t, c.Truncated)
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			c, err := ParseDelegationChain(tt.raw, tt.maxDepth)
-			if tt.wantErr {
-				require.Error(t, err)
-				if tt.errContains != "" {
-					assert.Contains(t, err.Error(), tt.errContains)
-				}
-				if tt.wantErrIs != nil {
-					assert.ErrorIs(t, err, tt.wantErrIs)
-				}
-				assert.Nil(t, c)
-				return
-			}
-			require.NoError(t, err)
-			if tt.check != nil {
-				tt.check(t, c)
-			}
+			c := ParseDelegationChain(tt.raw, tt.maxDepth)
+			require.NotNil(t, c, "ParseDelegationChain never returns nil")
+			require.NotNil(t, c.Chain, "Chain must always be allocated")
+			tt.check(t, c)
 		})
 	}
+}
+
+// checkTopLevelMalformed is the shared assertion for non-object top-level
+// input: no hops, Malformed=true with act_not_object, no truncation.
+func checkTopLevelMalformed(t *testing.T, c *DelegationChain) {
+	t.Helper()
+	assert.Empty(t, c.Chain)
+	assert.NotNil(t, c.Chain, "even a malformed chain must serialize chain as [], not null")
+	assert.True(t, c.Malformed)
+	assert.Equal(t, MalformedReasonActNotObject, c.MalformedReason)
+	assert.False(t, c.Truncated)
+	assert.Equal(t, 0, c.Omitted)
+	assert.True(t, c.IsEmpty())
+	assert.False(t, c.IsZero(), "a malformed chain carries information and is not zero")
 }
 
 func TestDelegatedActor_Extra(t *testing.T) {
@@ -372,25 +480,35 @@ func TestDelegatedActor_Extra(t *testing.T) {
 	})
 }
 
-func TestDelegationChain_IsEmpty(t *testing.T) {
+func TestDelegationChain_IsEmptyIsZero(t *testing.T) {
 	t.Parallel()
 
-	t.Run("nil chain is empty", func(t *testing.T) {
+	t.Run("nil chain is empty and zero", func(t *testing.T) {
 		t.Parallel()
 		var c *DelegationChain
 		assert.True(t, c.IsEmpty())
+		assert.True(t, c.IsZero())
 	})
 
-	t.Run("zero value is empty", func(t *testing.T) {
+	t.Run("zero value is empty and zero", func(t *testing.T) {
 		t.Parallel()
 		var c DelegationChain
 		assert.True(t, c.IsEmpty())
+		assert.True(t, c.IsZero())
 	})
 
-	t.Run("one empty hop is not empty", func(t *testing.T) {
+	t.Run("one empty hop is not empty and not zero", func(t *testing.T) {
 		t.Parallel()
 		c := &DelegationChain{Chain: []DelegatedActor{{}}}
 		assert.False(t, c.IsEmpty())
+		assert.False(t, c.IsZero())
+	})
+
+	t.Run("hopless malformed chain is empty but not zero", func(t *testing.T) {
+		t.Parallel()
+		c := &DelegationChain{Chain: []DelegatedActor{}, Malformed: true}
+		assert.True(t, c.IsEmpty())
+		assert.False(t, c.IsZero())
 	})
 }
 
@@ -399,7 +517,7 @@ func TestAuditEventWithDelegationChain(t *testing.T) {
 
 	chain := &DelegationChain{
 		Chain: []DelegatedActor{
-			{Issuer: "iss-1", Subject: "sub-1"},
+			{Issuer: testIss1, Subject: testSub1},
 			{Issuer: "iss-2", Subject: "sub-2"},
 		},
 	}
@@ -422,7 +540,7 @@ func TestAuditEventWithDelegationChain(t *testing.T) {
 		assert.Nil(t, event.DelegationChain)
 	})
 
-	t.Run("attach empty chain clears field", func(t *testing.T) {
+	t.Run("attach zero chain clears field", func(t *testing.T) {
 		t.Parallel()
 		event := NewAuditEvent("t", EventSource{}, OutcomeSuccess, map[string]string{}, "svc")
 		event.WithDelegationChain(chain)
@@ -431,12 +549,14 @@ func TestAuditEventWithDelegationChain(t *testing.T) {
 		assert.Nil(t, event.DelegationChain)
 	})
 
-	t.Run("attach then nil clears field", func(t *testing.T) {
+	t.Run("attach hopless malformed chain is kept", func(t *testing.T) {
 		t.Parallel()
 		event := NewAuditEvent("t", EventSource{}, OutcomeSuccess, map[string]string{}, "svc")
-		event.WithDelegationChain(chain)
-		event.WithDelegationChain(nil)
-		assert.Nil(t, event.DelegationChain)
+		malformed := ParseDelegationChain("not-an-object", 0)
+		event.WithDelegationChain(malformed)
+		require.NotNil(t, event.DelegationChain,
+			"a malformed delegation assertion is audit-relevant and must not be dropped")
+		assert.True(t, event.DelegationChain.Malformed)
 	})
 
 	t.Run("Subjects unchanged after attach no side effect", func(t *testing.T) {
@@ -477,8 +597,7 @@ func TestAuditEventLogTo_Delegation(t *testing.T) {
 			},
 		},
 	}
-	chain, err := ParseDelegationChain(raw, 2)
-	require.NoError(t, err)
+	chain := ParseDelegationChain(raw, 2)
 	require.True(t, chain.Truncated)
 	assert.Equal(t, 1, chain.Omitted)
 	require.Len(t, chain.Chain, 2)
@@ -500,23 +619,59 @@ func TestAuditEventLogTo_Delegation(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(out), &entry))
 
 	delegation, ok := entry["delegation"].(map[string]any)
-	require.True(t, ok, "delegation group must be present")
+	require.True(t, ok, "delegation object must be present")
 
-	hops, ok := delegation["hops"].(map[string]any)
-	require.True(t, ok, "hops must be a map")
-	assert.Len(t, hops, 2, "hops length must be 2 (truncated)")
+	// The slog shape must be structurally identical to the event's JSON
+	// marshaling: a "chain" ARRAY of {iss,sub} hops (not hop_N-keyed groups).
+	hops, ok := delegation["chain"].([]any)
+	require.True(t, ok, "chain must be a JSON array")
+	require.Len(t, hops, 2, "chain length must be 2 (truncated)")
 
-	hop0, ok := hops["hop_0"].(map[string]any)
+	hop0, ok := hops[0].(map[string]any)
 	require.True(t, ok)
-	assert.Equal(t, "current-actor", hop0["sub"], "hop_0.sub must be the current actor")
+	assert.Equal(t, "current-actor", hop0["sub"], "chain[0].sub must be the current actor")
 	assert.Equal(t, "outer-iss", hop0["iss"])
 
 	assert.Equal(t, true, delegation["truncated"])
 	assert.Equal(t, float64(1), delegation["omitted"])
+	assert.Equal(t, false, delegation["malformed"])
 
 	// PII guard: the extra-claim key must NOT appear anywhere in the output.
 	assert.NotContains(t, out, "secret@example.com")
 	assert.NotContains(t, out, "\"email\"", "extra claims must not be serialized")
+}
+
+// TestAuditEventLogTo_SlogMatchesJSON pins the contract that the "delegation"
+// object in slog output is structurally equal to the "delegation" object in
+// json.Marshal(event) output, so consumers can use one parser for both wire
+// shapes.
+func TestAuditEventLogTo_SlogMatchesJSON(t *testing.T) {
+	t.Parallel()
+
+	chain := ParseDelegationChain(map[string]any{
+		hopClaimIss: testIss1,
+		hopClaimSub: testSub1,
+		hopClaimAct: "broken", // exercises malformed + malformedReason too
+	}, 0)
+
+	event := NewAuditEvent("t", EventSource{}, OutcomeSuccess, map[string]string{}, "svc")
+	event.WithDelegationChain(chain)
+
+	data, err := json.Marshal(event)
+	require.NoError(t, err)
+	var fromJSON map[string]any
+	require.NoError(t, json.Unmarshal(data, &fromJSON))
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	event.LogTo(context.Background(), logger, LevelAudit)
+	var fromSlog map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &fromSlog))
+
+	require.Contains(t, fromJSON, "delegation")
+	require.Contains(t, fromSlog, "delegation")
+	assert.Equal(t, fromJSON["delegation"], fromSlog["delegation"],
+		"slog and JSON delegation shapes must be identical")
 }
 
 func TestAuditEventJSON_RoundTrip(t *testing.T) {
@@ -524,11 +679,13 @@ func TestAuditEventJSON_RoundTrip(t *testing.T) {
 
 	chain := &DelegationChain{
 		Chain: []DelegatedActor{
-			{Issuer: "iss-1", Subject: "sub-1", extra: map[string]any{extraClaimEmail: testAliceEmail}},
+			{Issuer: testIss1, Subject: testSub1, extra: map[string]any{extraClaimEmail: testAliceEmail}},
 			{Issuer: "iss-2", Subject: "sub-2"},
 		},
-		Truncated: true,
-		Omitted:   3,
+		Truncated:       true,
+		Omitted:         3,
+		Malformed:       true,
+		MalformedReason: MalformedReasonNestedActNotObject,
 	}
 
 	event := NewAuditEvent("mcp_tool_call", EventSource{Type: SourceTypeNetwork, Value: testSourceIP},
@@ -541,18 +698,73 @@ func TestAuditEventJSON_RoundTrip(t *testing.T) {
 	var decoded AuditEvent
 	require.NoError(t, json.Unmarshal(data, &decoded))
 
-	// Chain (iss/sub only) and Truncated/Omitted must round-trip.
+	// Chain (iss/sub only) and Truncated/Omitted/Malformed must round-trip.
 	require.NotNil(t, decoded.DelegationChain)
 	require.Len(t, decoded.DelegationChain.Chain, 2)
-	assert.Equal(t, "iss-1", decoded.DelegationChain.Chain[0].Issuer)
-	assert.Equal(t, "sub-1", decoded.DelegationChain.Chain[0].Subject)
+	assert.Equal(t, testIss1, decoded.DelegationChain.Chain[0].Issuer)
+	assert.Equal(t, testSub1, decoded.DelegationChain.Chain[0].Subject)
 	assert.Equal(t, "iss-2", decoded.DelegationChain.Chain[1].Issuer)
 	assert.Equal(t, "sub-2", decoded.DelegationChain.Chain[1].Subject)
 	assert.True(t, decoded.DelegationChain.Truncated)
 	assert.Equal(t, 3, decoded.DelegationChain.Omitted)
+	assert.True(t, decoded.DelegationChain.Malformed)
+	assert.Equal(t, MalformedReasonNestedActNotObject, decoded.DelegationChain.MalformedReason)
 
 	// Extra must NOT round-trip (in-memory only).
 	assert.Nil(t, decoded.DelegationChain.Chain[0].Extra())
+}
+
+// TestDelegationChainJSON_WireKeys asserts the EMITTED JSON key names, not Go
+// struct fields, so a tag rename cannot slip through with a green suite.
+func TestDelegationChainJSON_WireKeys(t *testing.T) {
+	t.Parallel()
+
+	t.Run("well-formed chain emits exactly the contracted keys", func(t *testing.T) {
+		t.Parallel()
+		event := NewAuditEvent("t", EventSource{}, OutcomeSuccess, map[string]string{}, "svc")
+		event.WithDelegationChain(&DelegationChain{
+			Chain: []DelegatedActor{{Issuer: testIss1, Subject: testSub1}},
+		})
+		data, err := json.Marshal(event)
+		require.NoError(t, err)
+
+		var raw map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(data, &raw))
+		require.Contains(t, raw, "delegation")
+
+		var delegation map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(raw["delegation"], &delegation))
+		assert.ElementsMatch(t,
+			[]string{"chain", "truncated", "omitted", "malformed"},
+			keysOf(delegation),
+			"delegation wire keys are a contract; malformedReason is omitempty")
+
+		var hops []map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(delegation["chain"], &hops))
+		require.Len(t, hops, 1)
+		assert.ElementsMatch(t, []string{"iss", "sub"}, keysOf(hops[0]),
+			"hop wire keys are a contract")
+	})
+
+	t.Run("hopless malformed chain emits chain as empty array not null", func(t *testing.T) {
+		t.Parallel()
+		event := NewAuditEvent("t", EventSource{}, OutcomeSuccess, map[string]string{}, "svc")
+		event.WithDelegationChain(ParseDelegationChain(float64(1), 0))
+		data, err := json.Marshal(event)
+		require.NoError(t, err)
+		assert.Contains(t, string(data), `"chain":[]`,
+			"a nil slice would marshal to null and break array-iterating consumers")
+		assert.Contains(t, string(data), `"malformed":true`)
+		assert.Contains(t, string(data), `"malformedReason":"act_not_object"`)
+	})
+}
+
+func keysOf(m map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func TestAuditEventJSON_OmitEmpty(t *testing.T) {
@@ -566,7 +778,7 @@ func TestAuditEventJSON_OmitEmpty(t *testing.T) {
 		assert.NotContains(t, string(data), "delegation")
 	})
 
-	t.Run("empty chain omits delegation key", func(t *testing.T) {
+	t.Run("zero chain omits delegation key", func(t *testing.T) {
 		t.Parallel()
 		event := NewAuditEvent("t", EventSource{}, OutcomeSuccess, map[string]string{}, "svc")
 		event.WithDelegationChain(&DelegationChain{})

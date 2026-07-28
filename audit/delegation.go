@@ -4,26 +4,18 @@
 package audit
 
 import (
-	"encoding/json"
-	"errors"
-	"fmt"
+	"reflect"
 )
 
 // DefaultMaxDelegationDepth is the default defensive cap on delegation-chain
-// parsing. It bounds recursion on attacker-influenceable input: RFC 8693 sets
-// no limit on chain length, so a maliciously crafted token could otherwise
-// force unbounded recursion. Callers may pass a stricter maxDepth to
-// [ParseDelegationChain] to match a minting-side cap. The default is
-// intentionally larger than any known consumer's minting cap.
+// parsing. It bounds the work done on attacker-influenceable input: RFC 8693
+// sets no limit on chain length, so a maliciously crafted token could
+// otherwise force unbounded work. Callers should pass their own minting-side
+// cap as maxDepth to [ParseDelegationChain] when they have one; the default is
+// intentionally larger than any known consumer's minting cap, so that for
+// consumers passing their (smaller) mint cap, Truncated=true is a genuine
+// signal that a token came from outside their own issuance path.
 const DefaultMaxDelegationDepth = 16
-
-// ErrNotJSONObject is returned by [ParseDelegationChain] when the top-level
-// act claim value is not a JSON object (e.g. a string, number, bool, or array).
-var ErrNotJSONObject = errors.New("top-level act claim is not a JSON object")
-
-// ErrNestedActNotObject is returned by [ParseDelegationChain] when a nested
-// act member inside a delegation hop is not a JSON object.
-var ErrNestedActNotObject = errors.New("nested act claim is not a JSON object")
 
 // hopClaimIss, hopClaimSub, and hopClaimAct are the RFC 8693 claim keys
 // recognized on a delegation hop. All other keys are treated as extra
@@ -34,12 +26,39 @@ const (
 	hopClaimAct = "act"
 )
 
+// MalformedReason is a low-cardinality label describing the first
+// RFC 8693 conformance violation encountered while parsing an `act` claim.
+// It is deliberately an enum rather than free text so that it is safe to use
+// as a metric or alerting dimension.
+type MalformedReason string
+
+// Malformed reasons reported by [ParseDelegationChain]. The first violation
+// encountered wins; subsequent violations do not overwrite it.
+const (
+	// MalformedReasonActNotObject: the top-level act claim value was not a
+	// JSON object (e.g. a string, number, bool, or array).
+	MalformedReasonActNotObject MalformedReason = "act_not_object"
+	// MalformedReasonNestedActNotObject: a nested act member inside a
+	// delegation hop was not a JSON object.
+	MalformedReasonNestedActNotObject MalformedReason = "nested_act_not_object"
+	// MalformedReasonIssNotString: a hop carried an iss claim that was not a
+	// JSON string. The raw value is retained in that hop's in-memory extra
+	// claims under "iss".
+	MalformedReasonIssNotString MalformedReason = "iss_not_string"
+	// MalformedReasonSubNotString: a hop carried a sub claim that was not a
+	// JSON string. The raw value is retained in that hop's in-memory extra
+	// claims under "sub".
+	MalformedReasonSubNotString MalformedReason = "sub_not_string"
+)
+
 // DelegatedActor represents a single hop in an RFC 8693 delegation chain.
 //
-// Per-hop identity is the issuer (iss) and subject (sub) pair only, as
-// specified by RFC 8693 §6. Any other claims present on a hop are retained
-// in the in-memory-only extra map (never serialized or logged) to avoid
-// leaking Personally Identifiable Information.
+// Per-hop identity is the issuer (iss) and subject (sub) pair only: per
+// OpenID Connect Core §5.7 the (iss, sub) combination is the only stable,
+// unique actor identifier, and RFC 8693 §6 calls for data minimization. Any
+// other claims present on a hop are retained in the in-memory-only extra map
+// (never serialized or logged) to avoid leaking Personally Identifiable
+// Information.
 type DelegatedActor struct {
 	Issuer  string `json:"iss,omitempty"`
 	Subject string `json:"sub,omitempty"`
@@ -51,6 +70,11 @@ type DelegatedActor struct {
 // does not affect the hop's internal state. However, mutating a nested map
 // or slice value may share underlying data with the hop's copy. It returns
 // nil when the hop has no extra claims.
+//
+// The extra claims are deliberately excluded from JSON and slog output as a
+// PII guard, and may contain sensitive or internal claims (session
+// identifiers, emails, roles). Callers MUST NOT serialize or log the returned
+// map; doing so reintroduces the leak this design prevents.
 func (a DelegatedActor) Extra() map[string]any {
 	if len(a.extra) == 0 {
 		return nil
@@ -65,158 +89,206 @@ func (a DelegatedActor) Extra() map[string]any {
 // DelegationChain holds a flattened, ordered RFC 8693 delegation chain.
 //
 // The chain is ordered OUTERMOST-FIRST: Chain[0] is the current actor (the
-// immediate subject of the event), and the last entry is the least recent
-// (original) actor. Only the top-level event claims and Chain[0] should
-// drive access-control decisions; prior hops are informational only.
+// immediate actor of the event), and the last entry is the least recent
+// (earliest) actor. The delegating end user is NOT part of the chain: per
+// RFC 8693 it is the token's top-level sub, recorded in the event's Subjects
+// map. Per RFC 8693 §4.1, only the top-level event claims and Chain[0] may
+// drive access-control decisions; prior hops are informational only and exist
+// for audit.
 //
-// Truncated and Omitted intentionally have no omitempty tag: truncation is
-// never silent. When Truncated is true, Omitted reports how many inner hops
-// were dropped to satisfy the maxDepth cap. The outermost hops are always
-// preserved (the current actor is never dropped); only inner hops are
-// omitted.
+// Ordering rationale — do not assume, and do not "fix": current-actor-first
+// matches the read order of RFC 8693's nested act structure, and it keeps
+// Chain[0] STABLE UNDER TRUNCATION — truncation drops inner (early) hops, so
+// the one hop that may inform decisions is always at index 0, complete chain
+// or not. Beware that append-style flat formats elsewhere (Envoy XFCC,
+// GCP delegates[]) run the OPPOSITE direction (original-first); consumers
+// correlating across systems must map explicitly rather than by position
+// intuition.
+//
+// Truncated, Omitted, and Malformed intentionally have no omitempty tag:
+// an incomplete or non-conformant chain is never silently indistinguishable
+// from a complete, well-formed one. When Truncated is true, Omitted reports
+// how many inner hops were dropped to satisfy the maxDepth cap; the outermost
+// hops are always preserved (the current actor is never dropped). When
+// Malformed is true, MalformedReason carries the first conformance violation
+// encountered, and Chain holds the hops that parsed successfully before it.
 type DelegationChain struct {
-	Chain     []DelegatedActor `json:"chain"`
-	Truncated bool             `json:"truncated"`
-	Omitted   int              `json:"omitted"`
+	Chain           []DelegatedActor `json:"chain"`
+	Truncated       bool             `json:"truncated"`
+	Omitted         int              `json:"omitted"`
+	Malformed       bool             `json:"malformed"`
+	MalformedReason MalformedReason  `json:"malformedReason,omitempty"`
 }
 
-// IsEmpty reports whether the chain is nil or contains no hops.
+// IsEmpty reports whether the chain is nil or contains no hops. Note that a
+// chain with no hops may still carry audit-relevant state (Malformed); use
+// [DelegationChain.IsZero] to decide whether a chain is worth recording.
 func (c *DelegationChain) IsEmpty() bool {
 	return c == nil || len(c.Chain) == 0
+}
+
+// IsZero reports whether the chain carries no information at all: no hops,
+// no truncation, and no malformation. A zero chain is omitted from JSON and
+// log output; a non-zero chain — including a hopless but malformed one — is
+// always recorded.
+func (c *DelegationChain) IsZero() bool {
+	return c == nil || (len(c.Chain) == 0 && !c.Truncated && !c.Malformed)
+}
+
+// flagMalformed marks the chain malformed with the given reason. The first
+// reason encountered wins so that the recorded reason points at the outermost
+// (most actionable) violation.
+func (c *DelegationChain) flagMalformed(reason MalformedReason) {
+	c.Malformed = true
+	if c.MalformedReason == "" {
+		c.MalformedReason = reason
+	}
 }
 
 // ParseDelegationChain parses a raw RFC 8693 `act` claim into a flattened,
 // outermost-first [DelegationChain].
 //
-// The input is expected to be a JSON object (map) decoded via
-// [encoding/json.Unmarshal] into an `any` value (i.e. map[string]any). The
-// parser walks nested `act` claims iteratively, bounded by maxDepth, so
-// pathologically deep input cannot cause a stack overflow.
+// The input is expected to be the decoded JSON value of the `act` claim
+// (i.e. a map[string]any, or any named map type with string keys such as
+// jwt.MapClaims). The parser walks nested `act` claims iteratively, bounded
+// by maxDepth, so pathologically deep input cannot cause a stack overflow.
+//
+// ParseDelegationChain never fails: it is an audit-side parser, and an audit
+// record must be producible for exactly the tokens that violate expectations
+// (an unreadable delegation assertion is forensically distinct from "no
+// delegation"). Non-conformant input is recorded on the returned chain via
+// Malformed/MalformedReason rather than dropped or returned as an error.
+// Enforcement belongs on the issuance path, not here.
 //
 // Parsing semantics:
 //   - maxDepth <= 0 uses [DefaultMaxDelegationDepth].
-//   - A nil input yields a non-nil empty chain (&DelegationChain{}), no error.
-//   - A non-map scalar (string, float64, bool, []any) returns nil and an error
-//     whose message names the unexpected kind.
+//   - A nil input yields a zero chain (no hops, not malformed): a JSON null
+//     or absent act claim asserts no delegation.
+//   - A non-object input (string, number, bool, array) yields no hops and
+//     Malformed=true with [MalformedReasonActNotObject].
 //   - A map with no iss/sub/act yields one hop with empty Subject/Issuer
 //     (sub is conventional, not RFC-mandatory; parsing is tolerant).
-//   - A map with sub sets that hop's Subject; iss sets Issuer.
+//   - A string sub sets that hop's Subject; a string iss sets Issuer. A
+//     non-string sub or iss leaves the field empty, flags the chain malformed,
+//     and retains the raw value in the hop's in-memory extra claims — the
+//     record shows that an identifier was present but unusable.
 //   - A nested `act` map is recursed: the outer map is Chain[0], its act is
 //     Chain[1], and so on. The result is naturally outermost-first.
+//   - A nested `act` that is present but not a map (JSON null excepted, which
+//     ends the chain) keeps the hops parsed so far and flags the chain
+//     malformed with [MalformedReasonNestedActNotObject].
 //   - When the depth equals maxDepth exactly, the full chain is returned with
 //     Truncated=false and Omitted=0.
 //   - When the depth exceeds maxDepth, the OUTERMOST maxDepth hops are kept
 //     (the current actor is preserved), Truncated=true, and Omitted counts
-//     the dropped inner hops. This is truncation, not an error.
-//   - An `act` claim present but not a map (e.g. "act":"x") returns nil and
-//     an error.
+//     the dropped inner hops. A malformed node past the cap flags Malformed
+//     but is not counted as an omitted hop.
 //   - Unknown extra keys on a hop are stored in that hop's in-memory-only
-//     extra map (see [DelegatedActor.Extra]).
-func ParseDelegationChain(raw any, maxDepth int) (*DelegationChain, error) {
+//     extra map (see [DelegatedActor.Extra]) and are never serialized.
+func ParseDelegationChain(raw any, maxDepth int) *DelegationChain {
 	if maxDepth <= 0 {
 		maxDepth = DefaultMaxDelegationDepth
 	}
 
+	chain := &DelegationChain{Chain: []DelegatedActor{}}
 	if raw == nil {
-		return &DelegationChain{}, nil
+		return chain
 	}
 
-	// A non-map scalar input is invalid; the top-level act claim must be a
-	// JSON object. Reject by naming the unexpected kind.
-	switch raw.(type) {
-	case map[string]any:
-		// ok, proceed
-	case string, float64, bool, []any, json.Number:
-		return nil, fmt.Errorf("%w: expected JSON object, got %T", ErrNotJSONObject, raw)
-	default:
-		return nil, fmt.Errorf("%w: expected JSON object, got %T", ErrNotJSONObject, raw)
+	current, ok := asStringMap(raw)
+	if !ok {
+		chain.flagMalformed(MalformedReasonActNotObject)
+		return chain
 	}
 
-	chain := &DelegationChain{}
-	current := raw
-	depth := 0
-
-	for current != nil {
+	for depth := 0; ; depth++ {
 		if depth >= maxDepth {
 			// We have hit the cap. The remaining inner hops (current and any
-			// nested act beneath it) must be counted and dropped, preserving
-			// only the outermost maxDepth hops already collected.
+			// nested act beneath it) are counted and dropped, preserving only
+			// the outermost maxDepth hops already collected.
 			chain.Truncated = true
-			chain.Omitted += countRemainingHops(current)
-			return chain, nil
+			omitted, malformed := countRemainingHops(current)
+			chain.Omitted += omitted
+			if malformed {
+				chain.flagMalformed(MalformedReasonNestedActNotObject)
+			}
+			return chain
 		}
 
-		hopMap, ok := current.(map[string]any)
-		if !ok {
-			// An `act` claim present but not a map is a hard error.
-			return nil, fmt.Errorf("%w: act claim must be a JSON object", ErrNestedActNotObject)
+		hop := DelegatedActor{extra: extraClaims(current)}
+		if rawIss, present := current[hopClaimIss]; present {
+			if iss, isString := rawIss.(string); isString {
+				hop.Issuer = iss
+			} else {
+				chain.flagMalformed(MalformedReasonIssNotString)
+			}
 		}
-
-		hop := DelegatedActor{extra: extraClaims(hopMap)}
-		if iss, ok := hopMap[hopClaimIss].(string); ok {
-			hop.Issuer = iss
-		}
-		if sub, ok := hopMap[hopClaimSub].(string); ok {
-			hop.Subject = sub
+		if rawSub, present := current[hopClaimSub]; present {
+			if sub, isString := rawSub.(string); isString {
+				hop.Subject = sub
+			} else {
+				chain.flagMalformed(MalformedReasonSubNotString)
+			}
 		}
 		chain.Chain = append(chain.Chain, hop)
-		depth++
 
-		next, hasAct := hopMap[hopClaimAct]
-		if !hasAct {
-			// No further nesting; the chain is complete.
-			return chain, nil
+		next, hasAct := current[hopClaimAct]
+		if !hasAct || next == nil {
+			// No further nesting (an explicit JSON null ends the chain like
+			// an absent act); the chain is complete.
+			return chain
 		}
 
-		nextMap, ok := next.(map[string]any)
+		nextMap, ok := asStringMap(next)
 		if !ok {
-			return nil, fmt.Errorf("%w: act claim must be a JSON object", ErrNestedActNotObject)
+			// A nested act present but not an object: keep what parsed and
+			// record the violation.
+			chain.flagMalformed(MalformedReasonNestedActNotObject)
+			return chain
 		}
 		current = nextMap
 	}
-
-	return chain, nil
 }
 
-// countRemainingHops counts how many hops would follow the current node
-// (inclusive of current) down the nested `act` chain. These are the hops
-// dropped due to exceeding maxDepth. The walk is iterative (not recursive),
-// so it cannot stack-overflow; it terminates because decoded JSON is a tree
-// and cannot contain reference cycles.
-func countRemainingHops(node any) int {
+// countRemainingHops counts how many hops follow the current node (inclusive
+// of current) down the nested `act` chain. These are the hops dropped due to
+// exceeding maxDepth. The second return reports whether the walk ended on a
+// non-object act value. The walk is iterative (not recursive), so it cannot
+// stack-overflow; it terminates because decoded JSON is a tree and cannot
+// contain reference cycles.
+func countRemainingHops(node map[string]any) (int, bool) {
 	count := 0
 	current := node
-	for current != nil {
-		m, ok := current.(map[string]any)
-		if !ok {
-			// Non-map act was already validated during the main walk; treat a
-			// malformed node as a single dropped hop and stop.
-			count++
-			break
-		}
+	for {
 		count++
-		next, hasAct := m[hopClaimAct]
-		if !hasAct {
-			break
+		next, hasAct := current[hopClaimAct]
+		if !hasAct || next == nil {
+			return count, false
 		}
-		nm, ok := next.(map[string]any)
+		nm, ok := asStringMap(next)
 		if !ok {
-			count++
-			break
+			// A non-object act past the cap is a violation, not a hop.
+			return count, true
 		}
 		current = nm
 	}
-	return count
 }
 
-// extraClaims returns a shallow copy of the non-standard keys on a hop map
-// (i.e. every key except iss, sub, and act). The result is nil when there are
-// no extra claims.
+// extraClaims returns a shallow copy of the non-standard keys on a hop map:
+// every key except act, and except iss/sub when they hold their conventional
+// string type. A non-string iss/sub is retained here so the raw value stays
+// inspectable in memory after the typed field is left empty. The result is
+// nil when there are no extra claims.
 func extraClaims(hop map[string]any) map[string]any {
 	var extra map[string]any
 	for k, v := range hop {
-		if k == hopClaimIss || k == hopClaimSub || k == hopClaimAct {
+		switch k {
+		case hopClaimAct:
 			continue
+		case hopClaimIss, hopClaimSub:
+			if _, isString := v.(string); isString {
+				continue
+			}
 		}
 		if extra == nil {
 			extra = make(map[string]any)
@@ -224,4 +296,24 @@ func extraClaims(hop map[string]any) map[string]any {
 		extra[k] = v
 	}
 	return extra
+}
+
+// asStringMap converts a decoded JSON object into a map[string]any. The fast
+// path is a direct type assertion; the reflective fallback accepts named map
+// types with string keys (e.g. jwt.MapClaims) so that programmatically built
+// claim structures are not silently misread as non-objects.
+func asStringMap(v any) (map[string]any, bool) {
+	if m, ok := v.(map[string]any); ok {
+		return m, true
+	}
+	rv := reflect.ValueOf(v)
+	if !rv.IsValid() || rv.Kind() != reflect.Map || rv.Type().Key().Kind() != reflect.String {
+		return nil, false
+	}
+	out := make(map[string]any, rv.Len())
+	iter := rv.MapRange()
+	for iter.Next() {
+		out[iter.Key().String()] = iter.Value().Interface()
+	}
+	return out, true
 }
