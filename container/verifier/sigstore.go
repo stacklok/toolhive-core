@@ -53,14 +53,16 @@ func bundleFromSigstoreSignedImage(ctx context.Context, imageRef string, keychai
 		// Build the verification material for the bundle
 		verificationMaterial, err := getBundleVerificationMaterial(layer)
 		if err != nil {
-			slog.Error("error getting bundle verification material")
+			slog.Error("error getting bundle verification material",
+				"layer_digest", layer.Digest.String(), "error", err)
 			continue
 		}
 
 		// Build the message signature for the bundle
 		msgSignature, err := getBundleMsgSignature(layer)
 		if err != nil {
-			slog.Error("error getting bundle message signature")
+			slog.Error("error getting bundle message signature",
+				"layer_digest", layer.Digest.String(), "error", err)
 			continue
 		}
 
@@ -166,7 +168,23 @@ func getSimpleSigningLayersFromSignatureManifest(
 // getBundleVerificationMaterial returns the bundle verification material from the simple signing layer
 func getBundleVerificationMaterial(manifestLayer v1.Descriptor) (
 	*protobundle.VerificationMaterial, error) {
-	// 1. Get the signing certificate chain
+	// 1. Classify the layout by certificate annotation PRESENCE. A layer
+	// without one is the classic key-signed cosign layout ("cosign sign
+	// --key"): the only verification material is the signature itself, and
+	// trust is established by the verifier supplying the public key. A
+	// certificate annotation that is present but malformed must remain an
+	// error — the annotations are registry-supplied (attacker-controlled),
+	// and a corrupt keyless layer must not be reclassified as key-signed.
+	if manifestLayer.Annotations["dev.sigstore.cosign/certificate"] == "" {
+		if !hasCosignSignatureAnnotation(manifestLayer) {
+			return nil, errors.New("layer carries neither certificate nor signature annotation")
+		}
+		return &protobundle.VerificationMaterial{
+			Content: &protobundle.VerificationMaterial_PublicKey{
+				PublicKey: &protocommon.PublicKeyIdentifier{Hint: keySignedPublicKeyHint},
+			},
+		}, nil
+	}
 	signingCert, err := getVerificationMaterialX509CertificateChain(manifestLayer)
 	if err != nil {
 		return nil, fmt.Errorf("error getting signing certificate: %w", err)
@@ -183,6 +201,18 @@ func getBundleVerificationMaterial(manifestLayer v1.Descriptor) (
 		TlogEntries:               tlogEntries,
 		TimestampVerificationData: nil,
 	}, nil
+}
+
+// keySignedPublicKeyHint marks a reconstructed bundle as originating from
+// the key-signed cosign layout: the stored bundle carries no key material
+// itself, so offline re-verification requires the caller to supply the
+// public key (VerifyBundleOfflineWithKey).
+const keySignedPublicKeyHint = "cosign-keypair"
+
+// hasCosignSignatureAnnotation reports whether the simple signing layer
+// carries a cosign signature annotation.
+func hasCosignSignatureAnnotation(layer v1.Descriptor) bool {
+	return layer.Annotations["dev.cosignproject.cosign/signature"] != ""
 }
 
 // getVerificationMaterialX509CertificateChain returns the verification material X509 certificate chain from the

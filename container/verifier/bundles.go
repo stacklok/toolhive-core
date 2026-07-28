@@ -26,8 +26,9 @@ import (
 const DigestAlgorithmSHA256 = "sha256"
 
 // ErrNoBundles is returned by RetrieveBundles when the artifact carries no
-// Sigstore signature or attestation in any supported layout — i.e. the
-// artifact is unsigned as far as this package can tell.
+// Sigstore signature or attestation in any supported layout — keyless
+// (certificate-bearing), key-signed ("cosign sign --key"), or attestation —
+// i.e. the artifact is unsigned as far as this package can tell.
 var ErrNoBundles = errors.New("no sigstore bundles found for artifact")
 
 // ErrVerificationFailed wraps every cryptographic verification failure
@@ -38,7 +39,11 @@ var ErrVerificationFailed = errors.New("sigstore bundle verification failed")
 
 // Bundle is a Sigstore bundle retrieved for an artifact, in both parsed and
 // serialized form. Raw is the canonical JSON encoding, suitable for durable
-// storage and later re-verification with VerifyBundleOffline.
+// storage and later re-verification — with VerifyBundleOffline for keyless
+// (certificate-bearing) bundles, or VerifyBundleOfflineWithKey for bundles
+// reconstructed from the key-signed cosign layout (HasCertificate tells the
+// two apart; key-signed bundles carry a "cosign-keypair" public-key hint
+// instead of a certificate).
 type Bundle struct {
 	// Parsed is the decoded bundle.
 	Parsed *bundle.Bundle
@@ -49,6 +54,18 @@ type Bundle struct {
 	DigestAlgo string
 	// DigestHex is the hex-encoded artifact digest the bundle signs.
 	DigestHex string
+}
+
+// HasCertificate reports whether the bundle carries a signing certificate —
+// i.e. it came from a keyless (Fulcio) flow and verifies with VerifyBundle;
+// a false result is the key-signed layout, verifying with
+// VerifyBundleWithKey / VerifyBundleOfflineWithKey.
+func (b Bundle) HasCertificate() bool {
+	if b.Parsed == nil {
+		return false
+	}
+	vm := b.Parsed.GetVerificationMaterial()
+	return vm.GetCertificate() != nil || vm.GetX509CertificateChain() != nil
 }
 
 // Identity is the signer identity extracted from a verified Sigstore bundle.
@@ -287,6 +304,32 @@ func VerifyBundleOffline(
 		DigestAlgo: digestAlgo,
 		DigestHex:  digestHex,
 	}, tm, expected, opts...)
+}
+
+// VerifyBundleOfflineWithKey re-verifies a stored key-signed bundle (the
+// Raw form of a bundle whose HasCertificate is false) against the artifact
+// digest ("sha256:<hex>") and the given PEM public key. Key verification
+// needs no trust root or network in the first place; this entry point only
+// adds the parse step for stored bundles.
+func VerifyBundleOfflineWithKey(
+	rawBundle []byte,
+	artifactDigest string,
+	pubKeyPEM []byte,
+) (*verify.VerificationResult, error) {
+	digestAlgo, digestHex, ok := strings.Cut(artifactDigest, ":")
+	if !ok || digestAlgo == "" || digestHex == "" {
+		return nil, fmt.Errorf("artifact digest %q is not in <algorithm>:<hex> form", artifactDigest)
+	}
+	parsed := &bundle.Bundle{}
+	if err := parsed.UnmarshalJSON(rawBundle); err != nil {
+		return nil, fmt.Errorf("parsing stored bundle: %w", err)
+	}
+	return VerifyBundleWithKey(Bundle{
+		Parsed:     parsed,
+		Raw:        rawBundle,
+		DigestAlgo: digestAlgo,
+		DigestHex:  digestHex,
+	}, pubKeyPEM)
 }
 
 // identityPolicyOption translates an expected Identity into a Sigstore
