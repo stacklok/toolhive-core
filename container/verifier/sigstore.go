@@ -166,10 +166,22 @@ func getSimpleSigningLayersFromSignatureManifest(
 // getBundleVerificationMaterial returns the bundle verification material from the simple signing layer
 func getBundleVerificationMaterial(manifestLayer v1.Descriptor) (
 	*protobundle.VerificationMaterial, error) {
-	// 1. Get the signing certificate chain
+	// 1. Get the signing certificate chain. A layer without a certificate
+	// annotation is the classic key-signed cosign layout ("cosign sign
+	// --key"): the only verification material is the signature itself, and
+	// trust is established by the verifier supplying the public key. Build
+	// public-key verification material so such bundles are retrievable and
+	// verifiable with key-based trusted material.
 	signingCert, err := getVerificationMaterialX509CertificateChain(manifestLayer)
 	if err != nil {
-		return nil, fmt.Errorf("error getting signing certificate: %w", err)
+		if !hasCosignSignatureAnnotation(manifestLayer) {
+			return nil, fmt.Errorf("error getting signing certificate: %w", err)
+		}
+		return &protobundle.VerificationMaterial{
+			Content: &protobundle.VerificationMaterial_PublicKey{
+				PublicKey: &protocommon.PublicKeyIdentifier{},
+			},
+		}, nil
 	}
 
 	// 2. Get the transparency log entries
@@ -183,6 +195,12 @@ func getBundleVerificationMaterial(manifestLayer v1.Descriptor) (
 		TlogEntries:               tlogEntries,
 		TimestampVerificationData: nil,
 	}, nil
+}
+
+// hasCosignSignatureAnnotation reports whether the simple signing layer
+// carries a cosign signature annotation.
+func hasCosignSignatureAnnotation(layer v1.Descriptor) bool {
+	return layer.Annotations["dev.cosignproject.cosign/signature"] != ""
 }
 
 // getVerificationMaterialX509CertificateChain returns the verification material X509 certificate chain from the
