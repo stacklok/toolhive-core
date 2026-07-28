@@ -29,6 +29,11 @@
 //	// store bundles[0].Raw and identity; later:
 //	_, err = verifier.VerifyBundleOffline(storedRaw, "sha256:"+digestHex, &identity)
 //
+// Key-signed bundles (Bundle.HasCertificate() == false, the "cosign sign
+// --key" layout) carry no certificate identity; verify them with
+// VerifyBundleWithKey at retrieval time and VerifyBundleOfflineWithKey for
+// stored Raw bytes — both take the signer's PEM public key.
+//
 // # Stability
 //
 // This package is Alpha stability. The API may change without notice.
