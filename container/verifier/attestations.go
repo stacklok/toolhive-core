@@ -4,6 +4,7 @@
 package verifier
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -21,11 +22,11 @@ import (
 // bundleFromAttestation retrieves the attestation bundles from the image reference. Note that the attestation
 // bundles are stored as OCI image references. The function uses the referrers API to get the attestation. GitHub supports
 // discovering the attestations via their API, but this is not supported here for now.
-func bundleFromAttestation(imageRef string, keychain authn.Keychain) ([]sigstoreBundle, error) {
+func bundleFromAttestation(ctx context.Context, imageRef string, keychain authn.Keychain) ([]sigstoreBundle, error) {
 	var bundles []sigstoreBundle
 
 	// Get the auth options
-	opts := []remote.Option{remote.WithAuthFromKeychain(keychain)}
+	opts := []remote.Option{remote.WithAuthFromKeychain(keychain), remote.WithContext(ctx)}
 
 	// Get the image reference
 	ref, err := name.ParseReference(imageRef)
@@ -116,7 +117,9 @@ func extractBundleFromImage(img v1.Image) (*bundle.Bundle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error uncompressing referrer layer: %w", err)
 	}
-	bundleBytes, err := io.ReadAll(layer0)
+	// Cap the read: the layer comes from the registry (untrusted) and the
+	// signature-manifest path enforces the same limit.
+	bundleBytes, err := io.ReadAll(io.LimitReader(layer0, MaxAttestationsBytesLimit))
 	if err != nil {
 		return nil, fmt.Errorf("error reading referrer layer: %w", err)
 	}

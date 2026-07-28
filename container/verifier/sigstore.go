@@ -6,6 +6,7 @@ package verifier
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -33,15 +34,15 @@ type sigstoreBundle struct {
 }
 
 // bundleFromSigstoreSignedImage returns a bundle from a Sigstore signed image
-func bundleFromSigstoreSignedImage(imageRef string, keychain authn.Keychain) ([]sigstoreBundle, error) {
+func bundleFromSigstoreSignedImage(ctx context.Context, imageRef string, keychain authn.Keychain) ([]sigstoreBundle, error) {
 	// Get the signature manifest from the OCI image reference
-	signatureRef, err := getSignatureReferenceFromOCIImage(imageRef, keychain)
+	signatureRef, err := getSignatureReferenceFromOCIImage(ctx, imageRef, keychain)
 	if err != nil {
 		return nil, fmt.Errorf("error getting signature reference from OCI image: %w", err)
 	}
 
 	// Parse the manifest and return a list of all simple signing layers we managed to extract
-	simpleSigningLayers, err := getSimpleSigningLayersFromSignatureManifest(signatureRef, keychain)
+	simpleSigningLayers, err := getSimpleSigningLayersFromSignatureManifest(ctx, signatureRef, keychain)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrProvenanceNotFoundOrIncomplete, err.Error())
 	}
@@ -101,9 +102,9 @@ func bundleFromSigstoreSignedImage(imageRef string, keychain authn.Keychain) ([]
 }
 
 // getSignatureReferenceFromOCIImage returns the simple signing layer from the OCI image reference
-func getSignatureReferenceFromOCIImage(imageRef string, keychain authn.Keychain) (string, error) {
+func getSignatureReferenceFromOCIImage(ctx context.Context, imageRef string, keychain authn.Keychain) (string, error) {
 	// 0. Get the auth options
-	opts := []remote.Option{remote.WithAuthFromKeychain(keychain)}
+	opts := []remote.Option{remote.WithAuthFromKeychain(keychain), remote.WithContext(ctx)}
 
 	// 1. Get the image reference
 	ref, err := name.ParseReference(imageRef)
@@ -132,8 +133,10 @@ func getSignatureReferenceFromOCIImage(imageRef string, keychain authn.Keychain)
 }
 
 // getSimpleSigningLayersFromSignatureManifest returns the identity and issuer from the certificate
-func getSimpleSigningLayersFromSignatureManifest(manifestRef string, keychain authn.Keychain) ([]v1.Descriptor, error) {
-	craneOpts := []crane.Option{crane.WithAuthFromKeychain(keychain)}
+func getSimpleSigningLayersFromSignatureManifest(
+	ctx context.Context, manifestRef string, keychain authn.Keychain,
+) ([]v1.Descriptor, error) {
+	craneOpts := []crane.Option{crane.WithAuthFromKeychain(keychain), crane.WithContext(ctx)}
 	// Get the manifest of the signature
 	mf, err := crane.Manifest(manifestRef, craneOpts...)
 	if err != nil {
@@ -214,13 +217,20 @@ func getVerificationMaterialTlogEntries(manifestLayer v1.Descriptor) (
 	if err != nil {
 		return nil, fmt.Errorf("error unmarshaling json: %w", err)
 	}
-	// 2. Get the log index, log ID, integrated time, signed entry timestamp and body
-	logIndex, ok := jsonData["Payload"].(map[string]interface{})["logIndex"].(float64)
+	// 2. Get the log index, log ID, integrated time, signed entry timestamp and body.
+	// Every assertion is two-valued: the annotation is registry-supplied
+	// (attacker-controlled) data, and a malformed shape must be an error,
+	// never a panic.
+	payload, ok := jsonData["Payload"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("error getting Payload")
+	}
+	logIndex, ok := payload["logIndex"].(float64)
 	if !ok {
 		return nil, fmt.Errorf("error getting logIndex")
 	}
 	logIndexInt64 := int64(logIndex)
-	li, ok := jsonData["Payload"].(map[string]interface{})["logID"].(string)
+	li, ok := payload["logID"].(string)
 	if !ok {
 		return nil, fmt.Errorf("error getting logID")
 	}
@@ -228,7 +238,7 @@ func getVerificationMaterialTlogEntries(manifestLayer v1.Descriptor) (
 	if err != nil {
 		return nil, fmt.Errorf("error decoding logID: %w", err)
 	}
-	integratedTime, ok := jsonData["Payload"].(map[string]interface{})["integratedTime"].(float64)
+	integratedTime, ok := payload["integratedTime"].(float64)
 	if !ok {
 		return nil, fmt.Errorf("error getting integratedTime")
 	}
@@ -241,7 +251,7 @@ func getVerificationMaterialTlogEntries(manifestLayer v1.Descriptor) (
 		return nil, fmt.Errorf("error decoding signedEntryTimestamp: %w", err)
 	}
 	// 3. Unmarshal the body and extract the rekor KindVersion details
-	body, ok := jsonData["Payload"].(map[string]interface{})["body"].(string)
+	body, ok := payload["body"].(string)
 	if !ok {
 		return nil, fmt.Errorf("error getting body")
 	}
@@ -253,8 +263,14 @@ func getVerificationMaterialTlogEntries(manifestLayer v1.Descriptor) (
 	if err != nil {
 		return nil, fmt.Errorf("error unmarshaling json: %w", err)
 	}
-	apiVersion := jsonData["apiVersion"].(string)
-	kind := jsonData["kind"].(string)
+	apiVersion, ok := jsonData["apiVersion"].(string)
+	if !ok {
+		return nil, fmt.Errorf("error getting apiVersion")
+	}
+	kind, ok := jsonData["kind"].(string)
+	if !ok {
+		return nil, fmt.Errorf("error getting kind")
+	}
 	// 4. Construct the transparency log entry list
 	return []*protorekor.TransparencyLogEntry{
 		{
@@ -281,7 +297,7 @@ func getBundleMsgSignature(simpleSigningLayer v1.Descriptor) (*protobundle.Bundl
 	// 1. Get the message digest algorithm
 	var msgHashAlg protocommon.HashAlgorithm
 	switch simpleSigningLayer.Digest.Algorithm {
-	case "sha256":
+	case DigestAlgorithmSHA256:
 		msgHashAlg = protocommon.HashAlgorithm_SHA2_256
 	default:
 		return nil, fmt.Errorf("unknown digest algorithm: %s", simpleSigningLayer.Digest.Algorithm)
