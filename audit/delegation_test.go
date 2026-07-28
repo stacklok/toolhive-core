@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -448,6 +449,40 @@ func checkTopLevelMalformed(t *testing.T, c *DelegationChain) {
 	assert.False(t, c.Truncated)
 	assert.Equal(t, 0, c.Omitted)
 	assert.False(t, c.IsZero(), "a malformed chain carries information and is not zero")
+}
+
+// TestDelegatedActor_FmtCannotLeakExtra pins the fmt-side PII door: rendering
+// a hop, a chain value, or a chain pointer with %v/%+v must never reach the
+// unexported extra claims (fmt consults Stringer, not slog.LogValuer).
+func TestDelegatedActor_FmtCannotLeakExtra(t *testing.T) {
+	t.Parallel()
+
+	chain := ParseDelegationChain(map[string]any{
+		hopClaimSub:     testSub1,
+		extraClaimEmail: testAliceEmail,
+	}, 0)
+	require.NotNil(t, chain.Chain[0].Extra(), "fixture must carry an extra claim")
+
+	for name, rendered := range map[string]string{
+		"bare hop %+v":          fmt.Sprintf("%+v", chain.Chain[0]),
+		"dereferenced chain %v": fmt.Sprintf("%v", *chain),
+		"chain pointer %+v":     fmt.Sprintf("%+v", chain),
+	} {
+		assert.NotContains(t, rendered, testAliceEmail, "%s must not leak extra values", name)
+		assert.NotContains(t, rendered, extraClaimEmail, "%s must not leak extra keys", name)
+		assert.Contains(t, rendered, testSub1, "%s must still render the subject", name)
+	}
+}
+
+// TestDelegationChain_LogValueNilSafe pins that a nil chain resolves to an
+// empty group rather than a recovered-panic stack trace in the record.
+func TestDelegationChain_LogValueNilSafe(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	logger.LogAttrs(context.Background(), LevelAudit, "e", slog.Any("d", (*DelegationChain)(nil)))
+	assert.NotContains(t, buf.String(), "panicked", "nil chain must not render a recovered panic")
 }
 
 func TestDelegatedActor_Extra(t *testing.T) {

@@ -68,6 +68,15 @@ type DelegatedActor struct {
 	extra   map[string]any
 }
 
+// String implements [fmt.Stringer] so that fmt-based rendering of a hop — or of
+// any struct containing hops, such as a dereferenced DelegationChain — cannot
+// reach the unexported extra claims through %v/%+v. fmt does not consult
+// [log/slog.LogValuer], so the PII guard needs this second, fmt-side door
+// closed as well.
+func (a DelegatedActor) String() string {
+	return "{iss:" + a.Issuer + " sub:" + a.Subject + "}"
+}
+
 // Extra returns a shallow copy of the hop's extra (non-standard) claims.
 // Mutating the returned map (adding, deleting, or replacing top-level keys)
 // does not affect the hop's internal state. However, mutating a nested map
@@ -139,6 +148,9 @@ func (c *DelegationChain) IsZero() bool {
 // struct's JSON tags (including omitempty on iss/sub and malformedReason) so
 // slog and JSON output stay structurally identical.
 func (c *DelegationChain) LogValue() slog.Value {
+	if c == nil {
+		return slog.GroupValue()
+	}
 	hops := make([]map[string]string, 0, len(c.Chain))
 	for _, hop := range c.Chain {
 		// Mirror the omitempty tags on DelegatedActor so the shapes stay
