@@ -19,15 +19,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # toolhive-core is a shared library: a pre-release go-sdk require
-      # propagates to every downstream consumer via MVS. Fail the release
-      # job so nobody accidentally tags a release pinned to a go-sdk
-      # pre-release (see the inline comment on the go-sdk require in go.mod).
+      # propagates to every downstream consumer via MVS. Warn on release so
+      # it's obvious a go-sdk pre-release is pinned (see the inline comment
+      # on the go-sdk require in go.mod), without blocking releases needed
+      # before go-sdk v1.7.0 final ships.
       - name: Guard against pre-release go-sdk dependency
         run: |
           if grep -qE 'github\.com/modelcontextprotocol/go-sdk v[0-9]+\.[0-9]+\.[0-9]+-(pre|rc)' go.mod; then
-            echo "::error file=go.mod::go.mod pins a pre-release go-sdk version; do not tag a toolhive-core release until go-sdk final ships"
+            echo "::warning file=go.mod::go.mod pins a pre-release go-sdk version; confirm this release is intentional before go-sdk final ships"
             grep -nE 'github\.com/modelcontextprotocol/go-sdk v[0-9]+\.[0-9]+\.[0-9]+-(pre|rc)' go.mod
-            exit 1
           fi
 
       - name: Upload schema artifacts to release
