@@ -22,6 +22,19 @@
 //	logger := logging.New()
 //	wrappedMux := recovery.Middleware(mux, recovery.WithLogger(logger))
 //
+// # Panic reporting
+//
+// Use [WithPanicHandler] to forward recovered panics to observability
+// backends. RecordError receives a sanitized, value-free error suitable
+// for tracing spans; ReportPanic receives the raw panic value for
+// operator-configured error trackers.
+//
+// # Abort-handler passthrough
+//
+// A panic of [http.ErrAbortHandler] (or an error wrapping it) is
+// re-panicked rather than recovered, preserving net/http and
+// httputil.ReverseProxy streaming-abort semantics.
+//
 // # Stability
 //
 // This package is Beta stability. The API may have minor changes before
