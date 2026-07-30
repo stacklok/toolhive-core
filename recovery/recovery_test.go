@@ -6,6 +6,8 @@ package recovery
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -158,4 +160,114 @@ func TestMiddleware_PreservesRequestContext(t *testing.T) {
 	// Verify context was preserved
 	assert.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, value, receivedValue)
+}
+
+type recordingPanicHandler struct {
+	recordErrs   []error
+	reportValues []any
+}
+
+func (h *recordingPanicHandler) RecordError(_ *http.Request, err error) {
+	h.recordErrs = append(h.recordErrs, err)
+}
+
+func (h *recordingPanicHandler) ReportPanic(_ *http.Request, v any) {
+	h.reportValues = append(h.reportValues, v)
+}
+
+func TestMiddleware_PanicHandlerInvoked(t *testing.T) {
+	t.Parallel()
+
+	handler := &recordingPanicHandler{}
+	testHandler := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		panic("secret-bearing panic value")
+	})
+
+	wrappedHandler := Middleware(testHandler, WithPanicHandler(handler))
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rec := httptest.NewRecorder()
+	wrappedHandler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+
+	// RecordError must receive a sanitized error: the panic value must not
+	// leak into telemetry-bound error records.
+	if assert.Len(t, handler.recordErrs, 1) {
+		assert.Equal(t, "panic recovered", handler.recordErrs[0].Error())
+		assert.NotContains(t, handler.recordErrs[0].Error(), "secret-bearing")
+	}
+
+	// ReportPanic receives the raw value for operator-configured trackers.
+	if assert.Len(t, handler.reportValues, 1) {
+		assert.Equal(t, "secret-bearing panic value", handler.reportValues[0])
+	}
+}
+
+func TestMiddleware_PanicHandlerNotInvokedWithoutPanic(t *testing.T) {
+	t.Parallel()
+
+	handler := &recordingPanicHandler{}
+	testHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	wrappedHandler := Middleware(testHandler, WithPanicHandler(handler))
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rec := httptest.NewRecorder()
+	wrappedHandler.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Empty(t, handler.recordErrs)
+	assert.Empty(t, handler.reportValues)
+}
+
+func TestMiddleware_ErrAbortHandlerRePanicked(t *testing.T) {
+	t.Parallel()
+
+	testHandler := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		panic(http.ErrAbortHandler)
+	})
+
+	handler := &recordingPanicHandler{}
+	wrappedHandler := Middleware(testHandler, WithPanicHandler(handler))
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rec := httptest.NewRecorder()
+
+	defer func() {
+		v := recover()
+		assert.Equal(t, http.ErrAbortHandler, v, "ErrAbortHandler must propagate, not be recovered")
+	}()
+	wrappedHandler.ServeHTTP(rec, req)
+}
+
+func TestMiddleware_WrappedErrAbortHandlerRePanicked(t *testing.T) {
+	t.Parallel()
+
+	testHandler := http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		panic(fmt.Errorf("stream copy aborted: %w", http.ErrAbortHandler))
+	})
+
+	wrappedHandler := Middleware(testHandler)
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rec := httptest.NewRecorder()
+
+	defer func() {
+		v := recover()
+		assert.Equal(t, http.ErrAbortHandler, v, "wrapped ErrAbortHandler must re-panic as the bare sentinel")
+	}()
+	wrappedHandler.ServeHTTP(rec, req)
+}
+
+func TestIsErrAbortHandler(t *testing.T) {
+	t.Parallel()
+
+	assert.False(t, isErrAbortHandler(nil))
+	assert.False(t, isErrAbortHandler("some string panic"))
+	assert.False(t, isErrAbortHandler(errors.New("boom")))
+	assert.True(t, isErrAbortHandler(http.ErrAbortHandler))
+	assert.True(t, isErrAbortHandler(fmt.Errorf("wrap: %w", http.ErrAbortHandler)))
 }
