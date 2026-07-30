@@ -32,6 +32,11 @@ func TestBucketPresets(t *testing.T) {
 			[]float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300},
 		},
 		{
+			"MCP semconv",
+			BucketsMCPSemconv,
+			[]float64{0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60, 120, 300},
+		},
+		{
 			"long-running",
 			BucketsLongRunning,
 			[]float64{0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 180, 300},

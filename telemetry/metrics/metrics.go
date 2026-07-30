@@ -15,6 +15,16 @@ func BucketsMCPProxy() []float64 {
 	return []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300}
 }
 
+// BucketsMCPSemconv returns the histogram bucket boundaries, in seconds,
+// defined by the OpenTelemetry MCP semantic conventions for MCP server
+// histograms (e.g. mcp.server.operation.duration). Unlike BucketsMCPProxy —
+// a coarser Stacklok platform preset — this preset tracks the upstream
+// semconv boundary set exactly, for emitters that promise semconv fidelity.
+// See https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/mcp.md
+func BucketsMCPSemconv() []float64 {
+	return []float64{0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60, 120, 300}
+}
+
 // BucketsLongRunning returns the histogram bucket boundaries, in seconds, for
 // long-running measurements such as sync, reconcile, or composite-tool
 // durations (RFC §3.3: 0.1-300).
