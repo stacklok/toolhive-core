@@ -185,6 +185,16 @@ func (s *MCPServer) handleReadResource(ctx context.Context, id any, message json
 	if !ok {
 		return errorResponse(id, mcp.RESOURCE_NOT_FOUND, fmt.Sprintf("resource %q not found", req.Params.URI))
 	}
+	if sr.resultHandler != nil {
+		res, err := sr.resultHandler(ctx, req)
+		if err != nil {
+			return errorResponse(id, mcp.INTERNAL_ERROR, err.Error())
+		}
+		if res == nil {
+			res = &mcp.ReadResourceResult{}
+		}
+		return successResponse(id, res)
+	}
 	contents, err := sr.Handler(ctx, req)
 	if err != nil {
 		return errorResponse(id, mcp.INTERNAL_ERROR, err.Error())

@@ -72,6 +72,16 @@ type ResourceHandlerFunc func(ctx context.Context, request mcp.ReadResourceReque
 // ResourceTemplateHandlerFunc handles a templated resource read.
 type ResourceTemplateHandlerFunc func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error)
 
+// ResourceResultHandlerFunc handles a resource read and returns the full
+// result, including the optional _meta. It is the result-returning counterpart
+// to ResourceHandlerFunc for callers that must propagate backend metadata
+// (trace ids, progress tokens, custom fields) to the client: the contents-only
+// shape (inherited from mark3labs/mcp-go, which has no result-returning
+// resource handler) has nowhere to carry _meta, so it is dropped at the go-sdk
+// boundary. Registered via AddResourceWithResult / AddResourceTemplateWithResult;
+// the returned result may be nil or carry nil Contents (a meta-only response).
+type ResourceResultHandlerFunc func(ctx context.Context, request mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error)
+
 // PromptHandlerFunc handles a prompt get.
 type PromptHandlerFunc func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error)
 
@@ -100,6 +110,11 @@ type ServerTool struct {
 type ServerResource struct {
 	Resource mcp.Resource
 	Handler  ResourceHandlerFunc
+
+	// resultHandler is the unwrapped result-returning handler when the
+	// resource was registered via AddResourceWithResult (Handler then carries
+	// the contents-only adapter). Nil for AddResource registrations.
+	resultHandler ResourceResultHandlerFunc
 }
 
 // ServerResourceTemplate pairs a resource template with its handler.
@@ -108,6 +123,12 @@ type ServerResource struct {
 type ServerResourceTemplate struct {
 	Template mcp.ResourceTemplate
 	Handler  ResourceTemplateHandlerFunc
+
+	// resultHandler is the unwrapped result-returning handler when the
+	// template was registered via AddResourceTemplateWithResult (Handler then
+	// carries the contents-only adapter). Nil for AddResourceTemplate
+	// registrations.
+	resultHandler ResourceResultHandlerFunc
 }
 
 // ServerPrompt pairs a prompt with its handler.
@@ -450,6 +471,65 @@ func (s *MCPServer) AddResourceTemplate(template mcp.ResourceTemplate, handler R
 	s.resourceTemplates[name] = ServerResourceTemplate{Template: template, Handler: handler}
 }
 
+// AddResourceWithResult registers a resource and a result-returning handler
+// whose _meta is forwarded onto the wire result (unlike AddResource, whose
+// contents-only handler has no meta to forward). An upsert by URI, mirroring
+// AddResource: a later registration replaces an earlier one for the same URI,
+// whichever shape either was registered with.
+func (s *MCPServer) AddResourceWithResult(resource mcp.Resource, handler ResourceResultHandlerFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resources[resource.URI] = NewServerResourceWithResult(resource, handler)
+}
+
+// AddResourceTemplateWithResult registers a resource template and a
+// result-returning handler whose _meta is forwarded onto the wire result. An
+// upsert by template name, mirroring AddResourceTemplate.
+func (s *MCPServer) AddResourceTemplateWithResult(template mcp.ResourceTemplate, handler ResourceResultHandlerFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name := template.Name
+	s.resourceTemplates[name] = NewServerResourceTemplateWithResult(template, handler)
+}
+
+// NewServerResourceWithResult pairs a resource with a result-returning
+// handler whose _meta is served on the wire. It is the value-constructor
+// counterpart of AddResourceWithResult for registration paths that carry
+// ServerResource values (per-session SetSessionResources): the WithResult
+// registration methods only exist on MCPServer, and the unwrapped handler
+// field is unexported, so a result-returning per-session resource must be
+// built here.
+func NewServerResourceWithResult(resource mcp.Resource, handler ResourceResultHandlerFunc) ServerResource {
+	return ServerResource{Resource: resource, Handler: resultHandlerContentsAdapter(handler), resultHandler: handler}
+}
+
+// NewServerResourceTemplateWithResult is NewServerResourceWithResult for
+// resource templates (per-session SetSessionResourceTemplates).
+func NewServerResourceTemplateWithResult(
+	template mcp.ResourceTemplate, handler ResourceResultHandlerFunc,
+) ServerResourceTemplate {
+	return ServerResourceTemplate{
+		Template:      template,
+		Handler:       ResourceTemplateHandlerFunc(resultHandlerContentsAdapter(handler)),
+		resultHandler: handler,
+	}
+}
+
+// resultHandlerContentsAdapter adapts a result-returning resource handler to
+// the contents-only ResourceHandlerFunc shape: it serves Contents and drops
+// _meta. Callers that can serve _meta (wrapResourceHandler) use the unwrapped
+// resultHandler field instead; this adapter only runs on paths typed on the
+// legacy contents-only shape.
+func resultHandlerContentsAdapter(h ResourceResultHandlerFunc) ResourceHandlerFunc {
+	return func(ctx context.Context, req mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+		res, err := h(ctx, req)
+		if err != nil || res == nil {
+			return nil, err
+		}
+		return res.Contents, nil
+	}
+}
+
 // AddPrompt registers a prompt and its handler.
 func (s *MCPServer) AddPrompt(prompt mcp.Prompt, handler PromptHandlerFunc) {
 	s.mu.Lock()
@@ -591,7 +671,7 @@ func (s *MCPServer) registerGlobalFeatures(
 		if err := jsonConvert(sr.Resource, gr); err != nil {
 			return fmt.Errorf("converting resource %q: %w", sr.Resource.URI, err)
 		}
-		srv.AddResource(gr, s.wrapResourceHandler(sr.Handler))
+		srv.AddResource(gr, s.wrapServerResource(sr))
 	}
 	for _, sp := range prompts {
 		gp := &gosdk.Prompt{}
@@ -605,7 +685,7 @@ func (s *MCPServer) registerGlobalFeatures(
 		if err := jsonConvert(srt.Template, grt); err != nil {
 			return fmt.Errorf("converting resource template %q: %w", srt.Template.Name, err)
 		}
-		h := s.wrapResourceHandler(ResourceHandlerFunc(srt.Handler))
+		h := s.wrapServerResourceTemplate(srt)
 		if err := addGlobalResourceTemplate(srv, grt, h, srt.Template.Name); err != nil {
 			return err
 		}
@@ -1022,6 +1102,20 @@ func (s *MCPServer) wrapToolHandler(h ToolHandlerFunc) gosdk.ToolHandler {
 }
 
 func (s *MCPServer) wrapResourceHandler(h ResourceHandlerFunc) gosdk.ResourceHandler {
+	return s.wrapResourceResultHandler(func(ctx context.Context, req mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		contents, err := h(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		return &mcp.ReadResourceResult{Contents: contents}, nil
+	})
+}
+
+// wrapResourceResultHandler adapts a result-returning resource handler to a
+// go-sdk ResourceHandler. Unlike wrapResourceHandler it forwards the handler's
+// _meta onto the wire result; a nil result is served as an empty result (no
+// contents, no meta).
+func (s *MCPServer) wrapResourceResultHandler(h ResourceResultHandlerFunc) gosdk.ResourceHandler {
 	return func(ctx context.Context, req *gosdk.ReadResourceRequest) (res *gosdk.ReadResourceResult, err error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -1031,16 +1125,37 @@ func (s *MCPServer) wrapResourceHandler(h ResourceHandlerFunc) gosdk.ResourceHan
 		ctx = s.contextWithSession(ctx, req.Session)
 		mreq := mcp.ReadResourceRequest{}
 		mreq.Params.URI = req.Params.URI
-		contents, err := h(ctx, mreq)
+		mres, err := h(ctx, mreq)
 		if err != nil {
 			return nil, err
 		}
+		if mres == nil {
+			mres = &mcp.ReadResourceResult{}
+		}
 		out := &gosdk.ReadResourceResult{}
-		if err := jsonConvert(mcp.ReadResourceResult{Contents: contents}, out); err != nil {
+		if err := jsonConvert(mres, out); err != nil {
 			return nil, fmt.Errorf("converting resource result: %w", err)
 		}
 		return out, nil
 	}
+}
+
+// wrapServerResource picks the richest handler a ServerResource was registered
+// with: the result-returning handler (serving _meta) when present, else the
+// contents-only one.
+func (s *MCPServer) wrapServerResource(sr ServerResource) gosdk.ResourceHandler {
+	if sr.resultHandler != nil {
+		return s.wrapResourceResultHandler(sr.resultHandler)
+	}
+	return s.wrapResourceHandler(sr.Handler)
+}
+
+// wrapServerResourceTemplate is wrapServerResource for resource templates.
+func (s *MCPServer) wrapServerResourceTemplate(srt ServerResourceTemplate) gosdk.ResourceHandler {
+	if srt.resultHandler != nil {
+		return s.wrapResourceResultHandler(srt.resultHandler)
+	}
+	return s.wrapResourceHandler(ResourceHandlerFunc(srt.Handler))
 }
 
 func (s *MCPServer) wrapPromptHandler(h PromptHandlerFunc) gosdk.PromptHandler {
