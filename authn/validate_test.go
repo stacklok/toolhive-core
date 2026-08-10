@@ -158,6 +158,9 @@ func (js *jwksServer) configFor() Config {
 	cfg.Issuer = js.srv.URL
 	cfg.JWKSURL = js.srv.URL + "/jwks.json"
 	cfg.InsecureAllowHTTP = true
+	// httptest servers listen on loopback, which the default client's dial guard
+	// blocks. A localhost issuer is exactly the case AllowPrivateIP exists for.
+	cfg.AllowPrivateIP = true
 	return cfg
 }
 

@@ -17,6 +17,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/stacklok/toolhive-core/networking"
 )
 
 // wantErrExceeds is the substring shared by the "over a configured limit"
@@ -59,6 +61,7 @@ func TestNewValidatorConfigValidation(t *testing.T) {
 				srv := newDiscoveryOnlyServer(t)
 				c.Issuer = srv.URL
 				c.InsecureAllowHTTP = true
+				c.AllowPrivateIP = true
 			},
 		},
 		{
@@ -90,6 +93,7 @@ func TestNewValidatorConfigValidation(t *testing.T) {
 				srv := newDiscoveryOnlyServer(t)
 				c.Issuer = srv.URL
 				c.InsecureAllowHTTP = true
+				c.AllowPrivateIP = true
 				c.Audiences = []string{"my-client-id"}
 			},
 		},
@@ -100,6 +104,7 @@ func TestNewValidatorConfigValidation(t *testing.T) {
 				srv := newDiscoveryOnlyServer(t)
 				c.Issuer = srv.URL
 				c.InsecureAllowHTTP = true
+				c.AllowPrivateIP = true
 				c.Audiences = []string{"550e8400-e29b-41d4-a716-446655440000"}
 			},
 		},
@@ -124,6 +129,7 @@ func TestNewValidatorConfigValidation(t *testing.T) {
 				srv := newDiscoveryOnlyServer(t)
 				c.Issuer = srv.URL
 				c.InsecureAllowHTTP = true
+				c.AllowPrivateIP = true
 				c.Audiences = nil
 				c.AllowAnyAudience = true
 			},
@@ -147,6 +153,7 @@ func TestNewValidatorConfigValidation(t *testing.T) {
 			mutate: func(c *Config) {
 				c.JWKSURL = "http://127.0.0.1:1/jwks.json"
 				c.InsecureAllowHTTP = true
+				c.AllowPrivateIP = true
 			},
 			wantErr: "failed to fetch JWKS",
 		},
@@ -174,6 +181,7 @@ func TestNewValidatorConfigValidation(t *testing.T) {
 				srv := newDiscoveryOnlyServer(t)
 				c.Issuer = srv.URL
 				c.InsecureAllowHTTP = true
+				c.AllowPrivateIP = true
 			},
 		},
 		{
@@ -189,6 +197,7 @@ func TestNewValidatorConfigValidation(t *testing.T) {
 				srv := newDiscoveryOnlyServer(t)
 				c.Issuer = srv.URL
 				c.InsecureAllowHTTP = true
+				c.AllowPrivateIP = true
 			},
 			check: func(t *testing.T, cfg Config) {
 				t.Helper()
@@ -238,6 +247,7 @@ func TestValidatorCloseIdempotentAndConcurrent(t *testing.T) {
 	cfg := validConfig()
 	cfg.Issuer = srv.URL
 	cfg.InsecureAllowHTTP = true
+	cfg.AllowPrivateIP = true
 	v, err := NewValidator(context.Background(), cfg)
 	require.NoError(t, err)
 
@@ -266,6 +276,7 @@ func TestDefaultHTTPClientRefusesRedirects(t *testing.T) {
 	cfg := validConfig()
 	cfg.Issuer = srv.URL
 	cfg.InsecureAllowHTTP = true
+	cfg.AllowPrivateIP = true
 	v, err := NewValidator(context.Background(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(v.Close)
@@ -292,6 +303,7 @@ func TestSuppliedHTTPClientEnforcesRedirectRefusalAndTimeout(t *testing.T) {
 		cfg := validConfig()
 		cfg.Issuer = srv.URL
 		cfg.InsecureAllowHTTP = true
+		cfg.AllowPrivateIP = true
 		cfg.HTTPClient = &http.Client{} // nil CheckRedirect, zero Timeout
 		v, err := NewValidator(context.Background(), cfg)
 		require.NoError(t, err)
@@ -331,7 +343,8 @@ func TestSuppliedHTTPClientEnforcesRedirectRefusalAndTimeout(t *testing.T) {
 		t.Cleanup(redirector.Close)
 
 		// The bare supplied client must get the redirect-refusal policy applied.
-		client := newHTTPClient(&http.Client{}) // nil CheckRedirect, zero Timeout
+		client, err := newHTTPClient(&http.Client{}, false, "") // nil CheckRedirect, zero Timeout
+		require.NoError(t, err)
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, redirector.URL+"/jwks.json", nil)
 		require.NoError(t, err)
 		resp, err := client.Do(req)
@@ -354,6 +367,7 @@ func TestSuppliedHTTPClientEnforcesRedirectRefusalAndTimeout(t *testing.T) {
 		cfg := validConfig()
 		cfg.Issuer = srv.URL
 		cfg.InsecureAllowHTTP = true
+		cfg.AllowPrivateIP = true
 		cfg.HTTPClient = &http.Client{CheckRedirect: explicit}
 		v, err := NewValidator(context.Background(), cfg)
 		require.NoError(t, err)
@@ -378,6 +392,7 @@ func TestSuppliedHTTPClientEnforcesRedirectRefusalAndTimeout(t *testing.T) {
 		cfg := validConfig()
 		cfg.Issuer = srv.URL
 		cfg.InsecureAllowHTTP = true
+		cfg.AllowPrivateIP = true
 		cfg.HTTPClient = &http.Client{Timeout: explicit}
 		v, err := NewValidator(context.Background(), cfg)
 		require.NoError(t, err)
@@ -424,6 +439,7 @@ func TestHTTPClientBodyCap(t *testing.T) {
 				srv := newDiscoveryOnlyServer(t)
 				cfg.Issuer = srv.URL
 				cfg.InsecureAllowHTTP = true
+				cfg.AllowPrivateIP = true
 			} else {
 				cfg.Issuer = bigBodyIssuer
 			}
@@ -474,6 +490,7 @@ func TestValidatorLifetimeContextOutlivesConstruction(t *testing.T) {
 	cfg := validConfig()
 	cfg.Issuer = srv.URL
 	cfg.InsecureAllowHTTP = true
+	cfg.AllowPrivateIP = true
 	v, err := NewValidator(context.Background(), cfg)
 	require.NoError(t, err)
 
@@ -549,4 +566,75 @@ func bigBody(req *http.Request) (*http.Response, error) {
 		Header:     make(http.Header),
 		Request:    req,
 	}, nil
+}
+
+// TestDefaultClientBlocksPrivateIPJWKS covers Phase C: the DEFAULT client must
+// refuse to fetch a JWKS whose host resolves to a private, loopback, or
+// link-local address. Without this, a jwks_uri pointing at cloud instance
+// metadata (169.254.169.254) or an in-cluster address would be fetched — the
+// https scheme check and redirect refusal do not classify resolved addresses.
+//
+// This is the protection ToolHive has on by default today
+// (--jwks-allow-private-ip defaults false), so losing it would be a silent
+// security regression for deployments that changed nothing.
+func TestDefaultClientBlocksPrivateIPJWKS(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name    string
+		jwksURL string
+	}{
+		{name: "cloud instance metadata", jwksURL: "http://169.254.169.254/latest/meta-data/jwks.json"},
+		{name: "RFC1918 private", jwksURL: "http://10.0.0.1/jwks.json"},
+		{name: "loopback", jwksURL: "http://127.0.0.1:9/jwks.json"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validConfig()
+			cfg.JWKSURL = tt.jwksURL
+			cfg.InsecureAllowHTTP = true // isolate the address check from the scheme check
+			v, err := NewValidator(context.Background(), cfg)
+			require.Error(t, err, "the default client must refuse a private-IP JWKS target")
+			assert.Nil(t, v)
+			assert.Contains(t, err.Error(), "private IP address",
+				"the failure must come from the address guard, not some incidental error")
+		})
+	}
+}
+
+// TestAllowPrivateIPOptsOut is the other half: an operator with a legitimately
+// in-cluster or localhost issuer can opt out, and then the fetch proceeds.
+func TestAllowPrivateIPOptsOut(t *testing.T) {
+	t.Parallel()
+
+	srv := newDiscoveryOnlyServer(t) // listens on loopback
+	cfg := validConfig()
+	cfg.Issuer = srv.URL
+	cfg.InsecureAllowHTTP = true
+	cfg.AllowPrivateIP = true
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err, "AllowPrivateIP must permit a loopback issuer")
+	t.Cleanup(v.Close)
+}
+
+// TestDefaultClientDisablesKeepAlives asserts the structural pairing: whenever
+// the dial guard is installed, keep-alives must be off, or a pooled connection
+// would skip the per-dial address check on a later JWKS refresh. authn refreshes
+// every 15 minutes over a long-lived client, so this matters here specifically.
+func TestDefaultClientDisablesKeepAlives(t *testing.T) {
+	t.Parallel()
+
+	client, err := newHTTPClient(nil, false, "")
+	require.NoError(t, err)
+	// The default chain is limitedTransport (authn's body cap) ->
+	// networking.ValidatingTransport -> *http.Transport. Unwrap to the bottom.
+	capped, ok := client.Transport.(limitedTransport)
+	require.True(t, ok, "the default transport must be body-capped")
+	validating, ok := capped.base.(*networking.ValidatingTransport)
+	require.True(t, ok, "the default client must use networking's validating transport")
+	transport, ok := validating.Transport.(*http.Transport)
+	require.True(t, ok, "the default client must bottom out in an *http.Transport")
+	assert.True(t, transport.DisableKeepAlives,
+		"keep-alives must be disabled whenever the dial guard is installed")
+	assert.NotNil(t, transport.DialContext, "the dial guard must be installed by default")
 }

@@ -27,6 +27,7 @@ func testJWKSConfig(srv *httptest.Server) Config {
 	cfg.Issuer = srv.URL
 	cfg.JWKSURL = srv.URL + "/jwks.json"
 	cfg.InsecureAllowHTTP = true
+	cfg.AllowPrivateIP = true
 	return cfg
 }
 
@@ -81,6 +82,7 @@ func TestNewValidatorJWKSRegistration(t *testing.T) {
 		cfg.Issuer = srv.URL
 		cfg.JWKSURL = srv.URL + "/jwks.json"
 		cfg.InsecureAllowHTTP = true
+		cfg.AllowPrivateIP = true
 		v, err := NewValidator(context.Background(), cfg)
 		require.Error(t, err)
 		assert.Nil(t, v)

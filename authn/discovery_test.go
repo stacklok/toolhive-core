@@ -22,6 +22,7 @@ func testDiscoveryConfig(issuer string) Config {
 	cfg := validConfig()
 	cfg.Issuer = issuer
 	cfg.InsecureAllowHTTP = true
+	cfg.AllowPrivateIP = true
 	return cfg
 }
 

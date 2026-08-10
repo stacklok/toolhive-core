@@ -16,6 +16,7 @@ import (
 	"github.com/lestrrat-go/httprc/v3"
 	"github.com/lestrrat-go/jwx/v3/jwk"
 
+	"github.com/stacklok/toolhive-core/networking"
 	httpvalidation "github.com/stacklok/toolhive-core/validation/http"
 )
 
@@ -110,28 +111,60 @@ type Config struct {
 	// package. Set it explicitly to opt into a lifetime bound.
 	MaxTokenLifetime time.Duration
 
-	// HTTPClient is used for discovery and JWKS fetches. When nil a default
-	// client is built (15s timeout, redirects refused). Supply one to add
-	// SSRF egress policy, a custom CA pool, or instrumentation.
+	// HTTPClient is used for discovery and JWKS fetches. Leave it nil unless you
+	// need something the default cannot express: the default is built by
+	// toolhive-core's networking package and is secure by default (private-IP
+	// dial guard, 15s timeout, redirects refused, 1 MiB body cap).
 	//
-	// Redirects are refused by default; if your IdP legitimately redirects its
-	// discovery or JWKS endpoint, set JWKSURL to the final target URL.
+	// IMPORTANT — a supplied client OPTS OUT of the address-level SSRF guard.
+	// That guard lives in the transport's DialContext, which this package cannot
+	// retrofit onto a client it did not build; AllowPrivateIP and CACertPath are
+	// likewise ignored. Build your client with
+	// networking.NewHttpClientBuilder() (or install
+	// networking.NewPrivateIPBlockingDialContext yourself) or you will have a
+	// weaker configuration than the default.
 	//
-	// For a supplied client the redirect-refusal policy and 15s timeout are
-	// still enforced UNLESS the caller sets them explicitly: a nil
-	// CheckRedirect is replaced with the redirect-refusing policy and a zero
-	// Timeout is replaced with the default, so a bare &http.Client{} cannot
-	// silently drop the SSRF redirect-refusal or the fetch bound. Set
-	// CheckRedirect / Timeout on the supplied client to override either.
+	// What IS still enforced for a supplied client: the 1 MiB response-body cap
+	// (its Transport is wrapped), plus redirect refusal and the 15s timeout when
+	// the caller left CheckRedirect / Timeout unset — so a bare &http.Client{}
+	// cannot silently drop them. Explicit caller values are preserved.
 	//
-	// Either way the transport is wrapped so response bodies are capped at
-	// 1 MiB.
+	// To attach a bearer token to the OUTBOUND JWKS/discovery request (an IdP
+	// whose JWKS endpoint is itself gated), supply a client whose Transport
+	// injects the Authorization header. That RoundTripper must be the innermost
+	// one — this package wraps whatever it is given in its body-capping
+	// transport, so set it as your client's Transport and let the wrapping
+	// happen around it.
+	//
+	// If your IdP legitimately redirects its discovery or JWKS endpoint, set
+	// JWKSURL to the final target rather than relaxing the redirect policy.
 	HTTPClient *http.Client
 
 	// InsecureAllowHTTP permits http:// Issuer and JWKSURL values. It exists
 	// for development and test environments only; never set it in
 	// production.
 	InsecureAllowHTTP bool
+
+	// AllowPrivateIP permits discovery and JWKS fetches to reach private,
+	// loopback, and link-local addresses. It defaults to FALSE, which is what
+	// blocks a jwks_uri resolving to cloud instance metadata
+	// (169.254.169.254) or an in-cluster address.
+	//
+	// The check runs on the resolved address at dial time, so it also defends
+	// against DNS rebinding and re-applies per redirect hop. Set it only for an
+	// issuer that legitimately lives on a private network — an in-cluster OIDC
+	// provider, or a test server on localhost.
+	//
+	// It applies ONLY to the default client. A caller-supplied HTTPClient brings
+	// its own dial policy; see that field.
+	AllowPrivateIP bool
+
+	// CACertPath optionally points at a PEM CA bundle used to verify the
+	// discovery and JWKS endpoints, for an issuer fronted by a private CA.
+	//
+	// It applies ONLY to the default client, for the same reason as
+	// AllowPrivateIP.
+	CACertPath string
 }
 
 // Validator verifies inbound JWT bearer tokens against the configured issuer
@@ -195,9 +228,14 @@ func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
 		return nil, err
 	}
 
+	httpClient, err := newHTTPClient(cfg.HTTPClient, cfg.AllowPrivateIP, cfg.CACertPath)
+	if err != nil {
+		return nil, err
+	}
+
 	v := &Validator{
 		cfg:        cfg,
-		httpClient: newHTTPClient(cfg.HTTPClient),
+		httpClient: httpClient,
 	}
 	// Deriving the lifetime context before any construction I/O guarantees a
 	// validator that can fail construction never leaks refresh goroutines:
@@ -420,24 +458,42 @@ func (v *Validator) init(ctx context.Context) error {
 	return nil
 }
 
-// newHTTPClient returns base when non-nil, else a default client with an
-// explicit timeout and a redirect policy that refuses to follow redirects —
-// a jwks_uri that 302s to an internal host must not defeat the https scheme
-// check. In both cases the transport is wrapped so response bodies are capped
-// at maxResponseBody.
+// newHTTPClient returns base when non-nil, else a secure-by-default client
+// built by the networking package. In both cases the transport is wrapped so
+// response bodies are capped at maxResponseBody.
 //
-// For a supplied client, a nil CheckRedirect is replaced with the
+// The DEFAULT client carries networking's address-level SSRF guard: a
+// net.Dialer.Control hook that refuses private, loopback, and link-local
+// addresses AFTER DNS resolution, so a jwks_uri resolving to cloud instance
+// metadata (169.254.169.254) or an in-cluster address is not fetched. That guard
+// is why the default path must not be the weak one — the https scheme check and
+// redirect refusal alone do not classify the address a name resolves to.
+//
+// For a SUPPLIED client, a nil CheckRedirect is replaced with the
 // redirect-refusing policy and a zero Timeout with defaultHTTPTimeout, so a
-// bare &http.Client{} cannot silently drop the SSRF redirect-refusal or the
-// fetch bound. Explicit caller values for either field are preserved.
-func newHTTPClient(base *http.Client) *http.Client {
+// bare &http.Client{} cannot silently drop the redirect refusal or the fetch
+// bound. Explicit caller values for either field are preserved. The dial guard
+// CANNOT be retrofitted onto a supplied client's transport, though: see the
+// Config.HTTPClient docs.
+func newHTTPClient(base *http.Client, allowPrivateIP bool, caCertPath string) (*http.Client, error) {
 	if base == nil {
-		base = &http.Client{
-			Timeout: defaultHTTPTimeout,
-			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
+		built, err := networking.NewHttpClientBuilder().
+			WithPrivateIPs(allowPrivateIP).
+			WithCABundle(caCertPath).
+			WithInsecureAllowHTTP(true). // scheme policy is enforced by validateHTTPSURI
+			WithTimeout(defaultHTTPTimeout).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("authn: failed to build HTTP client: %w", err)
 		}
+		// networking's builder deliberately leaves CheckRedirect unset (its dial
+		// guard re-fires per hop, so it tolerates redirects). authn is stricter:
+		// refuse them outright, since a jwks_uri that 302s elsewhere should be
+		// configured as its final target instead.
+		built.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		base = built
 	}
 	// A zero-value client has a nil Transport and would use
 	// http.DefaultTransport; wrap that instead so the cap always applies.
@@ -457,7 +513,7 @@ func newHTTPClient(base *http.Client) *http.Client {
 	if capped.Timeout == 0 {
 		capped.Timeout = defaultHTTPTimeout
 	}
-	return &capped
+	return &capped, nil
 }
 
 // limitedTransport caps response bodies at maxResponseBody. The cap lives at
