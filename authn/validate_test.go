@@ -572,6 +572,18 @@ func TestValidateRejection(t *testing.T) {
 		requireAuthnError(t, err, CodeInvalidToken, ReasonCriticalHeader)
 	})
 
+	t.Run("crit header with control characters is rejected without leaking them into the log-safe error", func(t *testing.T) {
+		t.Parallel()
+		rsaKey, js, v := setup(t)
+		// crit is attacker-controlled and unverified; a crafted member must not
+		// reach Error() unescaped (CR/LF would forge log lines).
+		token := rsaKey.mint(t, js.srv.URL, withHeader("crit", []string{"exp\r\nSet-Cookie: pwned=1"}))
+		_, err := v.Validate(context.Background(), token)
+		requireAuthnError(t, err, CodeInvalidToken, ReasonCriticalHeader)
+		assert.NotContains(t, err.Error(), "\r")
+		assert.NotContains(t, err.Error(), "\n")
+	})
+
 	t.Run("exp-iat exceeds MaxTokenLifetime rejected", func(t *testing.T) {
 		t.Parallel()
 		rsaKey := mintRSA(t, "rsa-1")
@@ -769,28 +781,43 @@ func TestValidateRejection(t *testing.T) {
 			"a negatively-cached kid must not trigger another refresh fetch")
 	})
 
-	t.Run("use enc key not selected but absent use is", func(t *testing.T) {
+	t.Run("use eligibility", func(t *testing.T) {
 		t.Parallel()
-		// The signing key has use:"enc" (must be skipped); the only eligible
-		// key is one with NO use field.
-		encKey := mintRSA(t, "enc-1")
-		require.NoError(t, encKey.jwk.Set(jwk.KeyUsageKey, jwk.ForEncryption))
-		sigKey := mintRSA(t, "sig-1") // no use set
-		js := newJWKSServer(t, encKey.jwk, sigKey.jwk)
-		v, err := NewValidator(context.Background(), js.configFor())
-		require.NoError(t, err)
-		t.Cleanup(v.Close)
+		// RFC 7517 §4.2 makes use optional, but a present value must be
+		// honoured: only an absent use or exactly "sig" is eligible. "enc" and
+		// any other value (a typo, a non-standard use) are not.
+		tests := []struct {
+			name    string
+			use     string // "" means don't set use at all
+			wantErr bool
+		}{
+			{name: "absent use is eligible", use: ""},
+			{name: "sig is eligible", use: "sig"},
+			{name: "enc is ineligible", use: "enc", wantErr: true},
+			{name: "arbitrary value is ineligible", use: "foo", wantErr: true},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+				key := mintRSA(t, "key")
+				if tt.use != "" {
+					require.NoError(t, key.jwk.Set(jwk.KeyUsageKey, tt.use))
+				}
+				js := newJWKSServer(t, key.jwk)
+				v, err := NewValidator(context.Background(), js.configFor())
+				require.NoError(t, err)
+				t.Cleanup(v.Close)
 
-		// Sign with sigKey; token has kid "sig-1", only sigKey matches.
-		token := sigKey.mint(t, js.srv.URL)
-		_, err = v.Validate(context.Background(), token)
-		require.NoError(t, err, "absent use must pass the filter")
-
-		// Sign with encKey; its use:"enc" excludes it, leaving no eligible
-		// candidate for kid "enc-1". The refresh finds nothing → unknown_kid.
-		token2 := encKey.mint(t, js.srv.URL)
-		_, err = v.Validate(context.Background(), token2)
-		requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
+				token := key.mint(t, js.srv.URL)
+				_, err = v.Validate(context.Background(), token)
+				if tt.wantErr {
+					// The key is filtered out, so the kid resolves to nothing.
+					requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
+					return
+				}
+				require.NoError(t, err)
+			})
+		}
 	})
 
 	t.Run("unknown kid after refresh is unknown_kid", func(t *testing.T) {
@@ -1239,6 +1266,32 @@ func TestLeeway(t *testing.T) {
 			withClaim(claimIat, time.Now().Add(leeway*2).Unix()))
 		_, err := v.Validate(context.Background(), token)
 		requireAuthnError(t, err, CodeInvalidToken, ReasonIssuedInFuture)
+	})
+
+	// TestDisableLeeway pins the whole point of the field: the SAME
+	// one-second-expired token is accepted under the 60s default and rejected
+	// once DisableLeeway opts out of it.
+	t.Run("DisableLeeway rejects a token the default leeway would accept", func(t *testing.T) {
+		t.Parallel()
+		rsaKey := mintRSA(t, "rsa-1")
+		js := newJWKSServer(t, rsaKey.jwk)
+		token := rsaKey.mint(t, js.srv.URL,
+			withClaim(claimExp, time.Now().Add(-time.Second).Unix()))
+
+		defaultCfg := js.configFor()
+		vDefault, err := NewValidator(context.Background(), defaultCfg)
+		require.NoError(t, err)
+		t.Cleanup(vDefault.Close)
+		_, err = vDefault.Validate(context.Background(), token)
+		require.NoError(t, err, "a 1s-expired token must be accepted inside the 60s default leeway")
+
+		noLeewayCfg := js.configFor()
+		noLeewayCfg.DisableLeeway = true
+		vNoLeeway, err := NewValidator(context.Background(), noLeewayCfg)
+		require.NoError(t, err)
+		t.Cleanup(vNoLeeway.Close)
+		_, err = vNoLeeway.Validate(context.Background(), token)
+		requireAuthnError(t, err, CodeInvalidToken, ReasonExpired)
 	})
 }
 
@@ -1748,6 +1801,46 @@ func TestParseBearerNeverLeaksCredential(t *testing.T) {
 			// Stronger: no substring of the header at all beyond the scheme name.
 			assert.NotContains(t, err.Error(), tt.header,
 				"the error text must not echo the header value")
+		})
+	}
+}
+
+// TestParseBearerRejectsControlCharacters covers the header-injection finding:
+// a token carrying CR/LF or other non-printable-ASCII bytes must be rejected
+// rather than returned verbatim, since a consumer may place it in an outbound
+// HTTP header (e.g. an introspection request). ParseBearer deliberately does
+// NOT enforce the strict RFC 7235 token68 alphabet (see validate.go), so
+// realistic opaque tokens using characters outside that alphabet must still
+// parse.
+func TestParseBearerRejectsControlCharacters(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		in      string
+		wantErr bool
+	}{
+		{name: "CRLF", in: "Bearer abc\r\ndef", wantErr: true},
+		{name: "LF", in: "Bearer abc\ndef", wantErr: true},
+		{name: "CR", in: "Bearer abc\rdef", wantErr: true},
+		{name: "NUL", in: "Bearer abc\x00def", wantErr: true},
+		{name: "ESC", in: "Bearer abc\x1bdef", wantErr: true},
+		{name: "DEL", in: "Bearer abc\x7fdef", wantErr: true},
+		{name: "base64url opaque token", in: "Bearer abcDEF123-_xyz"},
+		{name: "gho_-prefixed opaque token", in: "Bearer gho_16C7e42F292c6912E7710c838347Ae178B4a"},
+		{name: "UUID opaque token", in: "Bearer 550e8400-e29b-41d4-a716-446655440000"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ParseBearer(tt.in)
+			if tt.wantErr {
+				requireAuthnError(t, err, CodeInvalidRequest, ReasonMalformed)
+				assert.Empty(t, got)
+				return
+			}
+			require.NoError(t, err)
+			assert.NotEmpty(t, got)
 		})
 	}
 }

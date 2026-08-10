@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -284,7 +286,10 @@ func TestDefaultHTTPClientRefusesRedirects(t *testing.T) {
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://issuer.example.com/jwks.json", nil)
 	require.NoError(t, err)
 	err = v.httpClient.CheckRedirect(req, nil)
-	assert.ErrorIs(t, err, http.ErrUseLastResponse)
+	require.Error(t, err)
+	var refused *errRedirectRefused
+	assert.ErrorAs(t, err, &refused, "a refused redirect must be a real error, not http.ErrUseLastResponse")
+	assert.Contains(t, err.Error(), req.URL.String(), "the refused target must be named in the error")
 	assert.Equal(t, defaultHTTPTimeout, v.httpClient.Timeout)
 }
 
@@ -313,7 +318,9 @@ func TestSuppliedHTTPClientEnforcesRedirectRefusalAndTimeout(t *testing.T) {
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://issuer.example.com/jwks.json", nil)
 		require.NoError(t, err)
 		err = v.httpClient.CheckRedirect(req, nil)
-		assert.ErrorIs(t, err, http.ErrUseLastResponse)
+		require.Error(t, err)
+		var refused *errRedirectRefused
+		assert.ErrorAs(t, err, &refused)
 		// The zero Timeout was replaced with the default.
 		assert.Equal(t, defaultHTTPTimeout, v.httpClient.Timeout)
 	})
@@ -322,11 +329,12 @@ func TestSuppliedHTTPClientEnforcesRedirectRefusalAndTimeout(t *testing.T) {
 		t.Parallel()
 		// An httptest server that 302-redirects its JWKS URL to a different
 		// host. A bare &http.Client{} passed through newHTTPClient must refuse
-		// the redirect (SSRF): the JWKS GET surfaces the 302 rather than
-		// following it to the redirect target. We exercise newHTTPClient
-		// directly to isolate the redirect-refusal behavior from
-		// construction's fail-closed fetch (which would also surface the 302
-		// as an error, just a less direct assertion).
+		// the redirect (SSRF): the JWKS GET fails with errRedirectRefused
+		// rather than following it to the redirect target or returning the raw
+		// 302. We exercise newHTTPClient directly to isolate the
+		// redirect-refusal behavior from construction's fail-closed fetch
+		// (which would also surface this as an error, just a less direct
+		// assertion).
 		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"keys":[]}`))
@@ -343,15 +351,15 @@ func TestSuppliedHTTPClientEnforcesRedirectRefusalAndTimeout(t *testing.T) {
 		t.Cleanup(redirector.Close)
 
 		// The bare supplied client must get the redirect-refusal policy applied.
-		client, err := newHTTPClient(&http.Client{}, false, "") // nil CheckRedirect, zero Timeout
+		client, err := newHTTPClient(&http.Client{}, false, "", "") // nil CheckRedirect, zero Timeout
 		require.NoError(t, err)
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, redirector.URL+"/jwks.json", nil)
 		require.NoError(t, err)
-		resp, err := client.Do(req)
-		require.NoError(t, err)
-		defer resp.Body.Close()
-		assert.Equal(t, http.StatusFound, resp.StatusCode,
-			"a bare supplied client must refuse the JWKS redirect (SSRF), not follow it to the target")
+		_, err = client.Do(req)
+		require.Error(t, err, "a bare supplied client must refuse the JWKS redirect (SSRF), not follow it to the target")
+		var refused *errRedirectRefused
+		assert.ErrorAs(t, err, &refused)
+		assert.Contains(t, err.Error(), target.URL, "the error must name the refused redirect target")
 	})
 
 	t.Run("explicit CheckRedirect is preserved", func(t *testing.T) {
@@ -617,6 +625,215 @@ func TestAllowPrivateIPOptsOut(t *testing.T) {
 	t.Cleanup(v.Close)
 }
 
+// TestAcceptedTokenTypesClonedAtConstruction covers the aliasing finding: like
+// Audiences, AcceptedTokenTypes shares its backing array with the caller
+// unless cloned, so mutating it after construction would silently rewrite the
+// trusted typ policy. Modeled on TestAudiencesClonedAtConstruction.
+func TestAcceptedTokenTypesClonedAtConstruction(t *testing.T) {
+	t.Parallel()
+
+	rsaKey := mintRSA(t, "rsa-1")
+	js := newJWKSServer(t, rsaKey.jwk)
+	cfg := js.configFor()
+	cfg.AcceptedTokenTypes = []string{typAccessToken}
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	// Rewrite the caller's slice to a type the validator must NOT accept.
+	cfg.AcceptedTokenTypes[0] = "id_token+jwt"
+
+	token := rsaKey.mint(t, js.srv.URL, withHeader("typ", "id_token+jwt"))
+	_, err = v.Validate(context.Background(), token)
+	requireAuthnError(t, err, CodeInvalidToken, ReasonTokenType)
+
+	// And the originally configured type still validates.
+	token = rsaKey.mint(t, js.srv.URL, withHeader("typ", typAccessToken))
+	_, err = v.Validate(context.Background(), token)
+	require.NoError(t, err)
+}
+
+// TestLastSuccessStampedWithKeyProvider covers the MEDIUM finding that
+// lastSuccess was stamped after the `if v.cfg.KeyProvider != nil { return nil
+// }` early return in init, making it unreachable whenever a provider was
+// configured. Left unfixed, staleness() stays enormous from construction
+// onward, so MaxJWKSStaleness rejects with ReasonKeysStale the moment the
+// JWKS endpoint becomes unreachable — exactly the outage KeyProvider exists to
+// tolerate.
+func TestLastSuccessStampedWithKeyProvider(t *testing.T) {
+	t.Parallel()
+
+	const keyID = "provider-key-1"
+	rsaKey := mintRSA(t, keyID)
+	js := newJWKSServer(t, rsaKey.jwk)
+	cfg := js.configFor()
+	cfg.KeyProvider = &fakeKeyProvider{keys: []PublicKey{{KeyID: keyID, Key: rsaKey.priv.Public()}}}
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	assert.Less(t, v.staleness(), time.Minute,
+		"a successful construction fetch must stamp lastSuccess even with a KeyProvider configured")
+}
+
+// TestValidateHTTPSURISchemeAllowlist covers the MEDIUM finding that
+// InsecureAllowHTTP was implemented as "anything but https", so ftp://,
+// file://, and gopher:// all passed through once the flag was set. The fix
+// makes it an explicit allowlist: https always, http only with the flag, and
+// every other scheme always rejected.
+func TestValidateHTTPSURISchemeAllowlist(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		scheme string
+		wantOK bool // whether it is accepted when insecureAllowHTTP is true
+	}{
+		{scheme: schemeHTTPS, wantOK: true},
+		{scheme: schemeHTTP, wantOK: true},
+		{scheme: "ftp", wantOK: false},
+		{scheme: "file", wantOK: false},
+		{scheme: "gopher", wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.scheme, func(t *testing.T) {
+			t.Parallel()
+			raw := tt.scheme + "://host/jwks"
+
+			// https is always accepted regardless of the flag; every other
+			// scheme is always rejected when the flag is unset.
+			err := validateHTTPSURI("field", raw, false)
+			if tt.scheme == schemeHTTPS {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err, "non-https scheme must be rejected with InsecureAllowHTTP unset")
+			}
+
+			err = validateHTTPSURI("field", raw, true)
+			if tt.wantOK {
+				require.NoError(t, err, "scheme %q must be accepted with InsecureAllowHTTP set", tt.scheme)
+			} else {
+				require.Error(t, err, "scheme %q must stay rejected even with InsecureAllowHTTP set: "+
+					"the flag widens https-only to https-or-http, not to any scheme", tt.scheme)
+			}
+		})
+	}
+}
+
+// TestKeyProviderDiscoveryFailureFatality covers the MEDIUM finding that
+// init's construction switch tolerated ANY discovery failure once a
+// KeyProvider was configured, including a REJECTED document (issuer
+// mismatch, missing/non-https jwks_uri) rather than only a transient
+// transport failure. A rejected document is a configuration error, not a
+// startup race, and must stay fatal even with a provider: tolerating it
+// silently abandons JWKS forever, leaving every token the provider does not
+// offer failing with unknown_kid and no evidence beyond one log line.
+func TestKeyProviderDiscoveryFailureFatality(t *testing.T) {
+	t.Parallel()
+
+	kp := &fakeKeyProvider{}
+
+	t.Run("transient discovery failure is tolerated", func(t *testing.T) {
+		t.Parallel()
+		cfg := validConfig()
+		// Unreachable issuer: discovery fails transiently on every retry.
+		cfg.Issuer = "http://127.0.0.1:1"
+		cfg.InsecureAllowHTTP = true
+		cfg.AllowPrivateIP = true
+		cfg.KeyProvider = kp
+		v, err := NewValidator(context.Background(), cfg)
+		require.NoError(t, err, "a transient discovery failure must not be fatal with a KeyProvider configured")
+		t.Cleanup(v.Close)
+		assert.Nil(t, v.jwksCache, "JWKS must be abandoned when discovery never succeeded")
+	})
+
+	t.Run("rejected discovery document is fatal even with a provider", func(t *testing.T) {
+		t.Parallel()
+		// The discovery document's issuer does not match the configured
+		// issuer: the endpoint answered, and the answer is a poisoned/
+		// misconfigured document, not a race.
+		srv := discoveryServer(t, func(_ string) http.HandlerFunc {
+			return serveDiscovery("https://a-different-issuer.example.com", "https://a-different-issuer.example.com/jwks.json", nil)
+		})
+		cfg := validConfig()
+		cfg.Issuer = srv.URL
+		cfg.InsecureAllowHTTP = true
+		cfg.AllowPrivateIP = true
+		cfg.KeyProvider = kp
+		v, err := NewValidator(context.Background(), cfg)
+		require.Error(t, err, "a rejected discovery document must stay fatal even with a KeyProvider configured")
+		assert.Nil(t, v)
+		assert.Contains(t, err.Error(), "does not match configured issuer")
+	})
+}
+
+// TestAuthTokenFileAttachesBearerToken covers finding 5: AuthTokenFile must
+// attach a bearer token (read from the file) to outbound discovery/JWKS
+// requests, for an IdP whose own endpoints are gated. Without this the only
+// route was a caller-supplied HTTPClient, which opts out of the private-IP
+// dial guard entirely.
+func TestAuthTokenFileAttachesBearerToken(t *testing.T) {
+	t.Parallel()
+
+	const wantToken = "s3cr3t-token"
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	require.NoError(t, os.WriteFile(tokenFile, []byte(wantToken), 0o600))
+
+	var gotAuth atomic.Value
+	srv := discoveryServer(t, func(srvURL string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			gotAuth.Store(r.Header.Get("Authorization"))
+			serveDiscovery(srvURL, srvURL+"/jwks.json", nil)(w, r)
+		}
+	})
+
+	cfg := validConfig()
+	cfg.Issuer = srv.URL
+	cfg.InsecureAllowHTTP = true
+	cfg.AllowPrivateIP = true
+	cfg.AuthTokenFile = tokenFile
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	got, _ := gotAuth.Load().(string)
+	assert.Equal(t, "Bearer "+wantToken, got,
+		"AuthTokenFile must attach the token as a Bearer Authorization header on outbound requests")
+}
+
+// TestDisableLeewayValidation covers finding 6: DisableLeeway must let a
+// caller express zero clock-skew tolerance (Leeway==0 alone means "use the
+// 60s default"), and setting it together with a non-zero Leeway must be a
+// validation error, mirroring AllowAnyAudience's explicit-opt-out style.
+func TestDisableLeewayValidation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("DisableLeeway alone leaves Leeway at zero", func(t *testing.T) {
+		t.Parallel()
+		srv := newDiscoveryOnlyServer(t)
+		cfg := validConfig()
+		cfg.Issuer = srv.URL
+		cfg.InsecureAllowHTTP = true
+		cfg.AllowPrivateIP = true
+		cfg.DisableLeeway = true
+		v, err := NewValidator(context.Background(), cfg)
+		require.NoError(t, err)
+		t.Cleanup(v.Close)
+		assert.Zero(t, v.cfg.Leeway, "DisableLeeway must not be overwritten by the 60s default")
+	})
+
+	t.Run("DisableLeeway with a non-zero Leeway is rejected", func(t *testing.T) {
+		t.Parallel()
+		cfg := validConfig()
+		cfg.DisableLeeway = true
+		cfg.Leeway = 30 * time.Second
+		v, err := NewValidator(context.Background(), cfg)
+		require.Error(t, err)
+		assert.Nil(t, v)
+		assert.Contains(t, err.Error(), "DisableLeeway must not be set together with")
+	})
+}
+
 // TestDefaultClientDisablesKeepAlives asserts the structural pairing: whenever
 // the dial guard is installed, keep-alives must be off, or a pooled connection
 // would skip the per-dial address check on a later JWKS refresh. authn refreshes
@@ -624,7 +841,7 @@ func TestAllowPrivateIPOptsOut(t *testing.T) {
 func TestDefaultClientDisablesKeepAlives(t *testing.T) {
 	t.Parallel()
 
-	client, err := newHTTPClient(nil, false, "")
+	client, err := newHTTPClient(nil, false, "", "")
 	require.NoError(t, err)
 	// The default chain is limitedTransport (authn's body cap) ->
 	// networking.ValidatingTransport -> *http.Transport. Unwrap to the bottom.

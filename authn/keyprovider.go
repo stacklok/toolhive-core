@@ -98,15 +98,28 @@ func providerKeyTypeMatchesAlg(key crypto.PublicKey, alg string) bool {
 	switch {
 	case strings.HasPrefix(alg, "RS"), strings.HasPrefix(alg, "PS"):
 		pub, ok := key.(*rsa.PublicKey)
-		// Same RFC 7518 §3.3 strength floor as the JWKS path: an in-process key
-		// source is trusted, but not trusted to be correctly configured.
-		return ok && pub.N.BitLen() >= minRSAKeyBits
-	case strings.HasPrefix(alg, "ES"):
-		pub, ok := key.(*ecdsa.PublicKey)
-		if !ok {
+		// A KeyProvider is caller-implemented, so a nil pointer or a zero-value
+		// key (nil N) is a malformed-config bug, not a trusted input; treat it
+		// as ineligible rather than let BitLen panic on it.
+		if !ok || pub == nil || pub.N == nil {
 			return false
 		}
-		return curveMatchesAlg(pub.Curve.Params().Name, alg)
+		// Same RFC 7518 §3.3 strength floor as the JWKS path: an in-process key
+		// source is trusted, but not trusted to be correctly configured.
+		return pub.N.BitLen() >= minRSAKeyBits
+	case strings.HasPrefix(alg, "ES"):
+		pub, ok := key.(*ecdsa.PublicKey)
+		// Same reasoning as the RSA branch: guard against a nil pointer or a
+		// nil/unset Curve before calling Params(), which would otherwise panic
+		// on the nil interface method call.
+		if !ok || pub == nil || pub.Curve == nil {
+			return false
+		}
+		params := pub.Params()
+		if params == nil {
+			return false
+		}
+		return curveMatchesAlg(params.Name, alg)
 	default:
 		// Unreachable via Validate: the alg gate admits only RS/PS/ES.
 		return false

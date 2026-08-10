@@ -125,11 +125,17 @@ func ParseBearer(headerValue string) (string, error) {
 		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
 			err: errors.New("expected 'Bearer <token>': empty credential")}
 	}
-	// token68 forbids internal whitespace, so anything left after trimming the
-	// separator means the header is not a single bearer credential.
-	if strings.ContainsAny(token, " \t") {
-		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
-			err: errors.New("credential contains whitespace")}
+	// Reject anything outside printable ASCII (0x21-0x7E). This is
+	// deliberately NOT the strict RFC 7235 token68 alphabet: that would forbid
+	// characters some IdPs use in opaque tokens, and this package intentionally
+	// passes opaque tokens through so a consumer can introspect them.
+	// Printable-ASCII-only still catches CR/LF/NUL/ESC/DEL and space/tab (the
+	// case token68 exists to rule out) without that risk.
+	for i := 0; i < len(token); i++ {
+		if token[i] < 0x21 || token[i] > 0x7e {
+			return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
+				err: errors.New("credential contains a non-printable-ASCII character")}
+		}
 	}
 	if len(token) > maxTokenLength {
 		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
@@ -175,37 +181,7 @@ func (v *Validator) Validate(ctx context.Context, token string) (Principal, erro
 			err: fmt.Errorf("alg %q is not in the allow-list", alg)}
 	}
 
-	// The same allowlist is enforced again by the parser (WithValidMethods) so
-	// the verified path cannot be bypassed by a header that disagrees with
-	// itself, and so the gate cannot be forgotten by a second key path.
-	opts := []jwt.ParserOption{
-		jwt.WithValidMethods(allowedAlgs),
-		// Strict base64url, no padding (RFC 7515 §2); padding-allowed decode
-		// is the WithPaddingAllowed escape hatch and is NOT enabled.
-		jwt.WithStrictDecoding(),
-		// exp is required and validated against now+leeway; golang-jwt does
-		// not require exp by default, hence the explicit option.
-		jwt.WithExpirationRequired(),
-		jwt.WithLeeway(v.cfg.Leeway),
-		// iat, when present, must not be in the future beyond leeway.
-		jwt.WithIssuedAt(),
-	}
-	// The iss and aud options are added only when configured. golang-jwt treats
-	// an empty expected issuer/audience set as "do not check" anyway, but
-	// appending conditionally keeps the disabled case explicit here rather than
-	// depending on that library behavior. Config.validate has already ensured
-	// an empty Audiences was a deliberate AllowAnyAudience choice and that an
-	// empty Issuer came with an explicit JWKSURL.
-	if v.cfg.Issuer != "" {
-		// iss is compared byte-exact (OIDC Core §3.1.3.2); NO TrimSpace.
-		opts = append(opts, jwt.WithIssuer(v.cfg.Issuer))
-	}
-	if len(v.cfg.Audiences) > 0 {
-		// aud any-match against the configured set (bare string or array on
-		// the wire).
-		opts = append(opts, jwt.WithAudience(v.cfg.Audiences...))
-	}
-	parser := jwt.NewParser(opts...)
+	parser := jwt.NewParser(v.parserOptions()...)
 
 	claims := jwt.MapClaims{}
 	// kidSeen records whether the unverified header carried a kid, so the
@@ -216,9 +192,18 @@ func (v *Validator) Validate(ctx context.Context, token string) (Principal, erro
 		// RFC 7515 §4.1.11: we understand NO crit extensions, so any token
 		// whose header carries a `crit` member must be rejected. golang-jwt
 		// v5 does not inspect crit, so this is hand-written.
-		if _, hasCrit := tok.Header["crit"]; hasCrit {
+		if crit, hasCrit := tok.Header["crit"]; hasCrit {
+			// crit is attacker-controlled and Error() is log-safe: report only
+			// its shape (element count, when it is a slice), never render the
+			// value itself. %v would pass CR/LF through unescaped (unlike %q
+			// elsewhere in this package) and let a crafted crit member forge
+			// log lines.
+			n := -1
+			if s, ok := crit.([]any); ok {
+				n = len(s)
+			}
 			return nil, &Error{Code: CodeInvalidToken, Reason: ReasonCriticalHeader,
-				err: fmt.Errorf("token header carries unsupported crit member: %v", tok.Header["crit"])}
+				err: fmt.Errorf("token header carries unsupported crit member (%d element(s))", n)}
 		}
 		// typ gate, when configured. Enforced here rather than against the
 		// unverified header so the value checked is one the signature covers.
@@ -256,6 +241,51 @@ func (v *Validator) Validate(ctx context.Context, token string) (Principal, erro
 		Name:    stringClaim(claims, "name"),
 		Claims:  claims,
 	}, nil
+}
+
+// parserOptions builds the golang-jwt parser options for the validator's
+// configured policy. Split out of Validate to keep that function's
+// cyclomatic complexity down; the options themselves are as documented
+// inline below.
+func (v *Validator) parserOptions() []jwt.ParserOption {
+	// The same allowlist is enforced again by the parser (WithValidMethods) so
+	// the verified path cannot be bypassed by a header that disagrees with
+	// itself, and so the gate cannot be forgotten by a second key path.
+	opts := []jwt.ParserOption{
+		jwt.WithValidMethods(allowedAlgs),
+		// Strict base64url, no padding (RFC 7515 §2); padding-allowed decode
+		// is the WithPaddingAllowed escape hatch and is NOT enabled.
+		jwt.WithStrictDecoding(),
+		// exp is required and validated against now+leeway; golang-jwt does
+		// not require exp by default, hence the explicit option.
+		jwt.WithExpirationRequired(),
+		// iat, when present, must not be in the future beyond leeway.
+		jwt.WithIssuedAt(),
+	}
+	// DisableLeeway expresses zero clock-skew tolerance explicitly: Leeway==0
+	// otherwise defaults to 60s (see Config.Leeway), which cannot itself mean
+	// "no skew".
+	if v.cfg.DisableLeeway {
+		opts = append(opts, jwt.WithLeeway(0))
+	} else {
+		opts = append(opts, jwt.WithLeeway(v.cfg.Leeway))
+	}
+	// The iss and aud options are added only when configured. golang-jwt treats
+	// an empty expected issuer/audience set as "do not check" anyway, but
+	// appending conditionally keeps the disabled case explicit here rather than
+	// depending on that library behavior. Config.validate has already ensured
+	// an empty Audiences was a deliberate AllowAnyAudience choice and that an
+	// empty Issuer came with an explicit JWKSURL.
+	if v.cfg.Issuer != "" {
+		// iss is compared byte-exact (OIDC Core §3.1.3.2); NO TrimSpace.
+		opts = append(opts, jwt.WithIssuer(v.cfg.Issuer))
+	}
+	if len(v.cfg.Audiences) > 0 {
+		// aud any-match against the configured set (bare string or array on
+		// the wire).
+		opts = append(opts, jwt.WithAudience(v.cfg.Audiences...))
+	}
+	return opts
 }
 
 // unverifiedAlg extracts the alg from a token's UNVERIFIED header, used only
@@ -605,9 +635,10 @@ func candidateKeys(set jwk.Set, kid, alg string) []jwk.Key {
 // keyEligible applies the candidate filters: use/key_ops/alg eligibility plus
 // the kty-vs-alg backstop.
 func keyEligible(key jwk.Key, alg string) bool {
-	// use: "enc" is excluded; an absent use passes (use is optional in
-	// RFC 7517 §4.2).
-	if use, hasUse := key.KeyUsage(); hasUse && use == string(jwk.ForEncryption) {
+	// use, when present, must be exactly "sig" (RFC 7517 §4.2 makes use
+	// optional, but a present value that isn't sig — "enc" or anything else —
+	// means the key was not published for verification). An absent use passes.
+	if use, hasUse := key.KeyUsage(); hasUse && use != string(jwk.ForSignature) {
 		return false
 	}
 	// key_ops, when present, must contain "verify" (RFC 7517 §4.3).
@@ -644,6 +675,12 @@ func keyTypeMatchesAlg(key jwk.Key, alg string) bool {
 		// the JWK's metadata alone.
 		var raw rsa.PublicKey
 		if err := jwk.Export(key, &raw); err != nil {
+			return false
+		}
+		// A successful Export should always populate N; this guard is
+		// defence-in-depth against a nil-pointer panic on BitLen, not a known
+		// reachable path.
+		if raw.N == nil {
 			return false
 		}
 		return raw.N.BitLen() >= minRSAKeyBits

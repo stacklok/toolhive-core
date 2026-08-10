@@ -6,7 +6,9 @@ package authn
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rsa"
 	"errors"
 	"fmt"
 	"net/http"
@@ -256,6 +258,45 @@ func TestProviderCandidateEligibility(t *testing.T) {
 			alg:       testAlgRS256,
 			wantCount: 0,
 		},
+		{
+			// A malformed RSA key (nil modulus) must be rejected, not panic
+			// BitLen on a nil *big.Int.
+			name:      "RSA key with nil modulus skipped",
+			keys:      []PublicKey{{KeyID: "a", Key: &rsa.PublicKey{}}},
+			kid:       "a",
+			alg:       testAlgRS256,
+			wantCount: 0,
+		},
+		{
+			// A malformed ECDSA key (nil curve) must be rejected, not panic on
+			// the nil-interface Curve.Params() call.
+			name:      "ECDSA key with nil curve skipped",
+			keys:      []PublicKey{{KeyID: "a", Key: &ecdsa.PublicKey{}}},
+			kid:       "a",
+			alg:       testAlgES256,
+			wantCount: 0,
+		},
+		{
+			name:      "typed-nil RSA key skipped",
+			keys:      []PublicKey{{KeyID: "a", Key: (*rsa.PublicKey)(nil)}},
+			kid:       "a",
+			alg:       testAlgRS256,
+			wantCount: 0,
+		},
+		{
+			name:      "typed-nil ECDSA key skipped",
+			keys:      []PublicKey{{KeyID: "a", Key: (*ecdsa.PublicKey)(nil)}},
+			kid:       "a",
+			alg:       testAlgES256,
+			wantCount: 0,
+		},
+		{
+			name:      "untyped nil key skipped",
+			keys:      []PublicKey{{KeyID: "a", Key: nil}},
+			kid:       "a",
+			alg:       testAlgRS256,
+			wantCount: 0,
+		},
 	}
 
 	for _, tt := range tests {
@@ -265,6 +306,25 @@ func TestProviderCandidateEligibility(t *testing.T) {
 			assert.Len(t, got, tt.wantCount)
 		})
 	}
+}
+
+// TestKeyProviderMalformedKeyDoesNotPanic covers the same finding end-to-end
+// through the public API: a KeyProvider is caller-implemented, so a
+// malformed key it returns (nil modulus/curve) must make Validate return an
+// error, not panic the request path.
+func TestKeyProviderMalformedKeyDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	kp := &fakeKeyProvider{keys: []PublicKey{{KeyID: "malformed-1", Key: &rsa.PublicKey{}}}}
+	v, err := NewValidator(context.Background(), providerConfig(t, kp))
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	rsaKey := mintRSA(t, "malformed-1")
+	assert.NotPanics(t, func() {
+		_, err = v.Validate(context.Background(), rsaKey.mint(t, validConfig().Issuer))
+	})
+	require.Error(t, err, "a malformed provider key must fail validation, not verify or panic")
 }
 
 // TestProviderCandidatesBounded asserts the maxKeyCandidates bound applies to

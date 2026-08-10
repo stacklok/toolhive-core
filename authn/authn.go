@@ -5,6 +5,7 @@ package authn
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -54,8 +55,14 @@ const (
 	constructionTimeout = 30 * time.Second
 )
 
-// schemeHTTPS is compared against parsed URL schemes.
-const schemeHTTPS = "https"
+// schemeHTTPS and schemeHTTP are compared against parsed URL schemes.
+// validateHTTPSURI treats these as the only two acceptable schemes — an
+// allowlist, not a "not https" exclusion — so an unrelated scheme (ftp, file,
+// gopher) is always rejected regardless of InsecureAllowHTTP.
+const (
+	schemeHTTPS = "https"
+	schemeHTTP  = "http"
+)
 
 // Config holds the trusted issuer/audience policy and fetch behavior for a
 // Validator. A Config is validated eagerly by NewValidator so that a typo is
@@ -102,6 +109,16 @@ type Config struct {
 	// the default of 60s; negative is an error; values above 2m are an
 	// error.
 	Leeway time.Duration
+
+	// DisableLeeway expresses zero clock-skew tolerance explicitly, since
+	// Leeway==0 otherwise means "use the 60s default" and so cannot itself
+	// express "none" (see Leeway). Mirrors the AllowAnyAudience explicit-opt-out
+	// style: some deployments (matching ToolHive, which rejects exactly at exp)
+	// need no tolerance at all.
+	//
+	// Setting it together with a non-zero Leeway is an error, so the two cannot
+	// silently disagree about which policy applies.
+	DisableLeeway bool
 
 	// MaxJWKSStaleness bounds how long cached JWKS key material stays trusted
 	// without a confirmed successful fetch. Negative is an error.
@@ -207,6 +224,19 @@ type Config struct {
 	// AllowPrivateIP.
 	CACertPath string
 
+	// AuthTokenFile optionally points at a file containing a bearer token to
+	// attach to the OUTBOUND discovery and JWKS requests, for an IdP whose own
+	// endpoints are gated behind auth (mirrors ToolHive's
+	// --jwks-auth-token-file). The networking package re-reads the file per
+	// request, so a rotated token is picked up without restarting the
+	// validator.
+	//
+	// It applies ONLY to the default client, for the same reason as
+	// AllowPrivateIP and CACertPath: it is implemented by networking's HTTP
+	// client builder, which cannot be retrofitted onto a caller-supplied
+	// HTTPClient.
+	AuthTokenFile string
+
 	// KeyProvider optionally supplies verification keys in-process, for an
 	// embedded issuer. It is consulted BEFORE the JWKS cache on every
 	// validation; a miss falls through to JWKS when one is configured.
@@ -294,13 +324,15 @@ func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
 		return nil, err
 	}
 
-	// Config is copied by value, but Audiences would still alias the caller's
-	// backing array: mutating that slice afterwards would silently rewrite the
-	// trusted audience policy, and would race Validate while doing it. Clone it
-	// so the validator owns its policy for its whole lifetime.
+	// Config is copied by value, but Audiences and AcceptedTokenTypes would
+	// still alias the caller's backing arrays: mutating either slice afterwards
+	// would silently rewrite trusted policy, and would race Validate while
+	// doing it. Clone both so the validator owns its policy for its whole
+	// lifetime.
 	cfg.Audiences = slices.Clone(cfg.Audiences)
+	cfg.AcceptedTokenTypes = slices.Clone(cfg.AcceptedTokenTypes)
 
-	httpClient, err := newHTTPClient(cfg.HTTPClient, cfg.AllowPrivateIP, cfg.CACertPath)
+	httpClient, err := newHTTPClient(cfg.HTTPClient, cfg.AllowPrivateIP, cfg.CACertPath, cfg.AuthTokenFile)
 	if err != nil {
 		return nil, err
 	}
@@ -390,13 +422,8 @@ func (c *Config) validate() error {
 		}
 	}
 
-	switch {
-	case c.Leeway < 0:
-		return fmt.Errorf("authn: leeway must not be negative: %s", c.Leeway)
-	case c.Leeway == 0:
-		c.Leeway = defaultLeeway
-	case c.Leeway > maxLeeway:
-		return fmt.Errorf("authn: leeway %s exceeds maximum %s", c.Leeway, maxLeeway)
+	if err := c.validateLeeway(); err != nil {
+		return err
 	}
 
 	// Zero means "no lifetime bound"; it is NOT defaulted. A default cap would
@@ -416,6 +443,26 @@ func (c *Config) validate() error {
 		}
 	}
 
+	return nil
+}
+
+// validateLeeway checks the clock-skew tolerance policy and fills in the
+// default when neither Leeway nor DisableLeeway was set.
+//
+// DisableLeeway and a non-zero Leeway are mutually exclusive for the same
+// reason AllowAnyAudience and a populated Audiences are: the two must not be
+// left to silently disagree about which policy applies.
+func (c *Config) validateLeeway() error {
+	switch {
+	case c.Leeway < 0:
+		return fmt.Errorf("authn: leeway must not be negative: %s", c.Leeway)
+	case c.DisableLeeway && c.Leeway != 0:
+		return fmt.Errorf("authn: DisableLeeway must not be set together with a non-zero leeway %s", c.Leeway)
+	case c.Leeway == 0 && !c.DisableLeeway:
+		c.Leeway = defaultLeeway
+	case c.Leeway > maxLeeway:
+		return fmt.Errorf("authn: leeway %s exceeds maximum %s", c.Leeway, maxLeeway)
+	}
 	return nil
 }
 
@@ -478,10 +525,20 @@ func validateHTTPSURI(field, raw string, insecureAllowHTTP bool) error {
 	if err != nil {
 		return fmt.Errorf("authn: %s: %w", field, err)
 	}
-	if u.Scheme != schemeHTTPS && !insecureAllowHTTP {
-		return fmt.Errorf("authn: %s must use https scheme (set InsecureAllowHTTP for dev only): %s", field, raw)
+	// Allowlist, not exclusion: InsecureAllowHTTP widens the accepted set from
+	// {https} to {https, http}, it does not turn the check into "anything but
+	// https". Without this, ValidateResourceURI's scheme-presence-only check
+	// left ftp://, file://, and gopher:// passing through whenever the flag
+	// was set.
+	switch u.Scheme {
+	case schemeHTTPS:
+		return nil
+	case schemeHTTP:
+		if insecureAllowHTTP {
+			return nil
+		}
 	}
-	return nil
+	return fmt.Errorf("authn: %s must use https scheme (set InsecureAllowHTTP for dev only): %s", field, raw)
 }
 
 // init resolves the JWKS URL, starts the jwx cache, and registers the URL with
@@ -510,12 +567,17 @@ func (v *Validator) init(ctx context.Context) error {
 		switch {
 		case err == nil:
 			v.jwksURL = jwksURI
-		case v.cfg.KeyProvider != nil:
-			// An embedded issuer may advertise a URL that is not routable from
-			// inside the cluster, so discovery can fail permanently rather than
-			// transiently. The provider resolves keys locally, so give up on
-			// JWKS entirely and leave jwksCache nil: verificationKeys treats a
-			// nil cache as "provider is the only source".
+		case v.cfg.KeyProvider != nil && !errors.Is(err, errDiscoveryNotTransient):
+			// Startup-race tolerance is for TRANSPORT failures: an embedded
+			// issuer's discovery endpoint may not be listening yet, and that is
+			// exactly the case a KeyProvider exists to ride out. A REJECTED
+			// document (issuer mismatch, missing/non-https jwks_uri) is
+			// different — the endpoint answered and the answer is wrong, which
+			// is a configuration error, not a race. Tolerating it here would
+			// silently abandon JWKS forever: jwksCache stays nil and every
+			// token the provider does not offer returns unknown_kid with no
+			// evidence beyond one construction-time log line. So only a
+			// transient failure is swallowed; a rejected document stays fatal.
 			return nil
 		default:
 			return err
@@ -575,6 +637,18 @@ func (v *Validator) init(ctx context.Context) error {
 		return nil
 	}()
 
+	// A successful construction fetch is the first freshness proof, regardless
+	// of whether a KeyProvider is set: staleness() has to reflect it, or
+	// MaxJWKSStaleness's self-correcting refresh (see its docs) never fires and
+	// a validator constructed with a provider starts life reporting an
+	// infinite staleness that only an actual JWKS refresh clears. This must run
+	// BEFORE the KeyProvider early return below.
+	if refreshErr == nil {
+		v.refreshMu.Lock()
+		v.lastSuccess = time.Now()
+		v.refreshMu.Unlock()
+	}
+
 	// With a KeyProvider the first fetch is attempted but NOT required: an
 	// embedded issuer typically mounts its JWKS route on the very listener that
 	// has not started yet, so the fetch here can connection-refuse. Tolerating
@@ -589,13 +663,6 @@ func (v *Validator) init(ctx context.Context) error {
 		return nil
 	}
 
-	// A successful construction fetch is the first freshness proof.
-	if refreshErr == nil {
-		v.refreshMu.Lock()
-		v.lastSuccess = time.Now()
-		v.refreshMu.Unlock()
-	}
-
 	// Fail closed: with no provider the first fetch must complete during
 	// construction, so an unreachable or unparseable JWKS endpoint is a
 	// NewValidator error, never a validator with no key material. Refresh forces
@@ -603,6 +670,28 @@ func (v *Validator) init(ctx context.Context) error {
 	// on readiness, which would only report context deadline after background
 	// retries).
 	return refreshErr
+}
+
+// errRedirectRefused is returned by the redirect-refusal CheckRedirect policy
+// installed below. http.ErrUseLastResponse is NOT an error condition — it
+// tells the http.Client to hand the 3xx response back to the caller — so using
+// it here made a refused redirect surface as a confusing downstream failure
+// (discovery reporting "returned status 302", JWKS a parse error) with no
+// mention of a redirect anywhere. Returning a real error fails the request
+// instead, which is the point: this package requires jwks_uri/Issuer to be
+// the endpoint itself, not something it redirects to.
+type errRedirectRefused struct {
+	target string
+}
+
+func (e *errRedirectRefused) Error() string {
+	return fmt.Sprintf("authn: refused to follow redirect to %s (configure the final target directly)", e.target)
+}
+
+// refuseRedirects is the http.Client.CheckRedirect policy installed by
+// newHTTPClient for both the default and a supplied client.
+func refuseRedirects(req *http.Request, _ []*http.Request) error {
+	return &errRedirectRefused{target: req.URL.String()}
 }
 
 // newHTTPClient returns base when non-nil, else a secure-by-default client
@@ -616,30 +705,36 @@ func (v *Validator) init(ctx context.Context) error {
 // is why the default path must not be the weak one — the https scheme check and
 // redirect refusal alone do not classify the address a name resolves to.
 //
+// authTokenFile, when non-empty, attaches a bearer token (re-read from the
+// file on each request by networking) to outbound discovery/JWKS requests,
+// for an IdP whose own endpoints are gated. networking.Build() installs
+// SameHostRedirectPolicy whenever a token file is set, so the token is not
+// replayed to a different host — but the CheckRedirect override just below
+// replaces it with authn's stricter refuse-all anyway, so the two compose
+// correctly rather than conflicting: whichever runs, redirects are refused.
+//
 // For a SUPPLIED client, a nil CheckRedirect is replaced with the
 // redirect-refusing policy and a zero Timeout with defaultHTTPTimeout, so a
 // bare &http.Client{} cannot silently drop the redirect refusal or the fetch
 // bound. Explicit caller values for either field are preserved. The dial guard
-// CANNOT be retrofitted onto a supplied client's transport, though: see the
-// Config.HTTPClient docs.
-func newHTTPClient(base *http.Client, allowPrivateIP bool, caCertPath string) (*http.Client, error) {
+// and AuthTokenFile CANNOT be retrofitted onto a supplied client's transport,
+// though: see the Config.HTTPClient docs.
+func newHTTPClient(base *http.Client, allowPrivateIP bool, caCertPath, authTokenFile string) (*http.Client, error) {
 	if base == nil {
 		built, err := networking.NewHttpClientBuilder().
 			WithPrivateIPs(allowPrivateIP).
 			WithCABundle(caCertPath).
+			WithTokenFromFile(authTokenFile).
 			WithInsecureAllowHTTP(true). // scheme policy is enforced by validateHTTPSURI
 			WithTimeout(defaultHTTPTimeout).
 			Build()
 		if err != nil {
 			return nil, fmt.Errorf("authn: failed to build HTTP client: %w", err)
 		}
-		// networking's builder deliberately leaves CheckRedirect unset (its dial
-		// guard re-fires per hop, so it tolerates redirects). authn is stricter:
-		// refuse them outright, since a jwks_uri that 302s elsewhere should be
+		// authn is stricter than networking's own redirect tolerance: refuse
+		// redirects outright, since a jwks_uri that 302s elsewhere should be
 		// configured as its final target instead.
-		built.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
+		built.CheckRedirect = refuseRedirects
 		base = built
 	}
 	// A zero-value client has a nil Transport and would use
@@ -653,9 +748,7 @@ func newHTTPClient(base *http.Client, allowPrivateIP bool, caCertPath string) (*
 	// Enforce the redirect-refusal and timeout for a supplied client that
 	// left them unset, preserving an explicit caller policy.
 	if capped.CheckRedirect == nil {
-		capped.CheckRedirect = func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
+		capped.CheckRedirect = refuseRedirects
 	}
 	if capped.Timeout == 0 {
 		capped.Timeout = defaultHTTPTimeout
