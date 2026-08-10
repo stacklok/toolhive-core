@@ -30,6 +30,7 @@ The ToolHive ecosystem spans multiple Go repositories, and several of these proj
 | `telemetry/reconcile` | Alpha | Unified operator reconcile metric emitter |
 | `oci/skills` | Alpha | OCI artifact types, media types, and registry operations for skills |
 | `oci/plugins` | Alpha | OCI artifact types, media types, and registry operations for plugins |
+| `networking` | Alpha | Outbound HTTP client construction with SSRF egress policy: private-IP/link-local dial blocking, redirect policy, body-capped JSON fetch, endpoint/issuer URL + private-IP validation helpers, and port allocation/validation utilities |
 | `postgres` | Alpha | PostgreSQL connection pool with optional AWS RDS IAM dynamic auth |
 | `recovery` | Beta | HTTP panic recovery middleware |
 | `validation/http` | Stable | RFC 7230/8707 compliant HTTP header and URI validation |
