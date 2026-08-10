@@ -360,7 +360,26 @@ func TestKeepAlive_ConcurrentFramesNoInterleaving(t *testing.T) {
 		}
 	}
 	assert.Equal(t, writers*framesPerWriter, frames, "every whole frame must appear intact")
-	assert.Positive(t, comments, "the ticker should have emitted at least one comment")
+	// The ticker firing at least once is covered by TestKeepAlive_TickerEmitsComment,
+	// which waits deterministically instead of racing wall-clock time here.
+	_ = comments
+}
+
+// TestKeepAlive_TickerEmitsComment asserts the ticker emits a keep-alive
+// comment, waiting deterministically for evidence of a tick instead of
+// racing wall-clock time against a fixed amount of work.
+func TestKeepAlive_TickerEmitsComment(t *testing.T) {
+	t.Parallel()
+	rw := newRecordingWriter()
+	rw.setSSEHeaders()
+	k := newKeepAliveWriter(rw, time.Millisecond, nil)
+	defer k.stopKeepAlive()
+
+	k.WriteHeader(http.StatusOK)
+
+	require.Eventually(t, func() bool {
+		return rw.commentCount() > 0
+	}, time.Second, time.Millisecond, "the ticker should have emitted at least one comment")
 }
 
 func TestKeepAlive_DisabledInterval(t *testing.T) {
