@@ -2128,3 +2128,22 @@ func TestAcceptedTokenTypes(t *testing.T) {
 		requireAuthnError(t, err, CodeInvalidToken, ReasonTokenType)
 	})
 }
+
+// TestParseBearerChecksLengthBeforeScanning pins the check ORDER: an oversized
+// credential must be rejected on length without first walking every byte, so the
+// work done is not proportional to attacker-chosen input. Both paths yield the
+// same Code/Reason, so this asserts on the detail message — the only observable
+// difference.
+func TestParseBearerChecksLengthBeforeScanning(t *testing.T) {
+	t.Parallel()
+
+	// Oversized AND full of control characters: either check would reject it, so
+	// which message comes back tells us which ran first.
+	oversized := strings.Repeat("\x00", maxTokenLength+1)
+	_, err := ParseBearer("Bearer " + oversized)
+	requireAuthnError(t, err, CodeInvalidRequest, ReasonMalformed)
+	assert.Contains(t, err.Error(), "exceeds",
+		"the O(1) length bound must run before the O(n) character scan")
+	// And the credential still never appears in the error.
+	assert.NotContains(t, err.Error(), "\x00")
+}

@@ -125,6 +125,14 @@ func ParseBearer(headerValue string) (string, error) {
 		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
 			err: errors.New("expected 'Bearer <token>': empty credential")}
 	}
+	// Length first, then the character scan: the bound is O(1) and the scan is
+	// O(n), so rejecting an oversized credential before walking it avoids doing
+	// work proportional to attacker-chosen input. net/http's MaxHeaderBytes
+	// already bounds this, so the ordering is hygiene rather than a fix.
+	if len(token) > maxTokenLength {
+		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
+			err: fmt.Errorf("token length %d exceeds %d byte limit", len(token), maxTokenLength)}
+	}
 	// Reject anything outside printable ASCII (0x21-0x7E). This is
 	// deliberately NOT the strict RFC 7235 token68 alphabet: that would forbid
 	// characters some IdPs use in opaque tokens, and this package intentionally
@@ -136,10 +144,6 @@ func ParseBearer(headerValue string) (string, error) {
 			return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
 				err: errors.New("credential contains a non-printable-ASCII character")}
 		}
-	}
-	if len(token) > maxTokenLength {
-		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
-			err: fmt.Errorf("token length %d exceeds %d byte limit", len(token), maxTokenLength)}
 	}
 	return token, nil
 }
@@ -692,7 +696,22 @@ func keyTypeMatchesAlg(key jwk.Key, alg string) bool {
 		if err := jwk.Export(key, &raw); err != nil {
 			return false
 		}
-		return curveMatchesAlg(raw.Curve.Params().Name, alg)
+		// Same defence-in-depth as the RSA branch above, and for the same
+		// reason: a successful Export should always populate Curve, but calling
+		// Params() on a nil Curve is a nil-interface method call and panics.
+		// The three sibling sites (RSA here, and both branches in
+		// keyprovider.go) guard this; leaving one unguarded is the defect, not
+		// the reachability.
+		// The Curve nil-check must precede Params(): the promoted raw.Params()
+		// IS raw.Curve.Params(), so it panics on a nil Curve just the same.
+		if raw.Curve == nil {
+			return false
+		}
+		params := raw.Params()
+		if params == nil {
+			return false
+		}
+		return curveMatchesAlg(params.Name, alg)
 	default:
 		// Unreachable via Validate: the alg gate rejects any alg off the
 		// allowlist (RS/PS/ES only) before a keyfunc runs.
