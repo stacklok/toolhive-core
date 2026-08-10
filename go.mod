@@ -13,7 +13,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/modelcontextprotocol/go-sdk v1.7.0
-	github.com/modelcontextprotocol/registry v1.8.0
+	github.com/modelcontextprotocol/registry v1.8.1
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/redis/go-redis/v9 v9.22.0
