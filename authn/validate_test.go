@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -56,7 +57,14 @@ type ecPair struct {
 
 func mintRSA(t *testing.T, kid string) rsaPair {
 	t.Helper()
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	return mintRSABits(t, kid, 2048)
+}
+
+// mintRSABits mints an RSA pair with an explicit modulus size, so tests can
+// exercise the RFC 7518 §3.3 strength floor.
+func mintRSABits(t *testing.T, kid string, bits int) rsaPair {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, bits)
 	require.NoError(t, err)
 	pub, err := jwk.Import(&priv.PublicKey)
 	require.NoError(t, err)
@@ -1861,4 +1869,169 @@ func TestAudiencesClonedAtConstruction(t *testing.T) {
 	// And the originally configured audience still validates.
 	_, err = v.Validate(context.Background(), rsaKey.mint(t, js.srv.URL))
 	require.NoError(t, err)
+}
+
+// --- hardening policies: RSA strength, JWKS staleness, token type ----------
+
+// TestWeakRSAKeyRejected covers the RFC 7518 §3.3 strength floor: RS*/PS*
+// require a modulus of at least 2048 bits, so a shorter key must not be used
+// even though it came from the configured JWKS.
+func TestWeakRSAKeyRejected(t *testing.T) {
+	t.Parallel()
+
+	weak := mintRSABits(t, "weak", 1024)
+	js := newJWKSServer(t, weak.jwk)
+	v, err := NewValidator(context.Background(), js.configFor())
+	require.NoError(t, err, "a weak key must not break construction, only verification")
+	t.Cleanup(v.Close)
+
+	_, err = v.Validate(context.Background(), weak.mint(t, js.srv.URL))
+	// The key is filtered out as a candidate, so the kid resolves to nothing.
+	requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
+}
+
+// TestStrongRSAKeyStillAccepted is the control for the floor.
+func TestStrongRSAKeyStillAccepted(t *testing.T) {
+	t.Parallel()
+
+	strong := mintRSABits(t, "strong", 2048)
+	js := newJWKSServer(t, strong.jwk)
+	v, err := NewValidator(context.Background(), js.configFor())
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	_, err = v.Validate(context.Background(), strong.mint(t, js.srv.URL))
+	require.NoError(t, err)
+}
+
+// TestWeakRSAKeyFromProviderRejected applies the same floor to in-process keys:
+// a KeyProvider is trusted, but not trusted to be correctly configured.
+func TestWeakRSAKeyFromProviderRejected(t *testing.T) {
+	t.Parallel()
+
+	weak := mintRSABits(t, "weak", 1024)
+	kp := &fakeKeyProvider{keys: []PublicKey{{KeyID: "weak", Key: weak.priv.Public()}}}
+	cfg := providerConfig(t, kp)
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	_, err = v.Validate(context.Background(), weak.mint(t, validConfig().Issuer))
+	require.Error(t, err, "a sub-2048-bit provider key must not verify a token")
+	var authnErr *Error
+	require.ErrorAs(t, err, &authnErr)
+	assert.NotEqual(t, ReasonSignature, authnErr.Reason)
+}
+
+// TestMaxJWKSStalenessRejectsRevokedKeyAfterOutage covers the staleness bound:
+// the cache keeps serving its last good key set after every failed refresh, so
+// without a bound a key revoked at the IdP stays trusted for the whole outage.
+func TestMaxJWKSStalenessRejectsRevokedKeyAfterOutage(t *testing.T) {
+	t.Parallel()
+
+	compromised := mintRSA(t, "compromised")
+	js := newJWKSServer(t, compromised.jwk)
+	cfg := js.configFor()
+	cfg.MaxJWKSStaleness = 50 * time.Millisecond // tiny, so the test need not wait
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+	token := compromised.mint(t, js.srv.URL)
+
+	// While the issuer is reachable the bound must NOT bite, even though the
+	// window is far shorter than the refresh interval: exceeding it triggers a
+	// refresh, which succeeds.
+	time.Sleep(2 * cfg.MaxJWKSStaleness)
+	_, err = v.Validate(context.Background(), token)
+	require.NoError(t, err, "a healthy issuer must never trip the staleness bound")
+
+	// Now the issuer becomes unreachable. Once the bound elapses with no
+	// successful fetch, the cached key must stop being trusted.
+	js.setOverride(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	assert.Eventually(t, func() bool {
+		setLastRefresh(v, time.Now().Add(-2*refreshFloor)) // allow a refresh attempt
+		_, err := v.Validate(context.Background(), token)
+		var authnErr *Error
+		return errors.As(err, &authnErr) && authnErr.Reason == ReasonKeysStale
+	}, 3*time.Second, 50*time.Millisecond,
+		"a revoked key must stop validating once cached material exceeds MaxJWKSStaleness")
+}
+
+// TestStalenessBoundDisabledByDefault is the availability half: with the bound
+// off (the default), an unreachable issuer must NOT break validation of tokens
+// signed by already-cached keys.
+func TestStalenessBoundDisabledByDefault(t *testing.T) {
+	t.Parallel()
+
+	key := mintRSA(t, "k1")
+	js := newJWKSServer(t, key.jwk)
+	cfg := js.configFor()
+	require.Zero(t, cfg.MaxJWKSStaleness, "the bound must be off by default")
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+	token := key.mint(t, js.srv.URL)
+
+	js.setOverride(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	setLastRefresh(v, time.Now().Add(-2*refreshFloor))
+	_, err = v.Validate(context.Background(), token)
+	require.NoError(t, err,
+		"with the bound disabled an issuer outage must not break validation of cached keys")
+}
+
+// typAccessToken is RFC 9068's access-token media type.
+const typAccessToken = "at+jwt"
+
+// TestAcceptedTokenTypes covers the typ gate, including the ID-token
+// substitution it exists to stop.
+func TestAcceptedTokenTypes(t *testing.T) {
+	t.Parallel()
+
+	key := mintRSA(t, "k1")
+	js := newJWKSServer(t, key.jwk)
+
+	t.Run("unset accepts any typ", func(t *testing.T) {
+		t.Parallel()
+		v, err := NewValidator(context.Background(), js.configFor())
+		require.NoError(t, err)
+		t.Cleanup(v.Close)
+		for _, typ := range []string{"JWT", typAccessToken, "id_token+jwt", "anything"} {
+			_, err := v.Validate(context.Background(), key.mint(t, js.srv.URL, withHeader("typ", typ)))
+			require.NoError(t, err, "typ %q must be accepted when the gate is unset", typ)
+		}
+	})
+
+	t.Run("configured gate", func(t *testing.T) {
+		t.Parallel()
+		cfg := js.configFor()
+		cfg.AcceptedTokenTypes = []string{typAccessToken}
+		v, err := NewValidator(context.Background(), cfg)
+		require.NoError(t, err)
+		t.Cleanup(v.Close)
+
+		accepted := []any{typAccessToken, "AT+JWT", "application/" + typAccessToken, "application/AT+JWT"}
+		for _, typ := range accepted {
+			_, err := v.Validate(context.Background(), key.mint(t, js.srv.URL, withHeader("typ", typ)))
+			require.NoError(t, err, "typ %v must match the accepted type (case- and prefix-insensitive)", typ)
+		}
+
+		// The substitution this gate exists to stop.
+		_, err = v.Validate(context.Background(), key.mint(t, js.srv.URL, withHeader("typ", "id_token+jwt")))
+		requireAuthnError(t, err, CodeInvalidToken, ReasonTokenType)
+
+		_, err = v.Validate(context.Background(), key.mint(t, js.srv.URL, withHeader("typ", "JWT")))
+		requireAuthnError(t, err, CodeInvalidToken, ReasonTokenType)
+
+		// A missing typ cannot satisfy a gate that demands a positive statement.
+		_, err = v.Validate(context.Background(), key.mint(t, js.srv.URL))
+		requireAuthnError(t, err, CodeInvalidToken, ReasonTokenType)
+
+		// Nor can a non-string typ.
+		_, err = v.Validate(context.Background(), key.mint(t, js.srv.URL, withHeader("typ", 42)))
+		requireAuthnError(t, err, CodeInvalidToken, ReasonTokenType)
+	})
 }

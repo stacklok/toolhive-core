@@ -103,6 +103,46 @@ type Config struct {
 	// error.
 	Leeway time.Duration
 
+	// MaxJWKSStaleness bounds how long cached JWKS key material stays trusted
+	// without a confirmed successful fetch. Negative is an error.
+	//
+	// Zero DISABLES the bound, and is the default. The bound exists because the
+	// cache keeps serving its last good key set after every failed refresh, so a
+	// key revoked at the IdP stays trusted for as long as the endpoint is
+	// unreachable — the trust window equals the outage length.
+	//
+	// Enabling it trades availability for that bound: once exceeded, validation
+	// fails with CodeUnavailable/ReasonKeysStale, so a prolonged IdP outage
+	// becomes an authentication outage instead of an invisible one. Pick a value
+	// that reflects how long you are willing to honour a revoked key; hours
+	// rather than minutes is usually the right order of magnitude.
+	//
+	// Freshness is self-correcting rather than schedule-based: when the bound is
+	// exceeded the validator attempts a refresh before rejecting anything, so a
+	// healthy endpoint never trips it regardless of when the background refresh
+	// last ran. It applies only to JWKS material — keys from a KeyProvider are
+	// resolved in-process and are never considered stale.
+	MaxJWKSStaleness time.Duration
+
+	// AcceptedTokenTypes, when non-empty, requires the token's `typ` header to
+	// match one of these media types. Comparison is case-insensitive and an
+	// `application/` prefix is optional on both sides (RFC 7515 §4.1.9), so
+	// "at+jwt" matches a token carrying "application/at+JWT".
+	//
+	// Empty (the default) accepts any `typ`, including none. It cannot default
+	// to requiring RFC 9068's "at+jwt": that is a SHOULD, and many IdPs emit
+	// "JWT" or omit the header entirely, so a default would reject conformant
+	// tokens.
+	//
+	// This guards against ID-token substitution — an ID token sharing the
+	// issuer, audience, subject and expiry of an access token. Note the AUDIENCE
+	// check is the primary defence there, since an ID token's aud is the
+	// client_id rather than the resource: this matters most when
+	// AllowAnyAudience is set, or when a deployment uses its client_id as the
+	// resource audience, because in those cases the audience check cannot tell
+	// the two kinds of token apart.
+	AcceptedTokenTypes []string
+
 	// MaxTokenLifetime rejects tokens whose exp-iat span exceeds it, when both
 	// claims are present. Negative is an error.
 	//
@@ -223,6 +263,11 @@ type Validator struct {
 	// the floor timestamp the second caller sees after blocking on the mutex.
 	refreshMu   sync.Mutex
 	lastRefresh time.Time
+	// lastSuccess is when a JWKS fetch last SUCCEEDED, as opposed to
+	// lastRefresh, which records when one was last attempted. Only a success
+	// proves the cached key set reflects the issuer, so the staleness bound
+	// keys off this. Guarded by refreshMu.
+	lastSuccess time.Time
 
 	// negativeMu guards negativeKids, the bounded negative cache of kids that
 	// resolved to no key after a refresh (suppresses repeat fetches for a kid
@@ -359,6 +404,16 @@ func (c *Config) validate() error {
 	// in is the caller's decision.
 	if c.MaxTokenLifetime < 0 {
 		return fmt.Errorf("authn: max token lifetime must not be negative: %s", c.MaxTokenLifetime)
+	}
+	// Zero disables the staleness bound, for the same reason: enabling it can
+	// turn an issuer outage into an authentication outage.
+	if c.MaxJWKSStaleness < 0 {
+		return fmt.Errorf("authn: max JWKS staleness must not be negative: %s", c.MaxJWKSStaleness)
+	}
+	for i, tt := range c.AcceptedTokenTypes {
+		if normalizeTokenType(tt) == "" {
+			return fmt.Errorf("authn: accepted_token_types[%d] must not be empty", i)
+		}
 	}
 
 	return nil
@@ -532,6 +587,13 @@ func (v *Validator) init(ctx context.Context) error {
 	// immediately rather than reporting httprc.ErrNotReady on the first request.
 	if v.cfg.KeyProvider != nil {
 		return nil
+	}
+
+	// A successful construction fetch is the first freshness proof.
+	if refreshErr == nil {
+		v.refreshMu.Lock()
+		v.lastSuccess = time.Now()
+		v.refreshMu.Unlock()
 	}
 
 	// Fail closed: with no provider the first fetch must complete during

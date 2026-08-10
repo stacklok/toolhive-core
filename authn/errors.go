@@ -98,6 +98,20 @@ const (
 	// ReasonKeysUnavailable indicates the key material source (e.g. JWKS
 	// endpoint) could not be fetched; paired with CodeUnavailable.
 	ReasonKeysUnavailable Reason = "keys_unavailable"
+	// ReasonKeysStale indicates cached key material is older than the
+	// configured Config.MaxJWKSStaleness and a fresh fetch did not succeed, so
+	// it is no longer trusted; paired with CodeUnavailable.
+	//
+	// It is distinct from ReasonKeysUnavailable on purpose: keys_unavailable
+	// means the verifier never had usable key material, while keys_stale means
+	// it has some and is deliberately refusing to keep trusting it. For an
+	// operator those point at the same root cause (the issuer is unreachable)
+	// but different urgency — a revocation may already have been published.
+	ReasonKeysStale Reason = "keys_stale"
+	// ReasonTokenType indicates the "typ" header does not match any entry in
+	// Config.AcceptedTokenTypes (e.g. an ID token presented as an access
+	// token).
+	ReasonTokenType Reason = "token_type"
 	// ReasonInvalidClaims indicates the token parsed as a structurally valid
 	// JWT but its claim set was rejected by golang-jwt for a reason this
 	// package does not otherwise enumerate (e.g. a claim with the wrong JSON

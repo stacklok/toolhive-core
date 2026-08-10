@@ -97,8 +97,10 @@ func providerCandidates(keys []PublicKey, kid, alg string) []crypto.PublicKey {
 func providerKeyTypeMatchesAlg(key crypto.PublicKey, alg string) bool {
 	switch {
 	case strings.HasPrefix(alg, "RS"), strings.HasPrefix(alg, "PS"):
-		_, ok := key.(*rsa.PublicKey)
-		return ok
+		pub, ok := key.(*rsa.PublicKey)
+		// Same RFC 7518 §3.3 strength floor as the JWKS path: an in-process key
+		// source is trusted, but not trusted to be correctly configured.
+		return ok && pub.N.BitLen() >= minRSAKeyBits
 	case strings.HasPrefix(alg, "ES"):
 		pub, ok := key.(*ecdsa.PublicKey)
 		if !ok {

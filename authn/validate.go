@@ -39,6 +39,12 @@ const (
 	// only TTL: TTL alone does not stop an attacker spraying distinct random
 	// kids. On overflow the oldest entry is evicted.
 	negativeCacheMaxEntries = 128
+
+	// minRSAKeyBits is the smallest accepted RSA modulus. RFC 7518 §3.3 requires
+	// at least 2048 bits for every RS*/PS* algorithm, so a shorter key is
+	// rejected rather than trusted: it would come from the configured JWKS, but
+	// a resource server should not honour key material its own spec forbids.
+	minRSAKeyBits = 2048
 )
 
 // allowedAlgs is the hardcoded signature-algorithm allowlist. `none` and all
@@ -213,6 +219,11 @@ func (v *Validator) Validate(ctx context.Context, token string) (Principal, erro
 		if _, hasCrit := tok.Header["crit"]; hasCrit {
 			return nil, &Error{Code: CodeInvalidToken, Reason: ReasonCriticalHeader,
 				err: fmt.Errorf("token header carries unsupported crit member: %v", tok.Header["crit"])}
+		}
+		// typ gate, when configured. Enforced here rather than against the
+		// unverified header so the value checked is one the signature covers.
+		if err := v.checkTokenType(tok.Header); err != nil {
+			return nil, err
 		}
 		var kid string
 		if k, ok := tok.Header["kid"].(string); ok {
@@ -405,6 +416,42 @@ func issuedAt(claims jwt.MapClaims) (time.Time, bool) {
 	}
 }
 
+// checkTokenType enforces Config.AcceptedTokenTypes against the token's `typ`
+// header. An empty configuration accepts anything, including a missing typ.
+//
+// A missing or non-string typ is a REJECTION once the gate is configured: the
+// point of the gate is to require a positive statement of token kind, so an
+// absent statement cannot pass it.
+func (v *Validator) checkTokenType(header map[string]any) error {
+	if len(v.cfg.AcceptedTokenTypes) == 0 {
+		return nil
+	}
+	typ, _ := header["typ"].(string)
+	got := normalizeTokenType(typ)
+	if got == "" {
+		return &Error{Code: CodeInvalidToken, Reason: ReasonTokenType,
+			err: fmt.Errorf("token has no usable typ header; %d type(s) accepted", len(v.cfg.AcceptedTokenTypes))}
+	}
+	for _, want := range v.cfg.AcceptedTokenTypes {
+		if got == normalizeTokenType(want) {
+			return nil
+		}
+	}
+	return &Error{Code: CodeInvalidToken, Reason: ReasonTokenType,
+		err: fmt.Errorf("token typ %q is not accepted", typ)}
+}
+
+// normalizeTokenType canonicalizes a JOSE `typ` media type for comparison.
+//
+// RFC 7515 §4.1.9 permits omitting an "application/" prefix when the type
+// contains no "/", and media types are case-insensitive, so "at+jwt",
+// "AT+JWT" and "application/at+jwt" all denote the same thing and must compare
+// equal.
+func normalizeTokenType(typ string) string {
+	t := strings.ToLower(strings.TrimSpace(typ))
+	return strings.TrimPrefix(t, "application/")
+}
+
 // stringClaim extracts a string claim, tolerating a missing or non-string
 // value (returns "").
 func stringClaim(claims jwt.MapClaims, name string) string {
@@ -433,24 +480,18 @@ func (v *Validator) verificationKeys(ctx context.Context, kid, alg string) (any,
 	defer cancel()
 
 	if v.cfg.KeyProvider != nil {
-		local, err := v.keysFromProvider(ctx, kid, alg)
-		if err != nil {
-			return nil, err
+		set, handled, err := v.providerKeySet(ctx, kid, alg)
+		if handled || err != nil {
+			return set, err
 		}
-		if len(local) > 0 {
-			set := jwt.VerificationKeySet{Keys: make([]jwt.VerificationKey, 0, len(local))}
-			for _, k := range local {
-				set.Keys = append(set.Keys, k)
-			}
-			return set, nil
-		}
-		// Provider miss. When there is no JWKS to fall back to (an embedded
-		// issuer with no reachable endpoint), report the kid as unknown rather
-		// than falling through to a cache that was never populated.
-		if v.jwksCache == nil {
-			return nil, &Error{Code: CodeInvalidToken, Reason: ReasonUnknownKID,
-				err: fmt.Errorf("kid %q not offered by the key provider and no JWKS is configured", kid)}
-		}
+	}
+
+	// The staleness bound applies only to JWKS material: KeyProvider keys are
+	// resolved in-process above and are never stale.
+	if !v.jwksFresh() {
+		return nil, &Error{Code: CodeUnavailable, Reason: ReasonKeysStale,
+			err: fmt.Errorf("cached JWKS for %s is %s old, exceeding the %s bound, and a refresh did not succeed",
+				v.jwksURL, v.staleness().Round(time.Second), v.cfg.MaxJWKSStaleness)}
 	}
 
 	set, err := v.jwksCache.Lookup(ctx, v.jwksURL)
@@ -505,6 +546,33 @@ func (v *Validator) verificationKeys(ctx context.Context, kid, alg string) (any,
 	}
 
 	return exportCandidates(keys, alg)
+}
+
+// providerKeySet resolves candidates from the configured KeyProvider.
+//
+// handled reports whether the provider settled the question: true on a hit, and
+// also true on a miss when there is no JWKS to fall back to. A false handled
+// with a nil error means "provider missed, try the JWKS".
+func (v *Validator) providerKeySet(ctx context.Context, kid, alg string) (any, bool, error) {
+	local, err := v.keysFromProvider(ctx, kid, alg)
+	if err != nil {
+		return nil, true, err
+	}
+	if len(local) > 0 {
+		set := jwt.VerificationKeySet{Keys: make([]jwt.VerificationKey, 0, len(local))}
+		for _, k := range local {
+			set.Keys = append(set.Keys, k)
+		}
+		return set, true, nil
+	}
+	// Provider miss. When there is no JWKS to fall back to (an embedded issuer
+	// with no reachable endpoint), report the kid as unknown rather than falling
+	// through to a cache that was never populated.
+	if v.jwksCache == nil {
+		return nil, true, &Error{Code: CodeInvalidToken, Reason: ReasonUnknownKID,
+			err: fmt.Errorf("kid %q not offered by the key provider and no JWKS is configured", kid)}
+	}
+	return nil, false, nil
 }
 
 // candidateKeys filters the JWKS set down to the keys eligible to verify a
@@ -569,7 +637,16 @@ func keyEligible(key jwk.Key, alg string) bool {
 func keyTypeMatchesAlg(key jwk.Key, alg string) bool {
 	switch {
 	case strings.HasPrefix(alg, "RS") || strings.HasPrefix(alg, "PS"):
-		return key.KeyType().String() == "RSA"
+		if key.KeyType().String() != "RSA" {
+			return false
+		}
+		// Export to reach the modulus: the strength floor cannot be checked from
+		// the JWK's metadata alone.
+		var raw rsa.PublicKey
+		if err := jwk.Export(key, &raw); err != nil {
+			return false
+		}
+		return raw.N.BitLen() >= minRSAKeyBits
 	case strings.HasPrefix(alg, "ES"):
 		if key.KeyType().String() != "EC" {
 			return false
@@ -666,8 +743,45 @@ func (v *Validator) refreshOnce() (bool, error) {
 	refreshCtx, cancel := context.WithTimeout(v.ctx, defaultHTTPTimeout)
 	defer cancel()
 	_, err := v.jwksCache.Refresh(refreshCtx, v.jwksURL)
-	v.lastRefresh = time.Now()
+	now := time.Now()
+	v.lastRefresh = now
+	if err == nil {
+		v.lastSuccess = now
+	}
 	return true, err
+}
+
+// jwksFresh reports whether cached JWKS material is within
+// Config.MaxJWKSStaleness, attempting one refresh first if it is not.
+//
+// Attempting the refresh rather than only reading a timestamp is what makes the
+// bound safe to enable: this package cannot observe the jwx cache's BACKGROUND
+// refreshes (httprc exposes no last-success accessor), so a purely
+// timestamp-based check would reject perfectly fresh keys whenever the
+// background refresh happened to be the one keeping them current. Fetching
+// ourselves answers the only question that matters — can the issuer be reached
+// right now — and a healthy endpoint therefore never trips the bound. The
+// refreshFloor rate limit still applies, so this costs at most one fetch per
+// floor interval.
+func (v *Validator) jwksFresh() bool {
+	if v.cfg.MaxJWKSStaleness <= 0 {
+		return true // bound disabled
+	}
+	if v.staleness() <= v.cfg.MaxJWKSStaleness {
+		return true
+	}
+	// Stale: try to prove the issuer is reachable before refusing to serve.
+	if _, err := v.refreshOnce(); err != nil {
+		return false
+	}
+	return v.staleness() <= v.cfg.MaxJWKSStaleness
+}
+
+// staleness reports how long it has been since a JWKS fetch last succeeded.
+func (v *Validator) staleness() time.Duration {
+	v.refreshMu.Lock()
+	defer v.refreshMu.Unlock()
+	return time.Since(v.lastSuccess)
 }
 
 // knownBadKID reports whether kid is in the negative cache (within TTL).
