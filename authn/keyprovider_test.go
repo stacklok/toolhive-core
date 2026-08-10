@@ -51,7 +51,7 @@ func providerConfig(t *testing.T, kp KeyProvider) Config {
 	t.Helper()
 	cfg := validConfig()
 	// 127.0.0.1:1 refuses connections, so any JWKS fetch fails.
-	cfg.JWKSURL = "http://127.0.0.1:1/jwks.json"
+	cfg.JWKSURL = unreachableJWKSURL
 	cfg.InsecureAllowHTTP = true
 	cfg.AllowPrivateIP = true
 	cfg.KeyProvider = kp
@@ -302,7 +302,7 @@ func TestProviderCandidateEligibility(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := providerCandidates(tt.keys, tt.kid, tt.alg)
+			got, _ := providerCandidates(tt.keys, tt.kid, tt.alg)
 			assert.Len(t, got, tt.wantCount)
 		})
 	}
@@ -338,7 +338,7 @@ func TestProviderCandidatesBounded(t *testing.T) {
 	for i := range keys {
 		keys[i] = PublicKey{Key: rsaPub}
 	}
-	got := providerCandidates(keys, "", testAlgRS256)
+	got, _ := providerCandidates(keys, "", testAlgRS256)
 	assert.Len(t, got, maxKeyCandidates)
 }
 

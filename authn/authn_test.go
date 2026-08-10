@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,6 +23,11 @@ import (
 
 	"github.com/stacklok/toolhive-core/networking"
 )
+
+// unreachableJWKSURL is a JWKS URL on a closed port: any fetch against it fails
+// immediately, which is what several tests need to exercise the fail-closed and
+// provider-tolerant construction paths.
+const unreachableJWKSURL = "http://127.0.0.1:1/jwks.json"
 
 // wantErrExceeds is the substring shared by the "over a configured limit"
 // errors (leeway, audience length, token length, body cap).
@@ -153,7 +159,7 @@ func TestNewValidatorConfigValidation(t *testing.T) {
 			// then fails closed because the fake endpoint serves no JWKS.
 			name: "jwks_url non-https permitted with InsecureAllowHTTP but unfetchable",
 			mutate: func(c *Config) {
-				c.JWKSURL = "http://127.0.0.1:1/jwks.json"
+				c.JWKSURL = unreachableJWKSURL
 				c.InsecureAllowHTTP = true
 				c.AllowPrivateIP = true
 			},
@@ -854,4 +860,56 @@ func TestDefaultClientDisablesKeepAlives(t *testing.T) {
 	assert.True(t, transport.DisableKeepAlives,
 		"keep-alives must be disabled whenever the dial guard is installed")
 	assert.NotNil(t, transport.DialContext, "the dial guard must be installed by default")
+}
+
+// TestFailedConstructionDoesNotLeakGoroutines pins a property a consumer depends
+// on: NewValidator cancels its lifetime context before returning an error, so a
+// caller that retries construction in a loop — the recommended way to tolerate an
+// unreachable issuer without a lazy mode inside this package — does not
+// accumulate jwx cache goroutines with every failed attempt.
+//
+// It is a regression test, not a discovery: the cancel is already there. But it
+// is one line inside an error path, and losing it would leak silently and only
+// show up as slow memory growth in a service that retries.
+//
+//nolint:paralleltest // counts goroutines; a parallel sibling would make the measurement meaningless
+func TestFailedConstructionDoesNotLeakGoroutines(t *testing.T) {
+	// Deliberately NOT parallel: it counts goroutines, so a sibling test
+	// starting servers concurrently would make the measurement meaningless.
+	cfg := validConfig()
+	cfg.JWKSURL = unreachableJWKSURL // refuses connections
+	cfg.InsecureAllowHTTP = true
+	cfg.AllowPrivateIP = true
+
+	// One failure first, so any one-off lazy initialisation is already paid for
+	// and not counted as a leak below.
+	_, err := NewValidator(context.Background(), cfg)
+	require.Error(t, err)
+	settleGoroutines()
+	baseline := runtime.NumGoroutine()
+
+	const attempts = 40
+	for range attempts {
+		v, err := NewValidator(context.Background(), cfg)
+		require.Error(t, err, "an unreachable JWKS with no KeyProvider must fail construction")
+		require.Nil(t, v)
+	}
+
+	// Cancellation is asynchronous: the goroutines observe the cancelled context
+	// and exit shortly after. Poll rather than assert immediately.
+	require.Eventually(t, func() bool {
+		return runtime.NumGoroutine() <= baseline+attempts/4
+	}, 10*time.Second, 100*time.Millisecond,
+		"goroutines grew across %d failed constructions (baseline %d, now %d): "+
+			"NewValidator must cancel its context before returning an error",
+		attempts, baseline, runtime.NumGoroutine())
+}
+
+// settleGoroutines gives recently-cancelled goroutines a chance to exit so a
+// count taken afterwards is stable.
+func settleGoroutines() {
+	for range 20 {
+		runtime.Gosched()
+		time.Sleep(10 * time.Millisecond)
+	}
 }

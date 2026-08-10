@@ -110,14 +110,25 @@ type Config struct {
 	// error.
 	Leeway time.Duration
 
-	// DisableLeeway expresses zero clock-skew tolerance explicitly, since
-	// Leeway==0 otherwise means "use the 60s default" and so cannot itself
-	// express "none" (see Leeway). Mirrors the AllowAnyAudience explicit-opt-out
-	// style: some deployments (matching ToolHive, which rejects exactly at exp)
-	// need no tolerance at all.
+	// DisableLeeway sets the clock-skew tolerance to zero, so exp is enforced
+	// exactly. It exists because Leeway == 0 means "use the 60s default", which
+	// left no way to ask for no tolerance at all. Setting it together with a
+	// non-zero Leeway is an error, so the two cannot silently disagree.
 	//
-	// Setting it together with a non-zero Leeway is an error, so the two cannot
-	// silently disagree about which policy applies.
+	// IMPORTANT for anyone setting this for parity with a validator that has no
+	// leeway: it applies to nbf and iat as well as exp, and this package checks
+	// iat (a token issued in the future beyond tolerance is rejected) where many
+	// validators do not check it at all. So NEITHER setting is exact parity with
+	// such a validator:
+	//
+	//   - set     → exp and nbf match exactly, but iat becomes zero-tolerance
+	//               where the other validator ignores iat entirely, so IdP clock
+	//               skew that was previously invisible starts failing.
+	//   - unset   → 60s of slack on exp that the other validator does not give.
+	//
+	// Pick based on which mismatch your deployment can absorb. There is
+	// deliberately no separate iat opt-out: adding one before a concrete
+	// deployment needs it would be a speculative knob.
 	DisableLeeway bool
 
 	// MaxJWKSStaleness bounds how long cached JWKS key material stays trusted

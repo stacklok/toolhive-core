@@ -664,8 +664,9 @@ func TestValidateRejection(t *testing.T) {
 		// The token carries kid "rsa-1" but the server publishes ONLY an EC
 		// key under that kid. The kty backstop must filter the EC key out of
 		// the candidate set (an EC key handed to an RS256 verify would be a
-		// confused verification); the refresh then finds nothing, so the
-		// result is unknown_kid.
+		// confused verification). The key IS present under that kid, just
+		// unusable, so the result is key_unsupported rather than unknown_kid —
+		// the distinction that tells an operator to look at the key, not the kid.
 		ecKey := mintEC(t, "rsa-1")
 		js := newJWKSServer(t, ecKey.jwk)
 		v, err := NewValidator(context.Background(), js.configFor())
@@ -675,7 +676,7 @@ func TestValidateRejection(t *testing.T) {
 		rsaKey := mintRSA(t, "rsa-1")
 		token := rsaKey.mint(t, js.srv.URL)
 		_, err = v.Validate(context.Background(), token)
-		requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
+		requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
 	})
 
 	t.Run("P-384 key not selected for ES256 token (curve confusion)", func(t *testing.T) {
@@ -693,7 +694,7 @@ func TestValidateRejection(t *testing.T) {
 		signing := mintEC(t, "ec-1")
 		token := signing.mint(t, js.srv.URL)
 		_, err = v.Validate(context.Background(), token)
-		requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
+		requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
 	})
 
 	t.Run("RSA key not selected for ES256 token", func(t *testing.T) {
@@ -709,7 +710,7 @@ func TestValidateRejection(t *testing.T) {
 		ecKey := mintEC(t, "ec-1")
 		token := ecKey.mint(t, js.srv.URL)
 		_, err = v.Validate(context.Background(), token)
-		requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
+		requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
 	})
 
 	t.Run("signed token without alg header is unsupported_alg", func(t *testing.T) {
@@ -735,13 +736,14 @@ func TestValidateRejection(t *testing.T) {
 		requireAuthnError(t, err, CodeInvalidToken, ReasonUnsupportedAlg)
 	})
 
-	t.Run("kid-less token with no alg-eligible key is signature", func(t *testing.T) {
+	t.Run("kid-less token with no alg-eligible key is key_unsupported", func(t *testing.T) {
 		t.Parallel()
 		// The JWKS holds only a P-256 EC key, ineligible for the RS256 token,
-		// so the candidate set is empty. With NO kid in the header the H1
-		// refresh path is skipped (kid == ""), the keyfunc returns an empty
-		// VerificationKeySet, golang-jwt reports ErrTokenUnverifiable, and
-		// mapParseError (kidSeen=false) maps it to ReasonSignature.
+		// so the candidate set is empty. Without a kid every key is examined and
+		// every one is rejected, so the filter can say WHY — which beats the
+		// previous behaviour of falling through to an empty VerificationKeySet
+		// and reporting ReasonSignature for a token whose signature was never
+		// checked against anything.
 		ecKey := mintEC(t, "ec-1")
 		js := newJWKSServer(t, ecKey.jwk)
 		v, err := NewValidator(context.Background(), js.configFor())
@@ -751,34 +753,39 @@ func TestValidateRejection(t *testing.T) {
 		rsaKey := mintRSA(t, "rsa-1")
 		token := rsaKey.mint(t, js.srv.URL, withKid(""))
 		_, err = v.Validate(context.Background(), token)
-		requireAuthnError(t, err, CodeInvalidToken, ReasonSignature)
+		requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
 	})
 
-	t.Run("kid matching only an alg-ineligible key is unknown_kid", func(t *testing.T) {
+	t.Run("kid matching only an ineligible key is key_unsupported, with no fetch", func(t *testing.T) {
 		t.Parallel()
-		// Same empty candidate set as above, but the token CARRIES a kid that
-		// matches the ineligible key, so verificationKeys DOES fire the H1
-		// recovery (len(keys)==0 && kid!=""): it fetches once, negatively
-		// caches the kid, and returns its own ReasonUnknownKID *Error (the
-		// ErrTokenUnverifiable kidSeen=true branch in mapParseError is never
-		// reached on this path). Any later attempt with the same kid is
-		// rejected straight from the negative cache — no further fetch.
+		// The token carries a kid that MATCHES a key in the JWKS, but that key is
+		// ineligible for the token's alg. This used to fire the unknown-kid
+		// recovery — a JWKS fetch and a negative-cache entry — and then report
+		// unknown_kid, which is doubly wrong: the kid is known, and refreshing
+		// cannot change a key's type or strength.
+		//
+		// It now reports key_unsupported immediately and performs NO fetch at
+		// all. The absence of the fetch is the point: an unusable key is a
+		// permanent condition, so paying a network round-trip per request for it
+		// was pure waste.
 		ecKey := mintEC(t, "ec-1")
 		js := newJWKSServer(t, ecKey.jwk)
 		v, err := NewValidator(context.Background(), js.configFor())
 		require.NoError(t, err)
 		t.Cleanup(v.Close)
+		js.settle(t)
+		baseline := js.hits.Load()
 
 		rsaKey := mintRSA(t, "ec-1")
 		token := rsaKey.mint(t, js.srv.URL)
 		_, err = v.Validate(context.Background(), token)
-		requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
+		requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
+		assert.Equal(t, baseline, js.hits.Load(),
+			"an ineligible key is permanent: it must not trigger a recovery fetch")
 
-		afterFirst := js.hits.Load()
 		_, err = v.Validate(context.Background(), token)
-		requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
-		assert.Equal(t, afterFirst, js.hits.Load(),
-			"a negatively-cached kid must not trigger another refresh fetch")
+		requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
+		assert.Equal(t, baseline, js.hits.Load(), "still no fetch on a repeat attempt")
 	})
 
 	t.Run("use eligibility", func(t *testing.T) {
@@ -811,8 +818,11 @@ func TestValidateRejection(t *testing.T) {
 				token := key.mint(t, js.srv.URL)
 				_, err = v.Validate(context.Background(), token)
 				if tt.wantErr {
-					// The key is filtered out, so the kid resolves to nothing.
-					requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
+					// The key is present under that kid but not published for
+					// verification, so the failure names the `use` problem
+					// instead of implying the kid is unknown.
+					requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
+					assert.Contains(t, err.Error(), "use")
 					return
 				}
 				require.NoError(t, err)
@@ -1426,10 +1436,12 @@ func TestKeyOpsFilter(t *testing.T) {
 	_, err = v.Validate(context.Background(), token)
 	require.NoError(t, err, "key_ops containing verify must be eligible")
 
-	// The sign-only key does not: no eligible candidate for kid "sign-only".
+	// The sign-only key does not. The key is present under that kid, so the
+	// failure names the key_ops problem rather than pointing at the kid.
 	token2 := signOnly.mint(t, js.srv.URL)
 	_, err = v.Validate(context.Background(), token2)
-	requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
+	requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
+	assert.Contains(t, err.Error(), "key_ops")
 }
 
 // TestKeyAlgFilter covers RFC 8725 §3.9: a JWK that declares alg must match
@@ -1445,11 +1457,12 @@ func TestKeyAlgFilter(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(v.Close)
 
-	// RS256 token against a key declaring RS384 → alg mismatch → filtered →
-	// unknown_kid after refresh.
+	// RS256 token against a key declaring RS384 → alg mismatch → filtered, and
+	// reported as key_unsupported naming the declared-alg disagreement.
 	token := declared.mint(t, js.srv.URL, withMethod(jwt.SigningMethodRS256, declared.priv))
 	_, err = v.Validate(context.Background(), token)
-	requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
+	requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
+	assert.Contains(t, err.Error(), "alg")
 }
 
 // TestKeyExportEdgeCases unit-tests the internal key helpers directly. The
@@ -1463,7 +1476,7 @@ func TestKeyExportEdgeCases(t *testing.T) {
 	rsaKey := mintRSA(t, "rsa-1")
 
 	// Non-RS/PS/ES algs hit the default (defensive) branches.
-	assert.False(t, keyTypeMatchesAlg(ecKey.jwk, "HS256"))
+	assert.Equal(t, rejectKeyType, keyTypeMatchesAlg(ecKey.jwk, "HS256"))
 	assert.False(t, curveMatchesAlg("P-256", "HS256"))
 	_, err := exportKey(rsaKey.jwk, "HS256")
 	assert.Error(t, err, "off-allowlist alg must fail export")
@@ -1979,8 +1992,11 @@ func TestWeakRSAKeyRejected(t *testing.T) {
 	t.Cleanup(v.Close)
 
 	_, err = v.Validate(context.Background(), weak.mint(t, js.srv.URL))
-	// The key is filtered out as a candidate, so the kid resolves to nothing.
-	requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
+	// The key is present under that kid but below the strength floor, so the
+	// failure names the strength problem rather than pointing at the kid.
+	requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
+	assert.Contains(t, err.Error(), "2048-bit minimum",
+		"the log-side detail must name the actual cause")
 }
 
 // TestStrongRSAKeyStillAccepted is the control for the floor.
@@ -2146,4 +2162,73 @@ func TestParseBearerChecksLengthBeforeScanning(t *testing.T) {
 		"the O(1) length bound must run before the O(n) character scan")
 	// And the credential still never appears in the error.
 	assert.NotContains(t, err.Error(), "\x00")
+}
+
+// TestKeyUnsupportedVsUnknownKID pins the distinction the reason exists for. It
+// has to hold in BOTH directions: a key that is present-but-unusable must not be
+// reported as an unknown kid, and a genuinely absent kid must not start being
+// reported as an unsupported key.
+func TestKeyUnsupportedVsUnknownKID(t *testing.T) {
+	t.Parallel()
+
+	weak := mintRSABits(t, "present-but-weak", 1024)
+	js := newJWKSServer(t, weak.jwk)
+	v, err := NewValidator(context.Background(), js.configFor())
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	t.Run("present but unusable is key_unsupported", func(t *testing.T) {
+		t.Parallel()
+		_, err := v.Validate(context.Background(), weak.mint(t, js.srv.URL))
+		requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
+	})
+
+	t.Run("genuinely absent kid is still unknown_kid", func(t *testing.T) {
+		t.Parallel()
+		stranger := mintRSA(t, "no-such-kid")
+		_, err := v.Validate(context.Background(), stranger.mint(t, js.srv.URL))
+		requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
+	})
+}
+
+// TestKeyUnsupportedDetailIsLogSafe guards the boundary the reason-threading
+// could have widened by accident: the cause reaches Error(), which is documented
+// as log-safe, so it must name a PROPERTY of the key and never key material,
+// JWKS contents, or unescaped attacker input.
+func TestKeyUnsupportedDetailIsLogSafe(t *testing.T) {
+	t.Parallel()
+
+	// A 1024-bit key: its modulus is the most obvious thing that could leak.
+	weak := mintRSABits(t, "weak", 1024)
+	js := newJWKSServer(t, weak.jwk)
+	v, err := NewValidator(context.Background(), js.configFor())
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	_, err = v.Validate(context.Background(), weak.mint(t, js.srv.URL))
+	requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
+	detail := err.Error()
+
+	assert.NotContains(t, detail, weak.priv.N.String(), "the modulus must never appear")
+	for _, ctrl := range []string{"\r", "\n", "\x00"} {
+		assert.NotContains(t, detail, ctrl, "no control characters in a log-safe detail")
+	}
+	// It should still be useful: the cause has to be in there.
+	assert.Contains(t, detail, "2048-bit minimum")
+}
+
+// TestKeyRejectionStringsAreSafe checks every cause string directly, so a future
+// value added to the enum cannot quietly introduce something unsafe or empty.
+func TestKeyRejectionStringsAreSafe(t *testing.T) {
+	t.Parallel()
+
+	for r := rejectNone; r <= rejectExport; r++ {
+		s := r.String()
+		assert.NotEmpty(t, s, "cause %d must describe itself", r)
+		for _, ctrl := range []string{"\r", "\n", "\x00", "\x1b"} {
+			assert.NotContains(t, s, ctrl, "cause %d must be log-safe", r)
+		}
+	}
+	// The zero value must not read as a failure, since it means "eligible".
+	assert.Equal(t, "eligible", rejectNone.String())
 }

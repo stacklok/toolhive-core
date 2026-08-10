@@ -98,6 +98,18 @@ const (
 	// ReasonKeysUnavailable indicates the key material source (e.g. JWKS
 	// endpoint) could not be fetched; paired with CodeUnavailable.
 	ReasonKeysUnavailable Reason = "keys_unavailable"
+	// ReasonKeyUnsupported indicates a key matching the token WAS found, but is
+	// not usable to verify it — a sub-2048-bit RSA modulus, a `use` that is not
+	// `sig`, `key_ops` without `verify`, a declared `alg` that disagrees with the
+	// token, or a key type/curve inconsistent with the token's alg.
+	//
+	// It is distinct from ReasonUnknownKID on purpose, and the distinction is
+	// operational rather than cosmetic: unknown_kid says "rotate or re-check the
+	// kid", while this says "the key is right there and your configuration or
+	// key material is the problem". Reporting the former for the latter sends an
+	// operator hunting the wrong fault. The specific cause is in the log-only
+	// detail, never on the wire.
+	ReasonKeyUnsupported Reason = "key_unsupported"
 	// ReasonKeysStale indicates cached key material is older than the
 	// configured Config.MaxJWKSStaleness and a fresh fetch did not succeed, so
 	// it is no longer trusted; paired with CodeUnavailable.

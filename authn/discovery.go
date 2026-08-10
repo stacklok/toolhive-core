@@ -123,7 +123,9 @@ func (v *Validator) discoverJWKSURI(ctx context.Context, issuer string) (string,
 	// served, so they are marked non-transient: retrying re-fetches the same
 	// unacceptable answer.
 	if doc.Issuer != issuer {
-		return "", fmt.Errorf("authn: OIDC discovery document issuer %q does not match configured issuer %q: %w",
+		return "", fmt.Errorf("authn: OIDC discovery document issuer %q does not match configured issuer %q "+
+			"(RFC 8414 §3.3 requires them to be byte-identical; a trailing-slash difference is the usual cause, "+
+			"and is NOT folded because folding would accept a non-conformant document): %w",
 			doc.Issuer, issuer, errDiscoveryNotTransient)
 	}
 

@@ -47,6 +47,55 @@ const (
 	minRSAKeyBits = 2048
 )
 
+// keyRejection records WHY a key that was otherwise a candidate was filtered
+// out. It exists so an empty candidate set can distinguish "no key carries that
+// kid" from "the key is present and unusable" — without it, a legacy 1024-bit
+// key in the JWKS surfaces as unknown_kid and points the operator at the wrong
+// problem entirely.
+//
+// Values are coarse by design. They name a PROPERTY of the key, never key
+// material or JWKS contents, because the string reaches Error(), which is
+// documented as log-safe. Key sizes and use/alg declarations are public
+// information — a JWKS is a public document — but the bytes are not, and
+// nothing here renders them.
+type keyRejection uint8
+
+const (
+	// rejectNone means the key is eligible.
+	rejectNone keyRejection = iota
+	rejectKeyUse
+	rejectKeyOps
+	rejectDeclaredAlg
+	rejectKeyType
+	rejectCurve
+	rejectWeakRSA
+	rejectExport
+)
+
+// String returns a short, log-safe description of the rejection cause.
+func (r keyRejection) String() string {
+	switch r {
+	case rejectNone:
+		return "eligible"
+	case rejectKeyUse:
+		return `key "use" is not "sig"`
+	case rejectKeyOps:
+		return `key "key_ops" does not include "verify"`
+	case rejectDeclaredAlg:
+		return `key declares a different "alg" than the token`
+	case rejectKeyType:
+		return "key type is not usable with the token's alg"
+	case rejectCurve:
+		return "key curve does not match the token's alg"
+	case rejectWeakRSA:
+		return "RSA key is shorter than the 2048-bit minimum (RFC 7518 §3.3)"
+	case rejectExport:
+		return "key could not be decoded"
+	default:
+		return "key is unusable"
+	}
+}
+
 // allowedAlgs is the hardcoded signature-algorithm allowlist. `none` and all
 // HMAC algs are excluded (RFC 8725 §3.1/§3.2 — HMAC with a public JWKS is the
 // algorithm-confusion attack). Excluding EdDSA (Ed25519/Ed448) is a policy
@@ -528,19 +577,10 @@ func (v *Validator) verificationKeys(ctx context.Context, kid, alg string) (any,
 				v.jwksURL, v.staleness().Round(time.Second), v.cfg.MaxJWKSStaleness)}
 	}
 
-	set, err := v.jwksCache.Lookup(ctx, v.jwksURL)
+	keys, err := v.lookupCandidates(ctx, kid, alg, "")
 	if err != nil {
-		// "Registered but first fetch pending" is reported distinctly; any
-		// other lookup failure also means key material is unreachable.
-		if errors.Is(err, httprc.ErrNotReady()) {
-			return nil, &Error{Code: CodeUnavailable, Reason: ReasonKeysUnavailable,
-				err: fmt.Errorf("JWKS fetch pending for %s: %w", v.jwksURL, err)}
-		}
-		return nil, &Error{Code: CodeUnavailable, Reason: ReasonKeysUnavailable,
-			err: fmt.Errorf("JWKS unavailable for %s: %w", v.jwksURL, err)}
+		return nil, err
 	}
-
-	keys := candidateKeys(set, kid, alg)
 	if len(keys) == 0 && kid != "" {
 		// H1 unknown-kid recovery: one serialized refresh, then re-resolve.
 		// The negative cache suppresses a refresh for a kid we have already
@@ -560,12 +600,10 @@ func (v *Validator) verificationKeys(ctx context.Context, kid, alg string) (any,
 			return nil, &Error{Code: CodeUnavailable, Reason: ReasonKeysUnavailable,
 				err: fmt.Errorf("JWKS refresh for unknown kid %q failed: %w", kid, refreshErr)}
 		}
-		set, err = v.jwksCache.Lookup(ctx, v.jwksURL)
+		keys, err = v.lookupCandidates(ctx, kid, alg, " after refresh")
 		if err != nil {
-			return nil, &Error{Code: CodeUnavailable, Reason: ReasonKeysUnavailable,
-				err: fmt.Errorf("JWKS unavailable for %s after refresh: %w", v.jwksURL, err)}
+			return nil, err
 		}
-		keys = candidateKeys(set, kid, alg)
 		if len(keys) == 0 {
 			// Only record the kid as bad when a fetch actually happened. If
 			// refreshOnce skipped the fetch (inside refreshFloor), proceed to
@@ -588,7 +626,7 @@ func (v *Validator) verificationKeys(ctx context.Context, kid, alg string) (any,
 // also true on a miss when there is no JWKS to fall back to. A false handled
 // with a nil error means "provider missed, try the JWKS".
 func (v *Validator) providerKeySet(ctx context.Context, kid, alg string) (any, bool, error) {
-	local, err := v.keysFromProvider(ctx, kid, alg)
+	local, why, err := v.keysFromProvider(ctx, kid, alg)
 	if err != nil {
 		return nil, true, err
 	}
@@ -598,6 +636,14 @@ func (v *Validator) providerKeySet(ctx context.Context, kid, alg string) (any, b
 			set.Keys = append(set.Keys, k)
 		}
 		return set, true, nil
+	}
+	// The provider offered a key for this kid but it is unusable — a weak
+	// modulus, a declared alg that disagrees, a malformed key. That is permanent
+	// and specific, so report it instead of falling through to the JWKS and
+	// eventually reporting unknown_kid for a key that is right here.
+	if why != rejectNone {
+		return nil, true, &Error{Code: CodeInvalidToken, Reason: ReasonKeyUnsupported,
+			err: fmt.Errorf("key provider offered no usable key for alg %q: %s", alg, why)}
 	}
 	// Provider miss. When there is no JWKS to fall back to (an embedded issuer
 	// with no reachable endpoint), report the kid as unknown rather than falling
@@ -609,10 +655,48 @@ func (v *Validator) providerKeySet(ctx context.Context, kid, alg string) (any, b
 	return nil, false, nil
 }
 
+// lookupCandidates reads the cached JWKS and resolves eligible candidates,
+// converting both failure shapes into the package's *Error.
+//
+// It returns an empty slice with a nil error for the one case the caller must
+// handle itself: nothing matched the kid, which is recoverable by a refresh. A
+// key that was FOUND and rejected as ineligible is not recoverable — no refresh
+// changes a 1024-bit modulus or a `use: enc` — so that is reported here as
+// ReasonKeyUnsupported rather than left to the caller's unknown-kid path, which
+// would otherwise spend a fetch and a negative-cache entry on it per request.
+//
+// stage is appended to the detail message ("" or " after refresh") so the two
+// call sites stay distinguishable in a log.
+func (v *Validator) lookupCandidates(ctx context.Context, kid, alg, stage string) ([]jwk.Key, error) {
+	set, err := v.jwksCache.Lookup(ctx, v.jwksURL)
+	if err != nil {
+		// "Registered but first fetch pending" is reported distinctly; any
+		// other lookup failure also means key material is unreachable.
+		if errors.Is(err, httprc.ErrNotReady()) {
+			return nil, &Error{Code: CodeUnavailable, Reason: ReasonKeysUnavailable,
+				err: fmt.Errorf("JWKS fetch pending for %s: %w", v.jwksURL, err)}
+		}
+		return nil, &Error{Code: CodeUnavailable, Reason: ReasonKeysUnavailable,
+			err: fmt.Errorf("JWKS unavailable for %s%s: %w", v.jwksURL, stage, err)}
+	}
+
+	keys, why := candidateKeys(set, kid, alg)
+	if len(keys) == 0 && why != rejectNone {
+		return nil, &Error{Code: CodeInvalidToken, Reason: ReasonKeyUnsupported,
+			err: fmt.Errorf("no usable key for alg %q%s: %s", alg, stage, why)}
+	}
+	return keys, nil
+}
+
 // candidateKeys filters the JWKS set down to the keys eligible to verify a
 // token with the given kid/alg, bounded to maxKeyCandidates.
-func candidateKeys(set jwk.Set, kid, alg string) []jwk.Key {
+func candidateKeys(set jwk.Set, kid, alg string) ([]jwk.Key, keyRejection) {
 	var out []jwk.Key
+	// why records the cause for a key that MATCHED the kid filter but was then
+	// found ineligible. It is what lets verificationKeys distinguish "no key
+	// carries that kid" from "the key is here and unusable"; the first cause wins,
+	// since reporting one concrete reason beats summarising several.
+	why := rejectNone
 	for i := range set.Len() {
 		key, ok := set.Key(i)
 		if !ok {
@@ -625,7 +709,10 @@ func candidateKeys(set jwk.Set, kid, alg string) []jwk.Key {
 				continue
 			}
 		}
-		if !keyEligible(key, alg) {
+		if r := keyEligible(key, alg); r != rejectNone {
+			if why == rejectNone {
+				why = r
+			}
 			continue
 		}
 		out = append(out, key)
@@ -633,17 +720,21 @@ func candidateKeys(set jwk.Set, kid, alg string) []jwk.Key {
 	if len(out) > maxKeyCandidates {
 		out = out[:maxKeyCandidates]
 	}
-	return out
+	if len(out) > 0 {
+		// Something is usable, so any rejection along the way is not a failure.
+		return out, rejectNone
+	}
+	return out, why
 }
 
 // keyEligible applies the candidate filters: use/key_ops/alg eligibility plus
 // the kty-vs-alg backstop.
-func keyEligible(key jwk.Key, alg string) bool {
+func keyEligible(key jwk.Key, alg string) keyRejection {
 	// use, when present, must be exactly "sig" (RFC 7517 §4.2 makes use
 	// optional, but a present value that isn't sig — "enc" or anything else —
 	// means the key was not published for verification). An absent use passes.
 	if use, hasUse := key.KeyUsage(); hasUse && use != string(jwk.ForSignature) {
-		return false
+		return rejectKeyUse
 	}
 	// key_ops, when present, must contain "verify" (RFC 7517 §4.3).
 	if ops, hasOps := key.KeyOps(); hasOps {
@@ -655,12 +746,12 @@ func keyEligible(key jwk.Key, alg string) bool {
 			}
 		}
 		if !verify {
-			return false
+			return rejectKeyOps
 		}
 	}
 	// A JWK that declares alg must match the token's alg (RFC 8725 §3.9).
 	if keyAlg, hasAlg := key.Algorithm(); hasAlg && keyAlg.String() != alg {
-		return false
+		return rejectDeclaredAlg
 	}
 	// Key-type backstop for JWKs that omit alg: the kty (and for EC the
 	// curve) must be consistent with the token's alg. Without this an EC key
@@ -668,54 +759,55 @@ func keyEligible(key jwk.Key, alg string) bool {
 	return keyTypeMatchesAlg(key, alg)
 }
 
-// keyTypeMatchesAlg enforces kty/curve consistency with the token alg.
-func keyTypeMatchesAlg(key jwk.Key, alg string) bool {
+// keyTypeMatchesAlg enforces kty/curve consistency with the token alg, reporting
+// the rejection cause so an empty candidate set stays diagnosable.
+func keyTypeMatchesAlg(key jwk.Key, alg string) keyRejection {
 	switch {
 	case strings.HasPrefix(alg, "RS") || strings.HasPrefix(alg, "PS"):
 		if key.KeyType().String() != "RSA" {
-			return false
+			return rejectKeyType
 		}
 		// Export to reach the modulus: the strength floor cannot be checked from
 		// the JWK's metadata alone.
 		var raw rsa.PublicKey
 		if err := jwk.Export(key, &raw); err != nil {
-			return false
+			return rejectExport
 		}
 		// A successful Export should always populate N; this guard is
 		// defence-in-depth against a nil-pointer panic on BitLen, not a known
 		// reachable path.
 		if raw.N == nil {
-			return false
+			return rejectExport
 		}
-		return raw.N.BitLen() >= minRSAKeyBits
+		if raw.N.BitLen() < minRSAKeyBits {
+			return rejectWeakRSA
+		}
+		return rejectNone
 	case strings.HasPrefix(alg, "ES"):
 		if key.KeyType().String() != "EC" {
-			return false
+			return rejectKeyType
 		}
 		var raw ecdsa.PublicKey
 		if err := jwk.Export(key, &raw); err != nil {
-			return false
+			return rejectExport
 		}
-		// Same defence-in-depth as the RSA branch above, and for the same
-		// reason: a successful Export should always populate Curve, but calling
-		// Params() on a nil Curve is a nil-interface method call and panics.
-		// The three sibling sites (RSA here, and both branches in
-		// keyprovider.go) guard this; leaving one unguarded is the defect, not
-		// the reachability.
 		// The Curve nil-check must precede Params(): the promoted raw.Params()
 		// IS raw.Curve.Params(), so it panics on a nil Curve just the same.
 		if raw.Curve == nil {
-			return false
+			return rejectExport
 		}
 		params := raw.Params()
 		if params == nil {
-			return false
+			return rejectExport
 		}
-		return curveMatchesAlg(params.Name, alg)
+		if !curveMatchesAlg(params.Name, alg) {
+			return rejectCurve
+		}
+		return rejectNone
 	default:
 		// Unreachable via Validate: the alg gate rejects any alg off the
 		// allowlist (RS/PS/ES only) before a keyfunc runs.
-		return false
+		return rejectKeyType
 	}
 }
 

@@ -68,8 +68,11 @@ type PublicKey struct {
 // disagrees with the token, or whose Go type is inconsistent with the token's
 // alg family, is skipped rather than handed to the verifier. Without the type
 // backstop an ECDSA key could be offered to an RS256 verification path.
-func providerCandidates(keys []PublicKey, kid, alg string) []crypto.PublicKey {
+func providerCandidates(keys []PublicKey, kid, alg string) ([]crypto.PublicKey, keyRejection) {
 	var out []crypto.PublicKey
+	// why mirrors candidateKeys: the cause for a key that matched the kid filter
+	// but was then found ineligible, so an empty set stays diagnosable.
+	why := rejectNone
 	for _, pk := range keys {
 		// A key that declares a kid must match the token's kid when the token
 		// carries one. A key with no kid is always a candidate: an embedded
@@ -78,9 +81,15 @@ func providerCandidates(keys []PublicKey, kid, alg string) []crypto.PublicKey {
 			continue
 		}
 		if pk.Alg != "" && pk.Alg != alg {
+			if why == rejectNone {
+				why = rejectDeclaredAlg
+			}
 			continue
 		}
-		if !providerKeyTypeMatchesAlg(pk.Key, alg) {
+		if r := providerKeyTypeMatchesAlg(pk.Key, alg); r != rejectNone {
+			if why == rejectNone {
+				why = r
+			}
 			continue
 		}
 		out = append(out, pk.Key)
@@ -88,52 +97,68 @@ func providerCandidates(keys []PublicKey, kid, alg string) []crypto.PublicKey {
 			break
 		}
 	}
-	return out
+	if len(out) > 0 {
+		return out, rejectNone
+	}
+	return out, why
 }
 
 // providerKeyTypeMatchesAlg enforces that a provider key's Go type is consistent
 // with the token's alg family. It is the KeyProvider analogue of
 // keyTypeMatchesAlg, which does the same job for a jwk.Key.
-func providerKeyTypeMatchesAlg(key crypto.PublicKey, alg string) bool {
+func providerKeyTypeMatchesAlg(key crypto.PublicKey, alg string) keyRejection {
 	switch {
 	case strings.HasPrefix(alg, "RS"), strings.HasPrefix(alg, "PS"):
 		pub, ok := key.(*rsa.PublicKey)
-		// A KeyProvider is caller-implemented, so a nil pointer or a zero-value
-		// key (nil N) is a malformed-config bug, not a trusted input; treat it
-		// as ineligible rather than let BitLen panic on it.
-		if !ok || pub == nil || pub.N == nil {
-			return false
+		// Guard the dereferences: a nil pointer or nil modulus panics in
+		// big.Int.BitLen, and PublicKeys is called per validation, so a buggy
+		// provider would crash the request path rather than fail a token.
+		if !ok || pub == nil {
+			return rejectKeyType
+		}
+		if pub.N == nil {
+			return rejectExport
 		}
 		// Same RFC 7518 §3.3 strength floor as the JWKS path: an in-process key
 		// source is trusted, but not trusted to be correctly configured.
-		return pub.N.BitLen() >= minRSAKeyBits
+		if pub.N.BitLen() < minRSAKeyBits {
+			return rejectWeakRSA
+		}
+		return rejectNone
 	case strings.HasPrefix(alg, "ES"):
 		pub, ok := key.(*ecdsa.PublicKey)
 		// Same reasoning as the RSA branch: guard against a nil pointer or a
 		// nil/unset Curve before calling Params(), which would otherwise panic
 		// on the nil interface method call.
-		if !ok || pub == nil || pub.Curve == nil {
-			return false
+		if !ok || pub == nil {
+			return rejectKeyType
+		}
+		if pub.Curve == nil {
+			return rejectExport
 		}
 		params := pub.Params()
 		if params == nil {
-			return false
+			return rejectExport
 		}
-		return curveMatchesAlg(params.Name, alg)
+		if !curveMatchesAlg(params.Name, alg) {
+			return rejectCurve
+		}
+		return rejectNone
 	default:
 		// Unreachable via Validate: the alg gate admits only RS/PS/ES.
-		return false
+		return rejectKeyType
 	}
 }
 
 // keysFromProvider asks the provider for candidates. A provider error is
 // reported as CodeUnavailable, not as an invalid token: the verifier could not
 // make a determination, exactly as with an unreachable JWKS.
-func (v *Validator) keysFromProvider(ctx context.Context, kid, alg string) ([]crypto.PublicKey, error) {
+func (v *Validator) keysFromProvider(ctx context.Context, kid, alg string) ([]crypto.PublicKey, keyRejection, error) {
 	keys, err := v.cfg.KeyProvider.PublicKeys(ctx)
 	if err != nil {
-		return nil, &Error{Code: CodeUnavailable, Reason: ReasonKeysUnavailable,
+		return nil, rejectNone, &Error{Code: CodeUnavailable, Reason: ReasonKeysUnavailable,
 			err: fmt.Errorf("key provider failed: %w", err)}
 	}
-	return providerCandidates(keys, kid, alg), nil
+	candidates, why := providerCandidates(keys, kid, alg)
+	return candidates, why, nil
 }
