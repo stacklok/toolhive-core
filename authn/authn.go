@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/lestrrat-go/httprc/v3"
 	"github.com/lestrrat-go/jwx/v3/jwk"
@@ -25,9 +26,9 @@ const (
 	// maxLeeway is the largest accepted Config.Leeway. A tolerance beyond
 	// this stops being "skew" and starts extending token lifetimes.
 	maxLeeway = 2 * time.Minute
-	// defaultMaxTokenLifetime is the maximum accepted exp-iat span when
-	// Config.MaxTokenLifetime is zero.
-	defaultMaxTokenLifetime = 24 * time.Hour
+	// maxAudienceLength bounds a single Config.Audiences entry. Audiences are
+	// identifiers, not documents; 1 KiB is far above any real value.
+	maxAudienceLength = 1 << 10
 	// maxResponseBody caps discovery and JWKS response bodies. jwx reads the
 	// body itself (up to ~1GB); 1 MiB is generous for any legitimate JWKS or
 	// discovery document.
@@ -60,18 +61,35 @@ const schemeHTTPS = "https"
 type Config struct {
 	// Issuer is the expected iss claim value. When JWKSURL is empty it is
 	// also the base for OIDC discovery ({Issuer}/.well-known/openid-configuration).
-	// Required. Must be an https URI unless InsecureAllowHTTP is set.
+	// Must be an https URI unless InsecureAllowHTTP is set.
+	//
+	// At least one of Issuer or JWKSURL is required. Leaving Issuer EMPTY
+	// (only legal alongside an explicit JWKSURL) DISABLES iss verification
+	// entirely: any issuer that can present a key from the configured JWKS is
+	// accepted. Only do this when the JWKS endpoint itself is the trust
+	// boundary.
 	Issuer string
 
 	// Audiences lists acceptable aud claim values; a token is accepted when
-	// ANY of its aud values matches ANY entry here. Required, non-empty;
-	// each entry must be an absolute URI without a fragment.
+	// ANY of its aud values matches ANY entry here.
 	//
-	// Note: validation requires each entry to be an absolute URI with a host,
-	// so URN-style or bare-identifier audiences (e.g. Azure's GUID audiences)
-	// are rejected by design (fail-closed). This is deliberate; loosen only if
-	// a concrete non-URI audience is required.
+	// Each entry is compared byte-exact against the token's aud values and is
+	// validated only as a bounded, control-character-free string: RFC 7519
+	// §4.1.3 types aud as StringOrURI, so bare identifiers (an OAuth
+	// client_id) and opaque GUIDs (Entra ID) are conformant and accepted.
+	//
+	// Required and non-empty unless AllowAnyAudience is set.
 	Audiences []string
+
+	// AllowAnyAudience disables audience verification. It exists so a
+	// deployment with no audience policy can be expressed explicitly rather
+	// than by leaving Audiences unset, since a silently absent audience check
+	// is how confused-deputy bugs reach production: any token the issuer minted
+	// for ANY relying party is accepted by this resource server.
+	//
+	// Setting it together with a non-empty Audiences is an error, so the two
+	// cannot silently disagree.
+	AllowAnyAudience bool
 
 	// JWKSURL, when set, points directly at the JWKS endpoint and skips OIDC
 	// discovery. Optional. Must be an https URI unless InsecureAllowHTTP is
@@ -83,9 +101,13 @@ type Config struct {
 	// error.
 	Leeway time.Duration
 
-	// MaxTokenLifetime rejects tokens whose exp-iat span exceeds it, when
-	// both claims are present. Zero uses the default of 24h; negative is an
-	// error.
+	// MaxTokenLifetime rejects tokens whose exp-iat span exceeds it, when both
+	// claims are present. Negative is an error.
+	//
+	// Zero DISABLES the check, and is the default: a resource server that
+	// accepts long-lived tokens today (service-account credentials commonly
+	// outlive a day) must not start rejecting them merely by adopting this
+	// package. Set it explicitly to opt into a lifetime bound.
 	MaxTokenLifetime time.Duration
 
 	// HTTPClient is used for discovery and JWKS fetches. When nil a default
@@ -206,20 +228,21 @@ func (v *Validator) Close() {
 
 // validate checks cfg and fills in defaults, performing no I/O.
 func (c *Config) validate() error {
-	if c.Issuer == "" {
-		return fmt.Errorf("authn: issuer is required")
+	// At least one of Issuer/JWKSURL is required: the issuer is what discovery
+	// resolves the JWKS URL from, so with neither there is no key material to
+	// reach. An Issuer-less config is permitted (and skips iss verification) so
+	// a static-JWKS deployment can be expressed; see the Config.Issuer docs.
+	if c.Issuer == "" && c.JWKSURL == "" {
+		return fmt.Errorf("authn: at least one of issuer or jwks_url is required")
 	}
-	if err := validateHTTPSURI("issuer", c.Issuer, c.InsecureAllowHTTP); err != nil {
-		return err
+	if c.Issuer != "" {
+		if err := validateHTTPSURI("issuer", c.Issuer, c.InsecureAllowHTTP); err != nil {
+			return err
+		}
 	}
 
-	if len(c.Audiences) == 0 {
-		return fmt.Errorf("authn: at least one audience is required")
-	}
-	for i, aud := range c.Audiences {
-		if err := httpvalidation.ValidateResourceURI(aud); err != nil {
-			return fmt.Errorf("authn: audiences[%d]: %w", i, err)
-		}
+	if err := c.validateAudiences(); err != nil {
+		return err
 	}
 
 	if c.JWKSURL != "" {
@@ -237,13 +260,59 @@ func (c *Config) validate() error {
 		return fmt.Errorf("authn: leeway %s exceeds maximum %s", c.Leeway, maxLeeway)
 	}
 
-	switch {
-	case c.MaxTokenLifetime < 0:
+	// Zero means "no lifetime bound"; it is NOT defaulted. A default cap would
+	// reject long-lived tokens that a resource server accepts today, so opting
+	// in is the caller's decision.
+	if c.MaxTokenLifetime < 0 {
 		return fmt.Errorf("authn: max token lifetime must not be negative: %s", c.MaxTokenLifetime)
-	case c.MaxTokenLifetime == 0:
-		c.MaxTokenLifetime = defaultMaxTokenLifetime
 	}
 
+	return nil
+}
+
+// validateAudiences checks the audience policy: exactly one of a non-empty
+// Audiences list or AllowAnyAudience must be chosen, and every entry must be a
+// safe bounded string.
+//
+// An empty audience list disables audience verification entirely, so it is
+// gated behind AllowAnyAudience rather than being the accidental result of
+// leaving a field unset.
+func (c *Config) validateAudiences() error {
+	switch {
+	case len(c.Audiences) == 0 && !c.AllowAnyAudience:
+		return fmt.Errorf("authn: at least one audience is required (set AllowAnyAudience to disable audience verification)")
+	case len(c.Audiences) > 0 && c.AllowAnyAudience:
+		return fmt.Errorf("authn: AllowAnyAudience must not be set together with %d configured audience(s)", len(c.Audiences))
+	}
+	for i, aud := range c.Audiences {
+		if err := validateAudience(aud); err != nil {
+			return fmt.Errorf("authn: audiences[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// validateAudience checks a single Config.Audiences entry.
+//
+// RFC 7519 §4.1.3 types aud as StringOrURI, so an audience need NOT be a URI:
+// bare identifiers (an OAuth client_id) and opaque GUIDs (Entra ID) are
+// conformant and common. The check is therefore a bounded-string one — length
+// plus injection-safety — not a URI-shape one.
+func validateAudience(aud string) error {
+	if aud == "" {
+		return fmt.Errorf("audience must not be empty")
+	}
+	if len(aud) > maxAudienceLength {
+		return fmt.Errorf("audience length %d exceeds %d byte limit", len(aud), maxAudienceLength)
+	}
+	// Audiences are compared against token claims and may be echoed into logs
+	// or headers by consumers; reject CR/LF and other control characters for
+	// the same reason validation/http rejects them in header values.
+	for _, r := range aud {
+		if r == '\r' || r == '\n' || unicode.IsControl(r) {
+			return fmt.Errorf("audience must not contain control characters: %q", aud)
+		}
+	}
 	return nil
 }
 
@@ -281,6 +350,9 @@ func (v *Validator) init(ctx context.Context) error {
 	// jwks_uri discovered from the issuer's OIDC metadata.
 	v.jwksURL = v.cfg.JWKSURL
 	if v.jwksURL == "" {
+		// Config.validate guarantees a non-empty Issuer whenever JWKSURL is
+		// empty, so discovery always has a base to resolve from here.
+		//
 		// Bound the discovery fetch so an unresponsive issuer cannot hang
 		// NewValidator past constructionTimeout.
 		discCtx, cancel := context.WithTimeout(ctx, constructionTimeout)

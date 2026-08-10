@@ -153,7 +153,7 @@ func (v *Validator) Validate(ctx context.Context, token string) (Principal, erro
 	// The same allowlist is enforced again by the parser (WithValidMethods) so
 	// the verified path cannot be bypassed by a header that disagrees with
 	// itself, and so the gate cannot be forgotten by a second key path.
-	parser := jwt.NewParser(
+	opts := []jwt.ParserOption{
 		jwt.WithValidMethods(allowedAlgs),
 		// Strict base64url, no padding (RFC 7515 §2); padding-allowed decode
 		// is the WithPaddingAllowed escape hatch and is NOT enabled.
@@ -164,12 +164,23 @@ func (v *Validator) Validate(ctx context.Context, token string) (Principal, erro
 		jwt.WithLeeway(v.cfg.Leeway),
 		// iat, when present, must not be in the future beyond leeway.
 		jwt.WithIssuedAt(),
+	}
+	// The iss and aud options are added only when configured. golang-jwt treats
+	// an empty expected issuer/audience set as "do not check" anyway, but
+	// appending conditionally keeps the disabled case explicit here rather than
+	// depending on that library behavior. Config.validate has already ensured
+	// an empty Audiences was a deliberate AllowAnyAudience choice and that an
+	// empty Issuer came with an explicit JWKSURL.
+	if v.cfg.Issuer != "" {
 		// iss is compared byte-exact (OIDC Core §3.1.3.2); NO TrimSpace.
-		jwt.WithIssuer(v.cfg.Issuer),
+		opts = append(opts, jwt.WithIssuer(v.cfg.Issuer))
+	}
+	if len(v.cfg.Audiences) > 0 {
 		// aud any-match against the configured set (bare string or array on
 		// the wire).
-		jwt.WithAudience(v.cfg.Audiences...),
-	)
+		opts = append(opts, jwt.WithAudience(v.cfg.Audiences...))
+	}
+	parser := jwt.NewParser(opts...)
 
 	claims := jwt.MapClaims{}
 	// kidSeen records whether the unverified header carried a kid, so the
@@ -205,8 +216,12 @@ func (v *Validator) Validate(ctx context.Context, token string) (Principal, erro
 			err: errors.New("missing or empty sub claim")}
 	}
 
+	// Issuer comes from the VERIFIED claim rather than from Config: when
+	// Config.Issuer is set the parser has already proven they are byte-equal,
+	// and when it is empty (JWKSURL-only, iss verification disabled) the claim
+	// is the only thing that reports who actually issued the token.
 	return Principal{
-		Issuer:  v.cfg.Issuer,
+		Issuer:  stringClaim(claims, "iss"),
 		Subject: sub,
 		Name:    stringClaim(claims, "name"),
 		Claims:  claims,
@@ -315,6 +330,10 @@ func mapParseError(err error, kidSeen bool) error {
 // MaxTokenLifetime, when both claims are present. A token without iat skips
 // the check entirely (many IdPs omit it).
 func (v *Validator) checkLifetime(claims jwt.MapClaims) error {
+	// Zero means the caller opted out of a lifetime bound (the default).
+	if v.cfg.MaxTokenLifetime == 0 {
+		return nil
+	}
 	exp, err := claims.GetExpirationTime()
 	if err != nil || exp == nil {
 		return nil

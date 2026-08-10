@@ -1565,3 +1565,144 @@ func TestRefreshOnceUsesLifetimeContext(t *testing.T) {
 	assert.Equal(t, int32(1), js.hits.Load()-baseline,
 		"the recovery refresh must complete on v.ctx even when the request ctx is canceled mid-fetch")
 }
+
+// --- ToolHive compatibility relaxations (Phase B) --------------------------
+
+// TestIssuerlessValidation covers B1: a JWKSURL-only config (no Issuer) must
+// construct and must validate tokens WITHOUT verifying iss, matching ToolHive,
+// which skips the issuer check when its Issuer is unset (pkg/auth/token.go
+// `if v.issuer != ""`). Principal.Issuer must still report the token's actual
+// iss claim, since Config no longer carries it.
+func TestIssuerlessValidation(t *testing.T) {
+	t.Parallel()
+
+	rsaKey := mintRSA(t, "rsa-1")
+	js := newJWKSServer(t, rsaKey.jwk)
+	cfg := js.configFor()
+	cfg.Issuer = "" // JWKSURL-only: the JWKS endpoint is the trust boundary
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err, "a JWKSURL-only config must construct")
+	t.Cleanup(v.Close)
+
+	t.Run("any issuer accepted", func(t *testing.T) {
+		t.Parallel()
+		token := rsaKey.mint(t, "https://some-other-issuer.example.com")
+		p, err := v.Validate(context.Background(), token)
+		require.NoError(t, err, "iss must not be verified when Issuer is empty")
+		assert.Equal(t, "https://some-other-issuer.example.com", p.Issuer,
+			"Principal.Issuer must come from the verified claim, not Config")
+	})
+
+	t.Run("absent issuer accepted", func(t *testing.T) {
+		t.Parallel()
+		token := rsaKey.mint(t, js.srv.URL, withoutClaim(claimIss))
+		p, err := v.Validate(context.Background(), token)
+		require.NoError(t, err, "a missing iss must be accepted when Issuer is empty")
+		assert.Empty(t, p.Issuer)
+	})
+}
+
+// TestIssuerStillVerifiedWhenConfigured is the other half of B1: relaxing the
+// requirement must not weaken the configured case.
+func TestIssuerStillVerifiedWhenConfigured(t *testing.T) {
+	t.Parallel()
+
+	rsaKey := mintRSA(t, "rsa-1")
+	js := newJWKSServer(t, rsaKey.jwk)
+	v, err := NewValidator(context.Background(), js.configFor())
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	token := rsaKey.mint(t, "https://attacker.example.com")
+	_, err = v.Validate(context.Background(), token)
+	requireAuthnError(t, err, CodeInvalidToken, ReasonIssuer)
+}
+
+// TestAllowAnyAudience covers B2: AllowAnyAudience disables audience
+// verification, matching ToolHive's behavior when its Audience is unset.
+func TestAllowAnyAudience(t *testing.T) {
+	t.Parallel()
+
+	rsaKey := mintRSA(t, "rsa-1")
+	js := newJWKSServer(t, rsaKey.jwk)
+	cfg := js.configFor()
+	cfg.Audiences = nil
+	cfg.AllowAnyAudience = true
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	for _, tt := range []struct {
+		name string
+		opt  mintOption
+	}{
+		{name: "unrelated audience accepted", opt: withClaim(claimAud, "https://someone-elses-api.example.com")},
+		{name: "bare-identifier audience accepted", opt: withClaim(claimAud, "some-client-id")},
+		{name: "absent audience accepted", opt: withoutClaim(claimAud)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := v.Validate(context.Background(), rsaKey.mint(t, js.srv.URL, tt.opt))
+			require.NoError(t, err, "audience must not be verified under AllowAnyAudience")
+		})
+	}
+}
+
+// TestNonURIAudienceMatching covers the other half of B2: non-URI audiences are
+// not merely accepted by config validation, they must actually MATCH a token's
+// aud claim, and a mismatch must still be rejected.
+func TestNonURIAudienceMatching(t *testing.T) {
+	t.Parallel()
+
+	rsaKey := mintRSA(t, "rsa-1")
+	js := newJWKSServer(t, rsaKey.jwk)
+	cfg := js.configFor()
+	cfg.Audiences = []string{"550e8400-e29b-41d4-a716-446655440000", "my-client-id"}
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	t.Run("GUID audience matches", func(t *testing.T) {
+		t.Parallel()
+		token := rsaKey.mint(t, js.srv.URL, withClaim(claimAud, "550e8400-e29b-41d4-a716-446655440000"))
+		_, err := v.Validate(context.Background(), token)
+		require.NoError(t, err)
+	})
+
+	t.Run("second entry matches (any-of)", func(t *testing.T) {
+		t.Parallel()
+		token := rsaKey.mint(t, js.srv.URL, withClaim(claimAud, "my-client-id"))
+		_, err := v.Validate(context.Background(), token)
+		require.NoError(t, err)
+	})
+
+	t.Run("mismatch still rejected", func(t *testing.T) {
+		t.Parallel()
+		token := rsaKey.mint(t, js.srv.URL, withClaim(claimAud, "not-my-client-id"))
+		_, err := v.Validate(context.Background(), token)
+		requireAuthnError(t, err, CodeInvalidToken, ReasonAudience)
+	})
+}
+
+// TestMaxTokenLifetimeDisabledByDefault covers B3: a zero MaxTokenLifetime
+// imposes no exp-iat bound, so a long-lived token that ToolHive accepts today
+// (it has no lifetime check at all) is not rejected merely by adopting authn.
+func TestMaxTokenLifetimeDisabledByDefault(t *testing.T) {
+	t.Parallel()
+
+	rsaKey := mintRSA(t, "rsa-1")
+	js := newJWKSServer(t, rsaKey.jwk)
+	cfg := js.configFor()
+	require.Zero(t, cfg.MaxTokenLifetime, "the test fixture must not set a lifetime bound")
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	// A 30-day span: comfortably beyond the 24h cap that used to be defaulted.
+	iat := time.Now().Add(-time.Hour)
+	token := rsaKey.mint(t, js.srv.URL,
+		withClaim(claimIat, iat.Unix()),
+		withClaim(claimExp, iat.Add(30*24*time.Hour).Unix()))
+	_, err = v.Validate(context.Background(), token)
+	require.NoError(t, err, "a zero MaxTokenLifetime must impose no exp-iat bound")
+}

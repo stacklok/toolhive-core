@@ -19,6 +19,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// wantErrExceeds is the substring shared by the "over a configured limit"
+// errors (leeway, audience length, token length, body cap).
+const wantErrExceeds = "exceeds"
+
 // validConfig returns a Config that passes validation.
 func validConfig() Config {
 	return Config{
@@ -37,9 +41,9 @@ func TestNewValidatorConfigValidation(t *testing.T) {
 		check   func(t *testing.T, cfg Config)
 	}{
 		{
-			name:    "empty issuer",
-			mutate:  func(c *Config) { c.Issuer = "" },
-			wantErr: "issuer is required",
+			name:    "empty issuer AND empty jwks_url rejected",
+			mutate:  func(c *Config) { c.Issuer = ""; c.JWKSURL = "" },
+			wantErr: "at least one of issuer or jwks_url is required",
 		},
 		{
 			name:    "issuer non-https rejected",
@@ -73,19 +77,63 @@ func TestNewValidatorConfigValidation(t *testing.T) {
 			wantErr: "host",
 		},
 		{
-			name:    "empty audiences",
+			name:    "empty audiences without AllowAnyAudience rejected",
 			mutate:  func(c *Config) { c.Audiences = nil },
-			wantErr: "audience",
+			wantErr: "at least one audience is required",
 		},
 		{
-			name:    "audience with fragment",
-			mutate:  func(c *Config) { c.Audiences = []string{"https://api.example.com#frag"} },
-			wantErr: "fragment",
+			// RFC 7519 §4.1.3 types aud as StringOrURI, so a bare identifier
+			// (an OAuth client_id) is conformant and MUST be accepted: this is
+			// the ToolHive-compatibility case.
+			name: "bare-identifier audience accepted",
+			mutate: func(c *Config) {
+				srv := newDiscoveryOnlyServer(t)
+				c.Issuer = srv.URL
+				c.InsecureAllowHTTP = true
+				c.Audiences = []string{"my-client-id"}
+			},
 		},
 		{
-			name:    "audience not absolute URI",
-			mutate:  func(c *Config) { c.Audiences = []string{"api"} },
-			wantErr: "scheme",
+			// Entra ID issues opaque GUID audiences.
+			name: "GUID audience accepted",
+			mutate: func(c *Config) {
+				srv := newDiscoveryOnlyServer(t)
+				c.Issuer = srv.URL
+				c.InsecureAllowHTTP = true
+				c.Audiences = []string{"550e8400-e29b-41d4-a716-446655440000"}
+			},
+		},
+		{
+			name:    "empty audience entry rejected",
+			mutate:  func(c *Config) { c.Audiences = []string{""} },
+			wantErr: "must not be empty",
+		},
+		{
+			name:    "audience with CRLF rejected",
+			mutate:  func(c *Config) { c.Audiences = []string{"https://api.example.com\r\nX: y"} },
+			wantErr: "control characters",
+		},
+		{
+			name:    "over-long audience rejected",
+			mutate:  func(c *Config) { c.Audiences = []string{strings.Repeat("a", maxAudienceLength+1)} },
+			wantErr: wantErrExceeds,
+		},
+		{
+			name: "AllowAnyAudience permits an empty list",
+			mutate: func(c *Config) {
+				srv := newDiscoveryOnlyServer(t)
+				c.Issuer = srv.URL
+				c.InsecureAllowHTTP = true
+				c.Audiences = nil
+				c.AllowAnyAudience = true
+			},
+		},
+		{
+			name: "AllowAnyAudience with a populated list rejected",
+			mutate: func(c *Config) {
+				c.AllowAnyAudience = true
+			},
+			wantErr: "must not be set together with",
 		},
 		{
 			name:    "jwks_url non-https rejected",
@@ -115,7 +163,7 @@ func TestNewValidatorConfigValidation(t *testing.T) {
 		{
 			name:    "leeway above max",
 			mutate:  func(c *Config) { c.Leeway = maxLeeway + time.Second },
-			wantErr: "exceeds",
+			wantErr: wantErrExceeds,
 		},
 		{
 			name: "leeway at max accepted",
@@ -145,7 +193,10 @@ func TestNewValidatorConfigValidation(t *testing.T) {
 			check: func(t *testing.T, cfg Config) {
 				t.Helper()
 				assert.Equal(t, defaultLeeway, cfg.Leeway)
-				assert.Equal(t, defaultMaxTokenLifetime, cfg.MaxTokenLifetime)
+				// MaxTokenLifetime is deliberately NOT defaulted: zero means
+				// "no lifetime bound", so adopting this package cannot start
+				// rejecting long-lived tokens a resource server accepts today.
+				assert.Zero(t, cfg.MaxTokenLifetime)
 			},
 		},
 	}
@@ -354,7 +405,7 @@ func TestHTTPClientBodyCap(t *testing.T) {
 			// than the cap for the JWKS URL, so construction fails closed at
 			// the first JWKS fetch; the cap assertion below still exercises
 			// the wrapped transport directly.
-			wantConstructionErr: "exceeds",
+			wantConstructionErr: wantErrExceeds,
 		},
 		{name: "caller-supplied client without transport", base: &http.Client{}},
 	}
@@ -405,7 +456,7 @@ func TestHTTPClientBodyCap(t *testing.T) {
 
 			body, err := io.ReadAll(resp.Body)
 			require.Error(t, err, "body larger than the cap must surface an error, not silent truncation")
-			assert.Contains(t, err.Error(), "exceeds")
+			assert.Contains(t, err.Error(), wantErrExceeds)
 			assert.LessOrEqual(t, len(body), maxResponseBody, "no more than the cap may be delivered")
 		})
 	}
@@ -467,7 +518,7 @@ func TestLimitedBodyCapBoundary(t *testing.T) {
 			assert.Len(t, got, tt.wantLen)
 			if tt.wantErr {
 				require.Error(t, err)
-				assert.Contains(t, err.Error(), "exceeds")
+				assert.Contains(t, err.Error(), wantErrExceeds)
 			} else {
 				assert.NoError(t, err)
 			}
