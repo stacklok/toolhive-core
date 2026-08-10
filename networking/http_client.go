@@ -260,8 +260,13 @@ func (b *HttpClientBuilder) WithTimeout(timeout time.Duration) *HttpClientBuilde
 
 // WithEnvReader sets the env.Reader used to read INSECURE_DISABLE_URL_VALIDATION.
 // Defaults to the real OS environment; inject a fake reader in tests to avoid
-// mutating process-wide state.
+// mutating process-wide state. A nil reader is normalized to &env.OSReader{}
+// so callers (including NewHostScopedClientBuilderWithReader) can't panic on
+// a nil-interface method call.
 func (b *HttpClientBuilder) WithEnvReader(reader env.Reader) *HttpClientBuilder {
+	if reader == nil {
+		reader = &env.OSReader{}
+	}
 	b.envReader = reader
 	return b
 }

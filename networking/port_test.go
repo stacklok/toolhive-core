@@ -179,6 +179,69 @@ func TestFindAvailableListener_ConcurrentCallsGetDistinctPorts(t *testing.T) {
 	}
 }
 
+func TestFindOrUsePort_InvalidPortRejected(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		port      int
+		wantError bool
+	}{
+		{"negative port is rejected", -1, true},
+		{"zero means auto-select", 0, false},
+		{"port 1 is a valid boundary", 1, false},
+		{"port 65535 is a valid boundary", 65535, false},
+		{"port 65536 is rejected", 65536, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := networking.FindOrUsePort(tt.port)
+			if tt.wantError {
+				require.Error(t, err)
+				assert.Equal(t, 0, got)
+				return
+			}
+			require.NoError(t, err)
+			assert.NotZero(t, got)
+		})
+	}
+}
+
+func TestFindOrUseListener_InvalidPortRejected(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		port      int
+		wantError bool
+	}{
+		{"negative port is rejected", -1, true},
+		{"zero means auto-select", 0, false},
+		{"port 1 is a valid boundary", 1, false},
+		{"port 65535 is a valid boundary", 65535, false},
+		{"port 65536 is rejected", 65536, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			l, err := networking.FindOrUseListener(tt.port)
+			if tt.wantError {
+				require.Error(t, err)
+				assert.Nil(t, l)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, l)
+			defer l.Close()
+		})
+	}
+}
+
 func TestFindOrUseListener(t *testing.T) {
 	t.Parallel()
 
@@ -272,6 +335,62 @@ func TestParsePortSpec(t *testing.T) {
 			expectedHostPort:  "",
 			expectedContainer: 0,
 			wantError:         true,
+		},
+		{
+			name:              "negative host port is rejected",
+			portSpec:          "-1:0",
+			expectedHostPort:  "",
+			expectedContainer: 0,
+			wantError:         true,
+		},
+		{
+			name:              "host port above range is rejected",
+			portSpec:          "70000:8001",
+			expectedHostPort:  "",
+			expectedContainer: 0,
+			wantError:         true,
+		},
+		{
+			name:              "container port above range is rejected",
+			portSpec:          "8000:99999",
+			expectedHostPort:  "",
+			expectedContainer: 0,
+			wantError:         true,
+		},
+		{
+			name:              "container-only port above range is rejected",
+			portSpec:          "99999",
+			expectedHostPort:  "",
+			expectedContainer: 0,
+			wantError:         true,
+		},
+		{
+			name:              "container-only port zero is rejected",
+			portSpec:          "0",
+			expectedHostPort:  "",
+			expectedContainer: 0,
+			wantError:         true,
+		},
+		{
+			name:              "host port 0 is passed through as Docker dynamic-port marker",
+			portSpec:          "0:8080",
+			expectedHostPort:  "0",
+			expectedContainer: 8080,
+			wantError:         false,
+		},
+		{
+			name:              "host and container port 1 is a valid boundary",
+			portSpec:          "1:1",
+			expectedHostPort:  "1",
+			expectedContainer: 1,
+			wantError:         false,
+		},
+		{
+			name:              "host and container port 65535 is a valid boundary",
+			portSpec:          "65535:65535",
+			expectedHostPort:  "65535",
+			expectedContainer: 65535,
+			wantError:         false,
 		},
 	}
 

@@ -115,6 +115,10 @@ func FindAvailable() int {
 // and FindAvailable. Prefer FindOrUseListener when you will bind the port yourself
 // shortly afterward in the same process.
 func FindOrUsePort(port int) (int, error) {
+	if port != 0 && (port < 1 || port > 65535) {
+		return 0, fmt.Errorf("invalid port %d: must be 0 (auto-select) or in range 1-65535", port)
+	}
+
 	if port == 0 {
 		// Find an available port
 		port = FindAvailable()
@@ -169,6 +173,10 @@ func FindAvailableListener() (*net.TCPListener, error) {
 // unavailable. The returned listener is still open; the caller is responsible
 // for closing it.
 func FindOrUseListener(port int) (*net.TCPListener, error) {
+	if port != 0 && (port < 1 || port > 65535) {
+		return nil, fmt.Errorf("invalid port %d: must be 0 (auto-select) or in range 1-65535", port)
+	}
+
 	if port == 0 {
 		return FindAvailableListener()
 	}
@@ -242,7 +250,15 @@ func GetProcessOnPort(port int) (int, error) {
 
 // ParsePortSpec parses a port specification string in the format "hostPort:containerPort" or just "containerPort".
 // Returns the host port string and container port integer.
-// If only a container port is provided, a random available host port is selected.
+// If only a container port is provided, a random available host port is selected
+// locally via FindAvailable.
+//
+// Host port 0 (explicit "0:containerPort" form) is passed through unchanged as
+// the string "0" and is NOT resolved to a concrete port here — this is
+// intentional. Docker's own PortBinding.HostPort treats "0" as "assign a port
+// dynamically at container start", which is a distinct mechanism from this
+// function's own container-only path (no ":") that calls FindAvailable to pick
+// a host port up front.
 func ParsePortSpec(portSpec string) (string, int, error) {
 	slog.Debug("Parsing port spec", "spec", portSpec)
 	// Check if it's in host:container format
@@ -256,13 +272,20 @@ func ParsePortSpec(portSpec string) (string, int, error) {
 		containerPortStr := parts[1]
 
 		// Verify host port is a valid integer (or empty string if we supported random host port with :, but here we expect explicit)
-		if _, err := strconv.Atoi(hostPortStr); err != nil {
+		hostPort, err := strconv.Atoi(hostPortStr)
+		if err != nil {
 			return "", 0, fmt.Errorf("invalid host port in spec '%s': %w", portSpec, err)
+		}
+		if hostPort < 0 || hostPort > 65535 {
+			return "", 0, fmt.Errorf("invalid host port in spec '%s': %d must be in range 0-65535", portSpec, hostPort)
 		}
 
 		containerPort, err := strconv.Atoi(containerPortStr)
 		if err != nil {
 			return "", 0, fmt.Errorf("invalid container port in spec '%s': %w", portSpec, err)
+		}
+		if containerPort < 1 || containerPort > 65535 {
+			return "", 0, fmt.Errorf("invalid container port in spec '%s': %d must be in range 1-65535", portSpec, containerPort)
 		}
 
 		return hostPortStr, containerPort, nil
@@ -271,6 +294,9 @@ func ParsePortSpec(portSpec string) (string, int, error) {
 	// Try parsing as just container port
 	containerPort, err := strconv.Atoi(portSpec)
 	if err == nil {
+		if containerPort < 1 || containerPort > 65535 {
+			return "", 0, fmt.Errorf("invalid container port in spec '%s': %d must be in range 1-65535", portSpec, containerPort)
+		}
 		// Find a random available host port
 		hostPort := FindAvailable()
 		if hostPort == 0 {

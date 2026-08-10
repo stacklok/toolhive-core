@@ -20,6 +20,7 @@ import (
 	"go.uber.org/mock/gomock"
 	"golang.org/x/oauth2"
 
+	"github.com/stacklok/toolhive-core/env"
 	"github.com/stacklok/toolhive-core/env/mocks"
 )
 
@@ -126,6 +127,21 @@ func TestNewHostScopedClientBuilderWithReader(t *testing.T) {
 	assert.True(t, builder.allowPrivate, "injected reader must widen the private-IP gate")
 	assert.True(t, builder.insecureAllowHTTP, "injected reader must widen the HTTP scheme gate")
 	assert.Same(t, mockReader, builder.envReader, "the injected reader must remain installed on the builder")
+}
+
+// TestNewHostScopedClientBuilderWithReader_NilReader is a regression test:
+// WithEnvReader used to store a nil reader as-is, so
+// NewHostScopedClientBuilderWithReader(..., nil) panicked on the nil-interface
+// Getenv call. WithEnvReader now normalizes nil to &env.OSReader{}, matching
+// the fallback ValidatingTransport.RoundTrip already does.
+func TestNewHostScopedClientBuilderWithReader_NilReader(t *testing.T) {
+	t.Parallel()
+
+	require.NotPanics(t, func() {
+		builder := NewHostScopedClientBuilderWithReader(testIdpExampleHost, false, false, nil)
+		assert.NotNil(t, builder.envReader, "nil reader must be normalized rather than stored as-is")
+		assert.IsType(t, &env.OSReader{}, builder.envReader)
+	})
 }
 
 func TestHttpClientBuilder_WithCABundle(t *testing.T) {
