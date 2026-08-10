@@ -87,30 +87,43 @@ type Principal struct {
 // a possibly-opaque token, so unlike Validate's CodeInvalidToken +
 // ReasonMalformed it must NOT feed ToolHive's introspection fallback (see
 // errors.go).
+//
+// NO error returned here contains any byte of the header value. Error() is
+// documented as log-safe, and a malformed header routinely still carries a live
+// credential — "Bearer <token> junk", or a token sent with no scheme at all
+// would put a replayable token into the logs (RFC 6750 §5 names token
+// disclosure as a primary threat). Errors therefore report only the structural
+// category and, where useful, a length.
 func ParseBearer(headerValue string) (string, error) {
 	if headerValue == "" {
 		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMissingHeader,
 			err: errors.New("no Authorization header")}
 	}
-	// RFC 7235 credentials are `scheme SP token68`; token68 has no internal
-	// whitespace. SplitN on the first space, reject extra segments: exactly
-	// two parts, no leading space on the scheme, no trailing space on the
-	// token.
-	parts := strings.SplitN(headerValue, " ", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	// RFC 7235 credentials are `auth-scheme 1*SP token68`: one or more spaces
+	// separate the scheme from the credential, and token68 itself has no
+	// internal whitespace. Cut at the first space, then trim any additional
+	// separator spaces (1*SP, not exactly one).
+	scheme, rest, found := strings.Cut(headerValue, " ")
+	if !found || scheme == "" {
 		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
-			err: fmt.Errorf("expected exactly 'Bearer <token>': %q", headerValue)}
+			err: errors.New("expected 'Bearer <token>': no scheme/credential separator")}
 	}
-	if !strings.EqualFold(parts[0], "Bearer") {
+	if !strings.EqualFold(scheme, "Bearer") {
+		// The scheme is not echoed either: on a header with no separator the
+		// whole credential can land in this position.
 		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
-			err: fmt.Errorf("unsupported auth scheme: %q", parts[0])}
+			err: errors.New("unsupported auth scheme: expected Bearer")}
 	}
-	token := parts[1]
-	// token68 forbids internal whitespace; a tab or a second space anywhere
-	// in the token part means the header is not exactly `Bearer <token>`.
+	token := strings.TrimLeft(rest, " ")
+	if token == "" {
+		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
+			err: errors.New("expected 'Bearer <token>': empty credential")}
+	}
+	// token68 forbids internal whitespace, so anything left after trimming the
+	// separator means the header is not a single bearer credential.
 	if strings.ContainsAny(token, " \t") {
 		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
-			err: fmt.Errorf("token part contains whitespace: %q", headerValue)}
+			err: errors.New("credential contains whitespace")}
 	}
 	if len(token) > maxTokenLength {
 		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
@@ -127,6 +140,12 @@ func ParseBearer(headerValue string) (string, error) {
 // touching key material runs before the algorithm gate (RFC 8725 §3.1) and
 // nothing expensive runs before the cheap structural rejects.
 func (v *Validator) Validate(ctx context.Context, token string) (Principal, error) {
+	// A closed validator cannot reach key material, so say so plainly rather
+	// than letting the caller discover it as a context error from deeper down.
+	if v.closed() {
+		return Principal{}, &Error{Code: CodeUnavailable, Reason: ReasonKeysUnavailable,
+			err: errors.New("validator is closed")}
+	}
 	if token == "" {
 		return Principal{}, &Error{Code: CodeInvalidToken, Reason: ReasonMalformed,
 			err: errors.New("empty token")}
@@ -338,16 +357,52 @@ func (v *Validator) checkLifetime(claims jwt.MapClaims) error {
 	if err != nil || exp == nil {
 		return nil
 	}
-	iat, err := claims.GetIssuedAt()
-	if err != nil || iat == nil {
+	iat, ok := issuedAt(claims)
+	if !ok {
 		return nil
 	}
-	if exp.Sub(iat.Time) > v.cfg.MaxTokenLifetime {
+	if exp.Sub(iat) > v.cfg.MaxTokenLifetime {
 		return &Error{Code: CodeInvalidToken, Reason: ReasonLifetime,
 			err: fmt.Errorf("token lifetime %s exceeds maximum %s",
-				exp.Sub(iat.Time), v.cfg.MaxTokenLifetime)}
+				exp.Sub(iat), v.cfg.MaxTokenLifetime)}
 	}
 	return nil
+}
+
+// issuedAt reads the iat claim, reporting whether it was PRESENT rather than
+// whether it was non-zero.
+//
+// jwt.MapClaims.GetIssuedAt cannot distinguish the two: it returns a nil
+// NumericDate for a numeric zero, so `iat: 0` — a perfectly valid NumericDate
+// meaning the Unix epoch — reads as absent and silently skips the lifetime
+// check, no matter how distant exp is. Inspecting the raw claim closes that
+// bypass.
+//
+// A non-numeric iat cannot reach here: the parser runs WithIssuedAt, which
+// rejects a wrong-typed claim before verification completes. The type switch is
+// a backstop, and an unrecognized type is reported as absent (the pre-existing
+// behavior) rather than guessed at.
+func issuedAt(claims jwt.MapClaims) (time.Time, bool) {
+	raw, present := claims["iat"]
+	if !present {
+		return time.Time{}, false
+	}
+	switch n := raw.(type) {
+	case float64:
+		return time.Unix(int64(n), 0), true
+	case int64:
+		return time.Unix(n, 0), true
+	case int:
+		return time.Unix(int64(n), 0), true
+	case json.Number:
+		secs, err := n.Int64()
+		if err != nil {
+			return time.Time{}, false
+		}
+		return time.Unix(secs, 0), true
+	default:
+		return time.Time{}, false
+	}
 }
 
 // stringClaim extracts a string claim, tolerating a missing or non-string
@@ -369,6 +424,14 @@ func stringClaim(claims jwt.MapClaims, name string) string {
 // validation. On a provider miss the JWKS path below still runs, so a validator
 // with both sources configured can verify tokens from either.
 func (v *Validator) verificationKeys(ctx context.Context, kid, alg string) (any, error) {
+	// Bind every cache operation to the validator's lifetime as well as the
+	// request. The jwx cache's controller goroutines stop when v.ctx is
+	// canceled, so a Lookup issued with only the request context after Close
+	// sends on a channel with no remaining receiver and blocks forever — a
+	// graceful-shutdown hang for any request still in flight.
+	ctx, cancel := v.withLifetime(ctx)
+	defer cancel()
+
 	if v.cfg.KeyProvider != nil {
 		local, err := v.keysFromProvider(ctx, kid, alg)
 		if err != nil {

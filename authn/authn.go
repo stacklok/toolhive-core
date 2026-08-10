@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"sync"
 	"time"
 	"unicode"
@@ -248,6 +249,12 @@ func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
 		return nil, err
 	}
 
+	// Config is copied by value, but Audiences would still alias the caller's
+	// backing array: mutating that slice afterwards would silently rewrite the
+	// trusted audience policy, and would race Validate while doing it. Clone it
+	// so the validator owns its policy for its whole lifetime.
+	cfg.Audiences = slices.Clone(cfg.Audiences)
+
 	httpClient, err := newHTTPClient(cfg.HTTPClient, cfg.AllowPrivateIP, cfg.CACertPath)
 	if err != nil {
 		return nil, err
@@ -280,8 +287,37 @@ func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
 // Close stops the validator's background JWKS refresh by canceling its
 // internal context. It is idempotent and safe to call concurrently. It does
 // not wait for in-flight fetches to finish.
+//
+// Validate must not be called after Close; if it is, it fails fast with
+// CodeUnavailable rather than blocking. A concurrent Close during an in-flight
+// Validate is also safe: cache operations are bound to the validator lifetime,
+// so they unblock instead of waiting on a controller that has stopped.
 func (v *Validator) Close() {
 	v.closeOnce.Do(v.cancel)
+}
+
+// withLifetime derives a context that is canceled when EITHER the request
+// context or the validator's lifetime context is done.
+//
+// This is what keeps a request from outliving the machinery it depends on: the
+// jwx cache's controller goroutines are bound to v.ctx, so once Close cancels
+// it a cache operation carrying only the request context would wait on a
+// receiver that no longer exists.
+func (v *Validator) withLifetime(ctx context.Context) (context.Context, context.CancelFunc) {
+	merged, cancel := context.WithCancel(ctx)
+	// AfterFunc fires immediately when v.ctx is already done, so the
+	// already-closed case needs no separate branch.
+	stop := context.AfterFunc(v.ctx, cancel)
+	return merged, func() {
+		stop()
+		cancel()
+	}
+}
+
+// closed reports whether the validator's lifetime context has been canceled,
+// either by Close or by cancellation of the context passed to NewValidator.
+func (v *Validator) closed() bool {
+	return v.ctx.Err() != nil
 }
 
 // validate checks cfg and fills in defaults, performing no I/O.

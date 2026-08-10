@@ -1709,3 +1709,156 @@ func TestMaxTokenLifetimeDisabledByDefault(t *testing.T) {
 	_, err = v.Validate(context.Background(), token)
 	require.NoError(t, err, "a zero MaxTokenLifetime must impose no exp-iat bound")
 }
+
+// --- log-safety, shutdown, and iat:0 (review follow-ups) -------------------
+
+// TestParseBearerNeverLeaksCredential covers the credential-disclosure finding:
+// Error() is documented as log-safe, and a malformed header routinely still
+// carries a live token ("Bearer <token> junk", or a token sent with no scheme).
+// No error from ParseBearer may contain any byte of the header value.
+func TestParseBearerNeverLeaksCredential(t *testing.T) {
+	t.Parallel()
+
+	const secret = "s3cr3t-live-token-do-not-log"
+	for _, tt := range []struct {
+		name   string
+		header string
+	}{
+		{name: "trailing junk after a valid token", header: "Bearer " + secret + " junk"},
+		{name: "token with no scheme", header: secret},
+		{name: "tab separator", header: "Bearer\t" + secret},
+		{name: "wrong scheme", header: "Basic " + secret},
+		{name: "internal whitespace", header: "Bearer " + secret + " " + secret},
+		{name: "over-long token", header: "Bearer " + strings.Repeat("x", maxTokenLength+1)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := ParseBearer(tt.header)
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), secret,
+				"the error text must not carry the credential: Error() is logged")
+			// Stronger: no substring of the header at all beyond the scheme name.
+			assert.NotContains(t, err.Error(), tt.header,
+				"the error text must not echo the header value")
+		})
+	}
+}
+
+// TestParseBearerAcceptsMultipleSeparatorSpaces covers RFC 7235's
+// `auth-scheme 1*SP token68`: one or more spaces are legal between the scheme
+// and the credential, so "Bearer  <token>" must parse rather than be rejected.
+func TestParseBearerAcceptsMultipleSeparatorSpaces(t *testing.T) {
+	t.Parallel()
+
+	for _, hv := range []string{"Bearer " + testToken, "Bearer  " + testToken, "Bearer   " + testToken} {
+		got, err := ParseBearer(hv)
+		require.NoError(t, err, "1*SP between scheme and credential is legal (RFC 7235)")
+		assert.Equal(t, testToken, got)
+	}
+}
+
+// TestValidateAfterCloseFailsFast covers the shutdown-hang finding: the jwx
+// cache's controller goroutines stop when the validator's lifetime context is
+// canceled, so a Lookup carrying only the request context would block forever
+// on a channel with no receiver. Validate must report CodeUnavailable promptly
+// instead.
+func TestValidateAfterCloseFailsFast(t *testing.T) {
+	t.Parallel()
+
+	rsaKey := mintRSA(t, "rsa-1")
+	js := newJWKSServer(t, rsaKey.jwk)
+	v, err := NewValidator(context.Background(), js.configFor())
+	require.NoError(t, err)
+	token := rsaKey.mint(t, js.srv.URL)
+	v.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		_, e := v.Validate(context.Background(), token)
+		done <- e
+	}()
+	select {
+	case e := <-done:
+		requireAuthnError(t, e, CodeUnavailable, ReasonKeysUnavailable)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Validate hung after Close instead of failing fast")
+	}
+}
+
+// TestValidateUnblocksOnConcurrentClose covers the same hazard from the other
+// side: a Close racing an in-flight Validate must let that request finish rather
+// than leave it parked on a stopped controller.
+func TestValidateUnblocksOnConcurrentClose(t *testing.T) {
+	t.Parallel()
+
+	rsaKey := mintRSA(t, "rsa-1")
+	js := newJWKSServer(t, rsaKey.jwk)
+	v, err := NewValidator(context.Background(), js.configFor())
+	require.NoError(t, err)
+
+	// An unknown kid forces the recovery path, which touches the cache more than
+	// a plain hit would.
+	stranger := mintRSA(t, "stranger")
+	token := stranger.mint(t, js.srv.URL)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = v.Validate(context.Background(), token)
+	}()
+	v.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an in-flight Validate did not unblock after a concurrent Close")
+	}
+}
+
+// TestIatZeroDoesNotBypassLifetime covers the iat:0 finding: 0 is a valid
+// NumericDate (the Unix epoch), but jwt.MapClaims.GetIssuedAt reports it as
+// absent, which silently skipped the lifetime check no matter how distant exp
+// was.
+func TestIatZeroDoesNotBypassLifetime(t *testing.T) {
+	t.Parallel()
+
+	rsaKey := mintRSA(t, "rsa-1")
+	js := newJWKSServer(t, rsaKey.jwk)
+	cfg := js.configFor()
+	cfg.MaxTokenLifetime = time.Hour
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	token := rsaKey.mint(t, js.srv.URL,
+		withClaim(claimIat, 0),
+		withClaim(claimExp, time.Now().Add(24*time.Hour).Unix()))
+	_, err = v.Validate(context.Background(), token)
+	requireAuthnError(t, err, CodeInvalidToken, ReasonLifetime)
+}
+
+// TestAudiencesClonedAtConstruction covers the aliasing finding: Config is
+// copied by value, but the Audiences slice shared its backing array with the
+// caller, so mutating it afterwards rewrote the trusted policy (and raced
+// Validate while doing it).
+func TestAudiencesClonedAtConstruction(t *testing.T) {
+	t.Parallel()
+
+	rsaKey := mintRSA(t, "rsa-1")
+	js := newJWKSServer(t, rsaKey.jwk)
+	cfg := js.configFor()
+	cfg.Audiences = []string{testAPIAud}
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	// Rewrite the caller's slice to an audience the validator must NOT trust.
+	cfg.Audiences[0] = "https://attacker.example.com"
+
+	token := rsaKey.mint(t, js.srv.URL, withClaim(claimAud, "https://attacker.example.com"))
+	_, err = v.Validate(context.Background(), token)
+	requireAuthnError(t, err, CodeInvalidToken, ReasonAudience)
+
+	// And the originally configured audience still validates.
+	_, err = v.Validate(context.Background(), rsaKey.mint(t, js.srv.URL))
+	require.NoError(t, err)
+}
