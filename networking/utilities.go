@@ -51,10 +51,9 @@ func TargetIsPrivate(ctx context.Context, rawURL string) bool {
 	return false
 }
 
-const (
-	// ErrPrivateIpAddress is the error returned when the provided URL redirects to a private IP address
-	ErrPrivateIpAddress = "the provided URL redirects to a private IP address, which is not allowed"
-)
+// ErrPrivateIPAddress is returned when the provided URL redirects to a
+// private IP address, which is not allowed.
+var ErrPrivateIPAddress = errors.New("the provided URL redirects to a private IP address, which is not allowed")
 
 // nat64Prefixes are the NAT64 translation prefixes whose embedded IPv4 address
 // lives in the low 32 bits (RFC 6052 §2.2 "/96" embedding). An address inside
@@ -162,8 +161,12 @@ func AddressReferencesPrivateIp(address string) error {
 	}
 	// Check for a private IP address or loopback
 	ip := net.ParseIP(host)
+	if ip == nil {
+		// Fail closed: an unparsable host must not be treated as safe.
+		return fmt.Errorf("could not parse IP from address %q", address)
+	}
 	if IsPrivateIP(ip) {
-		return errors.New(ErrPrivateIpAddress)
+		return ErrPrivateIPAddress
 	}
 
 	return nil

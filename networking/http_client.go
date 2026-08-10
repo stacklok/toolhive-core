@@ -59,8 +59,9 @@ var ErrRedirectRefused = errors.New("redirect refused")
 // it (CWE-918). Restricting redirects to the same host as the original request
 // keeps the request on the endpoint the operator actually configured.
 //
-// This mirrors the data-plane guard in pkg/transport/proxy/transparent
-// (followRedirects); keep the two policies in sync.
+// This mirrors the data-plane guard in the toolhive proxy transport
+// (github.com/stacklok/toolhive pkg/transport/proxy/transparent, followRedirects);
+// if you change this policy, check the corresponding guard there too.
 func SameHostRedirectPolicy() func(req *http.Request, via []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
 		if len(via) >= MaxRedirects {
@@ -206,7 +207,18 @@ func NewHttpClientBuilder() *HttpClientBuilder {
 // upstream OAuth2/OIDC providers and the DCR resolver so the two paths cannot
 // drift.
 func NewHostScopedClientBuilder(host string, allowPrivateIPs, insecureAllowHTTP bool) *HttpClientBuilder {
-	builder := NewHttpClientBuilder()
+	return NewHostScopedClientBuilderWithReader(host, allowPrivateIPs, insecureAllowHTTP, &env.OSReader{})
+}
+
+// NewHostScopedClientBuilderWithReader is identical to NewHostScopedClientBuilder
+// but takes the env.Reader used to evaluate INSECURE_DISABLE_URL_VALIDATION
+// explicitly, so callers can inject a fake reader for tests instead of relying
+// on a later WithEnvReader call, which would be too late to affect this
+// constructor's own allowInsecure computation.
+func NewHostScopedClientBuilderWithReader(
+	host string, allowPrivateIPs, insecureAllowHTTP bool, reader env.Reader,
+) *HttpClientBuilder {
+	builder := NewHttpClientBuilder().WithEnvReader(reader)
 	allowInsecure := IsLocalhost(host) ||
 		insecureAllowHTTP ||
 		strings.EqualFold(builder.envReader.Getenv("INSECURE_DISABLE_URL_VALIDATION"), "true")
@@ -264,6 +276,18 @@ func (b *HttpClientBuilder) WithEnvReader(reader env.Reader) *HttpClientBuilder 
 // branch makes "guard installed with keep-alives left on" structurally
 // unreachable rather than merely discouraged in documentation. When private
 // IPs are allowed, no guard is installed, so keep-alives may remain enabled.
+//
+// When WithTokenFromFile configures an auth token, the returned client
+// automatically installs SameHostRedirectPolicy as CheckRedirect. Without
+// this, oauth2.Transport re-adds the Authorization: Bearer header on every
+// redirected request, and http.Client follows cross-host redirects by
+// default — so a malicious or compromised server could redirect the request
+// to an attacker-controlled host and walk off with the bearer token. There is
+// no legitimate reason for a bearer-token-carrying client to need to follow a
+// cross-host redirect. Callers authenticating via other mechanisms (e.g. a
+// custom RoundTripper that adds its own headers) should layer
+// SameHostRedirectPolicy themselves if they need the same protection; Build
+// otherwise stays redirect-policy-neutral by default.
 func (b *HttpClientBuilder) Build() (*http.Client, error) {
 	transport := &http.Transport{
 		TLSHandshakeTimeout:   b.tlsHandshakeTimeout,
@@ -320,6 +344,12 @@ func (b *HttpClientBuilder) Build() (*http.Client, error) {
 	client := &http.Client{
 		Transport: clientTransport,
 		Timeout:   b.clientTimeout,
+	}
+
+	// A bearer token must never be replayed to a redirect target on a
+	// different host; see the Build doc comment above.
+	if b.authTokenFile != "" {
+		client.CheckRedirect = SameHostRedirectPolicy()
 	}
 
 	return client, nil

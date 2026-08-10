@@ -95,11 +95,12 @@ func TestNewHostScopedClientBuilder(t *testing.T) {
 
 // TestNewHostScopedClientBuilder_InsecureDisableURLValidationEnvVar pins that
 // the env var widens both gates the same way a loopback host does.
-// NewHostScopedClientBuilder builds its own env.Reader-backed builder
-// internally and has no way to accept an injected reader without breaking
+// NewHostScopedClientBuilder can't accept an injected reader without breaking
 // its exported signature, so this test still has to reach for the real
 // process environment; kept as a standalone test (not a table case) because
-// t.Setenv is incompatible with t.Parallel.
+// t.Setenv is incompatible with t.Parallel. See
+// TestNewHostScopedClientBuilderWithReader for the dependency-injected
+// equivalent that avoids mutating process-wide state.
 func TestNewHostScopedClientBuilder_InsecureDisableURLValidationEnvVar(t *testing.T) {
 	t.Setenv("INSECURE_DISABLE_URL_VALIDATION", "true")
 
@@ -107,6 +108,24 @@ func TestNewHostScopedClientBuilder_InsecureDisableURLValidationEnvVar(t *testin
 
 	assert.True(t, builder.allowPrivate, "env var must widen the private-IP gate")
 	assert.True(t, builder.insecureAllowHTTP, "env var must widen the HTTP scheme gate")
+}
+
+// TestNewHostScopedClientBuilderWithReader pins that
+// NewHostScopedClientBuilderWithReader consults the injected env.Reader (not
+// the real OS environment) when computing allowInsecure, and that the same
+// reader is left installed on the returned builder for subsequent use.
+func TestNewHostScopedClientBuilderWithReader(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	mockReader := mocks.NewMockReader(ctrl)
+	mockReader.EXPECT().Getenv("INSECURE_DISABLE_URL_VALIDATION").Return("true")
+
+	builder := NewHostScopedClientBuilderWithReader(testIdpExampleHost, false, false, mockReader)
+
+	assert.True(t, builder.allowPrivate, "injected reader must widen the private-IP gate")
+	assert.True(t, builder.insecureAllowHTTP, "injected reader must widen the HTTP scheme gate")
+	assert.Same(t, mockReader, builder.envReader, "the injected reader must remain installed on the builder")
 }
 
 func TestHttpClientBuilder_WithCABundle(t *testing.T) {
@@ -893,5 +912,69 @@ func TestSameHostRedirectPolicy_Integration(t *testing.T) {
 		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 		assert.Equal(t, "OK", string(body))
+	})
+}
+
+// TestHttpClientBuilder_Build_TokenFileSetsRedirectPolicy pins that a client
+// built with WithTokenFromFile refuses to replay its bearer token to a
+// redirect target on a different host: oauth2.Transport re-adds the
+// Authorization header on every round-trip it makes, including redirected
+// requests, so without a same-host CheckRedirect policy a malicious or
+// compromised server could redirect the request to an attacker-controlled
+// host and capture the token.
+func TestHttpClientBuilder_Build_TokenFileSetsRedirectPolicy(t *testing.T) {
+	t.Parallel()
+
+	tmpFile := filepath.Join(t.TempDir(), "token")
+	require.NoError(t, os.WriteFile(tmpFile, []byte("secret-token"), 0600))
+
+	t.Run("CheckRedirect is installed when a token file is configured", func(t *testing.T) {
+		t.Parallel()
+
+		client, err := NewHttpClientBuilder().WithTokenFromFile(tmpFile).Build()
+		require.NoError(t, err)
+		assert.NotNil(t, client.CheckRedirect)
+	})
+
+	t.Run("CheckRedirect is left unset without a token file", func(t *testing.T) {
+		t.Parallel()
+
+		client, err := NewHttpClientBuilder().Build()
+		require.NoError(t, err)
+		assert.Nil(t, client.CheckRedirect)
+	})
+
+	t.Run("cross-host redirect refuses to replay the bearer token", func(t *testing.T) {
+		t.Parallel()
+
+		var gotAuthHeader string
+		var redirectedRequestSeen bool
+		attackerHost := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			redirectedRequestSeen = true
+			gotAuthHeader = r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(attackerHost.Close)
+
+		originHost := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, attackerHost.URL+"/steal", http.StatusFound)
+		}))
+		t.Cleanup(originHost.Close)
+
+		client, err := NewHttpClientBuilder().
+			WithTokenFromFile(tmpFile).
+			WithPrivateIPs(true).
+			WithInsecureAllowHTTP(true).
+			Build()
+		require.NoError(t, err)
+
+		resp, err := client.Get(originHost.URL) //nolint:bodyclose // err path, no body
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrRedirectRefused)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		assert.False(t, redirectedRequestSeen, "the redirect target must never receive the request")
+		assert.Empty(t, gotAuthHeader)
 	})
 }

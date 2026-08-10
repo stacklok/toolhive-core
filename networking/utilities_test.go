@@ -492,6 +492,11 @@ func TestAddressReferencesPrivateIp(t *testing.T) {
 			expectError: true,
 		},
 		{
+			name:        "unparsable host fails closed",
+			address:     "not-an-ip:80",
+			expectError: true,
+		},
+		{
 			name:        "missing port",
 			address:     testPublicIPv4,
 			expectError: true,
