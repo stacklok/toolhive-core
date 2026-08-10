@@ -361,7 +361,35 @@ func stringClaim(claims jwt.MapClaims, name string) string {
 
 // verificationKeys implements the keyfunc: it resolves candidate verification
 // keys for a token carrying the given (possibly empty) kid and algorithm.
+//
+// A configured KeyProvider is consulted FIRST and short-circuits on a hit,
+// matching the order ToolHive's validator uses. That ordering is what makes the
+// embedded-issuer topology work: the local keys resolve without any HTTP, so a
+// JWKS endpoint that is not yet listening (or not routable) never blocks
+// validation. On a provider miss the JWKS path below still runs, so a validator
+// with both sources configured can verify tokens from either.
 func (v *Validator) verificationKeys(ctx context.Context, kid, alg string) (any, error) {
+	if v.cfg.KeyProvider != nil {
+		local, err := v.keysFromProvider(ctx, kid, alg)
+		if err != nil {
+			return nil, err
+		}
+		if len(local) > 0 {
+			set := jwt.VerificationKeySet{Keys: make([]jwt.VerificationKey, 0, len(local))}
+			for _, k := range local {
+				set.Keys = append(set.Keys, k)
+			}
+			return set, nil
+		}
+		// Provider miss. When there is no JWKS to fall back to (an embedded
+		// issuer with no reachable endpoint), report the kid as unknown rather
+		// than falling through to a cache that was never populated.
+		if v.jwksCache == nil {
+			return nil, &Error{Code: CodeInvalidToken, Reason: ReasonUnknownKID,
+				err: fmt.Errorf("kid %q not offered by the key provider and no JWKS is configured", kid)}
+		}
+	}
+
 	set, err := v.jwksCache.Lookup(ctx, v.jwksURL)
 	if err != nil {
 		// "Registered but first fetch pending" is reported distinctly; any

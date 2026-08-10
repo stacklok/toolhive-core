@@ -6,9 +6,11 @@ package authn
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // oidcDiscoveryPath is appended to the issuer to locate the OIDC discovery
@@ -16,6 +18,20 @@ import (
 // as https://host/realms/X the path is appended to the issuer path, matching
 // the common OIDC-provider convention (Keycloak, Entra ID, Auth0).
 const oidcDiscoveryPath = "/.well-known/openid-configuration"
+
+const (
+	// discoveryAttempts bounds how many times construction tries discovery
+	// before giving up. A resource server often starts alongside its issuer, so
+	// the first attempt can lose a startup race a retry wins.
+	discoveryAttempts = 3
+	// discoveryInitialBackoff is the first inter-attempt delay; it doubles.
+	discoveryInitialBackoff = 250 * time.Millisecond
+)
+
+// errDiscoveryNotTransient marks a discovery failure that retrying cannot fix:
+// the endpoint answered, and its answer is unacceptable. Wrapped rather than
+// returned directly so callers still get the specific reason.
+var errDiscoveryNotTransient = errors.New("discovery response is invalid")
 
 // oidcDiscoveryDocument is a deliberately minimal view of the OIDC discovery
 // document: a resource server needs only issuer (for the §4.3 consistency
@@ -25,6 +41,44 @@ const oidcDiscoveryPath = "/.well-known/openid-configuration"
 type oidcDiscoveryDocument struct {
 	Issuer  string `json:"issuer"`
 	JWKSURI string `json:"jwks_uri"`
+}
+
+// discoverWithRetry calls discoverJWKSURI, retrying a transient failure with
+// exponential backoff until ctx expires or the attempt budget is spent.
+//
+// A resource server commonly starts alongside its issuer, so the first attempt
+// can lose a race that a retry a moment later wins. Only the LAST error is
+// returned: the intermediate ones are the same failure observed earlier.
+//
+// Retries cover transport and status failures indiscriminately, including 5xx —
+// a just-starting issuer can serve one. A poisoned-document rejection (issuer
+// mismatch, missing jwks_uri, non-https jwks_uri) is NOT transient, so those
+// return immediately rather than burning the budget on a verdict that cannot
+// change.
+func (v *Validator) discoverWithRetry(ctx context.Context, issuer string) (string, error) {
+	var lastErr error
+	backoff := discoveryInitialBackoff
+	for attempt := range discoveryAttempts {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("authn: OIDC discovery for %s aborted after %d attempt(s): %w",
+					issuer, attempt, lastErr)
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+		jwksURI, err := v.discoverJWKSURI(ctx, issuer)
+		if err == nil {
+			return jwksURI, nil
+		}
+		lastErr = err
+		if errors.Is(err, errDiscoveryNotTransient) {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("authn: OIDC discovery for %s failed after %d attempts: %w",
+		issuer, discoveryAttempts, lastErr)
 }
 
 // discoverJWKSURI fetches {issuer}/.well-known/openid-configuration with
@@ -64,16 +118,21 @@ func (v *Validator) discoverJWKSURI(ctx context.Context, issuer string) (string,
 	}
 
 	// Byte-exact issuer comparison: no TrimSpace, no trailing-slash folding.
+	//
+	// The three checks below are verdicts on a document the endpoint actually
+	// served, so they are marked non-transient: retrying re-fetches the same
+	// unacceptable answer.
 	if doc.Issuer != issuer {
-		return "", fmt.Errorf("authn: OIDC discovery document issuer %q does not match configured issuer %q",
-			doc.Issuer, issuer)
+		return "", fmt.Errorf("authn: OIDC discovery document issuer %q does not match configured issuer %q: %w",
+			doc.Issuer, issuer, errDiscoveryNotTransient)
 	}
 
 	if doc.JWKSURI == "" {
-		return "", fmt.Errorf("authn: OIDC discovery document from %s is missing jwks_uri", wellKnown)
+		return "", fmt.Errorf("authn: OIDC discovery document from %s is missing jwks_uri: %w",
+			wellKnown, errDiscoveryNotTransient)
 	}
 	if err := validateHTTPSURI("discovered jwks_uri", doc.JWKSURI, v.cfg.InsecureAllowHTTP); err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: %w", err, errDiscoveryNotTransient)
 	}
 
 	return doc.JWKSURI, nil

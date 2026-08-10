@@ -165,6 +165,26 @@ type Config struct {
 	// It applies ONLY to the default client, for the same reason as
 	// AllowPrivateIP.
 	CACertPath string
+
+	// KeyProvider optionally supplies verification keys in-process, for an
+	// embedded issuer. It is consulted BEFORE the JWKS cache on every
+	// validation; a miss falls through to JWKS when one is configured.
+	//
+	// Setting it also relaxes construction, because an embedded issuer's JWKS
+	// endpoint is characteristically not reachable at the moment the Validator
+	// is built:
+	//
+	//   - OIDC discovery failure becomes non-fatal.
+	//   - The first JWKS fetch is no longer required to succeed; key material
+	//     is fetched lazily by the background refresh instead.
+	//
+	// Until that first fetch lands, a token whose kid the provider does not
+	// offer fails with CodeUnavailable/ReasonKeysUnavailable rather than being
+	// rejected as invalid — the verifier could not make a determination.
+	//
+	// With no KeyProvider, construction stays fail-closed: discovery and the
+	// first JWKS fetch must both succeed or NewValidator returns an error.
+	KeyProvider KeyProvider
 }
 
 // Validator verifies inbound JWT bearer tokens against the configured issuer
@@ -394,12 +414,21 @@ func (v *Validator) init(ctx context.Context) error {
 		// Bound the discovery fetch so an unresponsive issuer cannot hang
 		// NewValidator past constructionTimeout.
 		discCtx, cancel := context.WithTimeout(ctx, constructionTimeout)
-		jwksURI, err := v.discoverJWKSURI(discCtx, v.cfg.Issuer)
+		jwksURI, err := v.discoverWithRetry(discCtx, v.cfg.Issuer)
 		cancel()
-		if err != nil {
+		switch {
+		case err == nil:
+			v.jwksURL = jwksURI
+		case v.cfg.KeyProvider != nil:
+			// An embedded issuer may advertise a URL that is not routable from
+			// inside the cluster, so discovery can fail permanently rather than
+			// transiently. The provider resolves keys locally, so give up on
+			// JWKS entirely and leave jwksCache nil: verificationKeys treats a
+			// nil cache as "provider is the only source".
+			return nil
+		default:
 			return err
 		}
-		v.jwksURL = jwksURI
 	}
 
 	// The httprc client is restricted to fetching only whitelisted URLs: by
@@ -443,19 +472,39 @@ func (v *Validator) init(ctx context.Context) error {
 		return fmt.Errorf("authn: failed to register JWKS URL %s: %w", v.jwksURL, err)
 	}
 
-	// Fail closed: the first fetch must complete during construction, so an
-	// unreachable or unparseable JWKS endpoint is a NewValidator error, never
-	// a validator with no key material. Refresh forces the fetch synchronously
-	// and returns the underlying error (unlike waiting on readiness, which
-	// would only report context deadline after background retries).
-	if _, err := v.jwksCache.Refresh(fetchCtx, v.jwksURL); err != nil {
-		return fmt.Errorf("authn: failed to fetch JWKS from %s: %w", v.jwksURL, err)
-	}
-	if _, err := v.jwksCache.Lookup(fetchCtx, v.jwksURL); err != nil {
-		return fmt.Errorf("authn: JWKS from %s unavailable after fetch: %w", v.jwksURL, err)
+	// Attempt the first fetch regardless of whether a KeyProvider is set; only
+	// whether a FAILURE is fatal differs.
+	refreshErr := func() error {
+		if _, err := v.jwksCache.Refresh(fetchCtx, v.jwksURL); err != nil {
+			return fmt.Errorf("authn: failed to fetch JWKS from %s: %w", v.jwksURL, err)
+		}
+		if _, err := v.jwksCache.Lookup(fetchCtx, v.jwksURL); err != nil {
+			return fmt.Errorf("authn: JWKS from %s unavailable after fetch: %w", v.jwksURL, err)
+		}
+		return nil
+	}()
+
+	// With a KeyProvider the first fetch is attempted but NOT required: an
+	// embedded issuer typically mounts its JWKS route on the very listener that
+	// has not started yet, so the fetch here can connection-refuse. Tolerating
+	// that failure is what lets construction proceed; the registration stays in
+	// place so the background refresh picks the keys up once the endpoint is
+	// live, and until then the provider answers.
+	//
+	// Attempting it (rather than skipping it) matters: when the JWKS IS
+	// reachable, a provider miss must fall through to populated key material
+	// immediately rather than reporting httprc.ErrNotReady on the first request.
+	if v.cfg.KeyProvider != nil {
+		return nil
 	}
 
-	return nil
+	// Fail closed: with no provider the first fetch must complete during
+	// construction, so an unreachable or unparseable JWKS endpoint is a
+	// NewValidator error, never a validator with no key material. Refresh forces
+	// the fetch synchronously and returns the underlying error (unlike waiting
+	// on readiness, which would only report context deadline after background
+	// retries).
+	return refreshErr
 }
 
 // newHTTPClient returns base when non-nil, else a secure-by-default client
