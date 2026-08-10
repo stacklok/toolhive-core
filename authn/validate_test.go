@@ -60,8 +60,11 @@ func mintRSA(t *testing.T, kid string) rsaPair {
 	return mintRSABits(t, kid, 2048)
 }
 
-// mintRSABits mints an RSA pair with an explicit modulus size, so tests can
-// exercise the RFC 7518 §3.3 strength floor.
+// mintRSABits mints an RSA pair with an explicit modulus size.
+//
+// The size must be at least 2048: jwk.Import validates the modulus (jwx >=
+// 3.2.0), so a shorter key cannot be turned into a jwk.Key at all. Use
+// mintRawRSA to exercise the RFC 7518 §3.3 strength floor.
 func mintRSABits(t *testing.T, kid string, bits int) rsaPair {
 	t.Helper()
 	priv, err := rsa.GenerateKey(rand.Reader, bits)
@@ -70,6 +73,29 @@ func mintRSABits(t *testing.T, kid string, bits int) rsaPair {
 	require.NoError(t, err)
 	require.NoError(t, pub.Set(jwk.KeyIDKey, kid))
 	return rsaPair{priv: priv, jwk: pub}
+}
+
+// mintRawRSA generates an RSA pair of the given size plus a token signed with
+// it, WITHOUT importing the public key as a JWK.
+//
+// This exists because jwx >= 3.2.0 validates the modulus inside both jwk.Import
+// and jwk.Parse, so a sub-2048-bit key cannot become a jwk.Key by any public
+// route. The strength floor is therefore only reachable through the KeyProvider
+// path, which takes raw crypto keys and never goes through jwk — and that is
+// also the only path where this package's own floor still does work jwx does
+// not: on the JWKS path jwx now rejects such a key before we ever see it.
+func mintRawRSA(t *testing.T, kid string, bits int, issuer string) (*rsa.PrivateKey, string) {
+	t.Helper()
+	priv, err := rsa.GenerateKey(rand.Reader, bits)
+	require.NoError(t, err)
+	token := sign(t, mintSpec{
+		method:      jwt.SigningMethodRS256,
+		key:         priv,
+		kid:         kid,
+		claims:      defaultClaims(issuer),
+		extraHeader: map[string]any{},
+	})
+	return priv, token
 }
 
 func mintEC(t *testing.T, kid string) ecPair {
@@ -1979,25 +2005,14 @@ func TestAudiencesClonedAtConstruction(t *testing.T) {
 
 // --- hardening policies: RSA strength, JWKS staleness, token type ----------
 
-// TestWeakRSAKeyRejected covers the RFC 7518 §3.3 strength floor: RS*/PS*
-// require a modulus of at least 2048 bits, so a shorter key must not be used
-// even though it came from the configured JWKS.
-func TestWeakRSAKeyRejected(t *testing.T) {
-	t.Parallel()
-
-	weak := mintRSABits(t, "weak", 1024)
-	js := newJWKSServer(t, weak.jwk)
-	v, err := NewValidator(context.Background(), js.configFor())
-	require.NoError(t, err, "a weak key must not break construction, only verification")
-	t.Cleanup(v.Close)
-
-	_, err = v.Validate(context.Background(), weak.mint(t, js.srv.URL))
-	// The key is present under that kid but below the strength floor, so the
-	// failure names the strength problem rather than pointing at the kid.
-	requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
-	assert.Contains(t, err.Error(), "2048-bit minimum",
-		"the log-side detail must name the actual cause")
-}
+// There is deliberately no JWKS-path counterpart to
+// TestWeakRSAKeyFromProviderRejected below. jwx >= 3.2.0 validates the modulus in
+// jwk.Parse, so a sub-2048-bit key in a fetched JWKS fails to parse and — because
+// key-set parsing is strict by default — takes the whole set with it. The key can
+// therefore never reach this package's own filter, and no public jwx API can
+// construct such a jwk.Key to test with. keyTypeMatchesAlg keeps its floor as
+// defence-in-depth for consumers on older jwx; the other ineligibility causes on
+// that path are covered by TestKeyUsageFilter and TestKeyOpsFilter.
 
 // TestStrongRSAKeyStillAccepted is the control for the floor.
 func TestStrongRSAKeyStillAccepted(t *testing.T) {
@@ -2013,23 +2028,55 @@ func TestStrongRSAKeyStillAccepted(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestWeakRSAKeyFromProviderRejected applies the same floor to in-process keys:
-// a KeyProvider is trusted, but not trusted to be correctly configured.
+// TestWeakRSAKeyFromProviderRejected applies the RFC 7518 §3.3 strength floor to
+// in-process keys: a KeyProvider is trusted, but not trusted to be correctly
+// configured. This is the only path on which the floor is still reachable — see
+// the note above TestStrongRSAKeyStillAccepted.
 func TestWeakRSAKeyFromProviderRejected(t *testing.T) {
 	t.Parallel()
 
-	weak := mintRSABits(t, "weak", 1024)
-	kp := &fakeKeyProvider{keys: []PublicKey{{KeyID: "weak", Key: weak.priv.Public()}}}
+	priv, token := mintRawRSA(t, "weak", 1024, validConfig().Issuer)
+	kp := &fakeKeyProvider{keys: []PublicKey{{KeyID: "weak", Key: priv.Public()}}}
 	cfg := providerConfig(t, kp)
 	v, err := NewValidator(context.Background(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(v.Close)
 
-	_, err = v.Validate(context.Background(), weak.mint(t, validConfig().Issuer))
+	_, err = v.Validate(context.Background(), token)
 	require.Error(t, err, "a sub-2048-bit provider key must not verify a token")
-	var authnErr *Error
-	require.ErrorAs(t, err, &authnErr)
-	assert.NotEqual(t, ReasonSignature, authnErr.Reason)
+	// The key is present under that kid but below the floor, so the failure names
+	// the strength problem rather than the signature or the kid.
+	requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
+	assert.Contains(t, err.Error(), "2048-bit minimum",
+		"the log-side detail must name the actual cause")
+}
+
+// TestKeyUnsupportedDetailIsLogSafe guards the boundary the reason-threading
+// could have widened by accident: the cause reaches Error(), which is documented
+// as log-safe, so it must name a PROPERTY of the key and never key material,
+// JWKS contents, or unescaped attacker input.
+//
+// It runs on the provider path because a weak RSA key is the most obvious thing
+// that could leak a modulus, and that is the only path one can still be built on.
+func TestKeyUnsupportedDetailIsLogSafe(t *testing.T) {
+	t.Parallel()
+
+	priv, token := mintRawRSA(t, "weak", 1024, validConfig().Issuer)
+	kp := &fakeKeyProvider{keys: []PublicKey{{KeyID: "weak", Key: priv.Public()}}}
+	v, err := NewValidator(context.Background(), providerConfig(t, kp))
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+
+	_, err = v.Validate(context.Background(), token)
+	requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
+	detail := err.Error()
+
+	assert.NotContains(t, detail, priv.N.String(), "the modulus must never appear")
+	for _, ctrl := range []string{"\r", "\n", "\x00"} {
+		assert.NotContains(t, detail, ctrl, "no control characters in a log-safe detail")
+	}
+	// It should still be useful: the cause has to be in there.
+	assert.Contains(t, detail, "2048-bit minimum")
 }
 
 // TestMaxJWKSStalenessRejectsRevokedKeyAfterOutage covers the staleness bound:
@@ -2171,15 +2218,19 @@ func TestParseBearerChecksLengthBeforeScanning(t *testing.T) {
 func TestKeyUnsupportedVsUnknownKID(t *testing.T) {
 	t.Parallel()
 
-	weak := mintRSABits(t, "present-but-weak", 1024)
-	js := newJWKSServer(t, weak.jwk)
+	// `use: enc` is the unusability trigger rather than a weak modulus: it is
+	// equally permanent, but jwx validates the modulus during jwk.Parse (>= 3.2.0)
+	// and would reject a short key before this package could classify it.
+	encOnly := mintRSA(t, "present-but-enc")
+	require.NoError(t, encOnly.jwk.Set(jwk.KeyUsageKey, "enc"))
+	js := newJWKSServer(t, encOnly.jwk)
 	v, err := NewValidator(context.Background(), js.configFor())
 	require.NoError(t, err)
 	t.Cleanup(v.Close)
 
 	t.Run("present but unusable is key_unsupported", func(t *testing.T) {
 		t.Parallel()
-		_, err := v.Validate(context.Background(), weak.mint(t, js.srv.URL))
+		_, err := v.Validate(context.Background(), encOnly.mint(t, js.srv.URL))
 		requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
 	})
 
@@ -2189,32 +2240,6 @@ func TestKeyUnsupportedVsUnknownKID(t *testing.T) {
 		_, err := v.Validate(context.Background(), stranger.mint(t, js.srv.URL))
 		requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
 	})
-}
-
-// TestKeyUnsupportedDetailIsLogSafe guards the boundary the reason-threading
-// could have widened by accident: the cause reaches Error(), which is documented
-// as log-safe, so it must name a PROPERTY of the key and never key material,
-// JWKS contents, or unescaped attacker input.
-func TestKeyUnsupportedDetailIsLogSafe(t *testing.T) {
-	t.Parallel()
-
-	// A 1024-bit key: its modulus is the most obvious thing that could leak.
-	weak := mintRSABits(t, "weak", 1024)
-	js := newJWKSServer(t, weak.jwk)
-	v, err := NewValidator(context.Background(), js.configFor())
-	require.NoError(t, err)
-	t.Cleanup(v.Close)
-
-	_, err = v.Validate(context.Background(), weak.mint(t, js.srv.URL))
-	requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
-	detail := err.Error()
-
-	assert.NotContains(t, detail, weak.priv.N.String(), "the modulus must never appear")
-	for _, ctrl := range []string{"\r", "\n", "\x00"} {
-		assert.NotContains(t, detail, ctrl, "no control characters in a log-safe detail")
-	}
-	// It should still be useful: the cause has to be in there.
-	assert.Contains(t, detail, "2048-bit minimum")
 }
 
 // TestKeyRejectionStringsAreSafe checks every cause string directly, so a future
