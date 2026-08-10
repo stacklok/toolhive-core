@@ -250,7 +250,21 @@ type Config struct {
 
 	// KeyProvider optionally supplies verification keys in-process, for an
 	// embedded issuer. It is consulted BEFORE the JWKS cache on every
-	// validation; a miss falls through to JWKS when one is configured.
+	// validation.
+	//
+	// A provider MISS falls through to the JWKS when one is configured. A
+	// provider REJECTION does not: if the provider offers a key for the token's
+	// kid but that key is unusable — a sub-2048-bit modulus, a declared alg that
+	// disagrees, a malformed key — validation fails immediately with
+	// ReasonKeyUnsupported and the JWKS is never consulted. An unusable key is a
+	// permanent condition, so reporting it beats masking it behind a fallback
+	// that would end up reporting an unknown kid instead.
+	//
+	// The practical effect is that an unusable provider key shadows a usable
+	// JWKS key under the same kid. That is accepted: in the only topology that
+	// has a provider, the provider and the JWKS are the same key source, so the
+	// two disagreeing means something is wrong that a silent fallback would
+	// hide.
 	//
 	// Setting it also relaxes construction, because an embedded issuer's JWKS
 	// endpoint is characteristically not reachable at the moment the Validator
