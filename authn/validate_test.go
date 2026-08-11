@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -83,7 +84,8 @@ func mintRSABits(t *testing.T, kid string, bits int) rsaPair {
 // route. The strength floor is therefore only reachable through the KeyProvider
 // path, which takes raw crypto keys and never goes through jwk — and that is
 // also the only path where this package's own floor still does work jwx does
-// not: on the JWKS path jwx now rejects such a key before we ever see it.
+// not: on the JWKS path jwx rejects the key material itself, leaving only a
+// placeholder that this package filters as rejectExport.
 func mintRawRSA(t *testing.T, kid string, bits int, issuer string) (*rsa.PrivateKey, string) {
 	t.Helper()
 	priv, err := rsa.GenerateKey(rand.Reader, bits)
@@ -2005,14 +2007,14 @@ func TestAudiencesClonedAtConstruction(t *testing.T) {
 
 // --- hardening policies: RSA strength, JWKS staleness, token type ----------
 
-// There is deliberately no JWKS-path counterpart to
-// TestWeakRSAKeyFromProviderRejected below. jwx >= 3.2.0 validates the modulus in
-// jwk.Parse, so a sub-2048-bit key in a fetched JWKS fails to parse and — because
-// key-set parsing is strict by default — takes the whole set with it. The key can
-// therefore never reach this package's own filter, and no public jwx API can
-// construct such a jwk.Key to test with. keyTypeMatchesAlg keeps its floor as
-// defence-in-depth for consumers on older jwx; the other ineligibility causes on
-// that path are covered by TestKeyUsageFilter and TestKeyOpsFilter.
+// TestWeakRSAKeyFromProviderRejected below is the only test that reaches
+// rejectWeakRSA. jwx >= 3.2.0 validates the modulus in jwk.Parse, so a
+// sub-2048-bit key in a fetched JWKS never becomes a usable jwk.Key and no public
+// jwx API can construct one to test with; on the JWKS path such a key is rejected
+// as rejectExport instead, which TestWeakKeyDoesNotDisqualifyItsSiblings covers.
+// keyTypeMatchesAlg keeps its own floor as defence-in-depth for consumers on older
+// jwx; the other ineligibility causes on that path are covered by
+// TestKeyUsageFilter and TestKeyOpsFilter.
 
 // TestStrongRSAKeyStillAccepted is the control for the floor.
 func TestStrongRSAKeyStillAccepted(t *testing.T) {
@@ -2049,6 +2051,60 @@ func TestWeakRSAKeyFromProviderRejected(t *testing.T) {
 	requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
 	assert.Contains(t, err.Error(), "2048-bit minimum",
 		"the log-side detail must name the actual cause")
+}
+
+// rsaJWKJSON renders pub as a raw JWK object, bypassing jwk.Import — which
+// validates the modulus — so a sub-2048-bit key can be placed in a served JWKS.
+func rsaJWKJSON(t *testing.T, kid string, pub *rsa.PublicKey) map[string]string {
+	t.Helper()
+	return map[string]string{
+		"kty": "RSA",
+		"kid": kid,
+		"alg": "RS256",
+		"use": "sig",
+		"n":   base64.RawURLEncoding.EncodeToString(pub.N.Bytes()),
+		"e":   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pub.E)).Bytes()),
+	}
+}
+
+// TestWeakKeyDoesNotDisqualifyItsSiblings covers the reason this package turns
+// jwx's strict key-set parsing off: with it on, the sub-2048-bit key below fails
+// to parse and takes the whole set with it. Measured with the option removed, the
+// failure lands on NewValidator — "failed to fetch JWKS: ... rsa modulus too
+// small" — because construction fetches synchronously and fails closed. So an IdP
+// publishing one weak key does not merely get that key rejected, it stops the
+// resource server from starting at all, however good the other keys are.
+//
+// The weak key is served first so it occupies the position that fails the set.
+func TestWeakKeyDoesNotDisqualifyItsSiblings(t *testing.T) {
+	t.Parallel()
+
+	js := newJWKSServer(t)
+	good := mintRSA(t, "good")
+	weakPriv, weakToken := mintRawRSA(t, "weak", 1024, js.srv.URL)
+	doc, err := json.Marshal(map[string]any{"keys": []map[string]string{
+		rsaJWKJSON(t, "weak", &weakPriv.PublicKey),
+		rsaJWKJSON(t, "good", &good.priv.PublicKey),
+	}})
+	require.NoError(t, err)
+	js.setOverride(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(doc)
+	})
+
+	v, err := NewValidator(context.Background(), js.configFor())
+	require.NoError(t, err, "one unusable key must not make the JWKS unparseable")
+	t.Cleanup(v.Close)
+
+	_, err = v.Validate(context.Background(), good.mint(t, js.srv.URL))
+	require.NoError(t, err, "a token signed by the good key must still validate")
+
+	// The retained placeholder for the weak key cannot verify anything: it reports
+	// kty RSA, so jwk.Export is reached and fails, which is rejectExport. The
+	// distinction that matters is that this is an invalid-token verdict about one
+	// key, not an unavailable-keys verdict about the whole set.
+	_, err = v.Validate(context.Background(), weakToken)
+	requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
 }
 
 // TestKeyUnsupportedDetailIsLogSafe guards the boundary the reason-threading

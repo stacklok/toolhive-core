@@ -679,10 +679,30 @@ func (v *Validator) init(ctx context.Context) error {
 	// context deadline, which would turn every unreachable-JWKS construction
 	// error into a constructionTimeout wait; the synchronous Refresh below
 	// surfaces the real error immediately instead.
+	// WithStrictKeySetParsing(false) diverges from the jwx default deliberately:
+	// strict parsing fails the ENTIRE key set on the first unusable entry, so an
+	// IdP publishing one sub-2048-bit RSA key alongside good ones makes the whole
+	// JWKS unparseable. With no KeyProvider that is a CONSTRUCTION failure, not a
+	// per-request one — the fetch below is synchronous and fails closed, so
+	// NewValidator returns an error and the resource server does not start,
+	// however good the other keys in the set are. (A set that only degrades after
+	// construction instead surfaces as CodeUnavailable once the cached copy is no
+	// longer served.) Either way it contradicts how this package treats key
+	// material everywhere else: keys are filtered individually (use, key_ops,
+	// declared alg, kty/curve, RSA strength), and one bad key never disqualifies
+	// its siblings.
+	//
+	// It is safe because the placeholder jwx retains for the rejected entry
+	// cannot verify anything: it reports kty "RSA", so keyTypeMatchesAlg reaches
+	// jwk.Export, which fails on it, and the key is filtered as rejectExport and
+	// reported as ReasonKeyUnsupported. Nor is strictness a security control
+	// here — an attacker able to inject a key into the JWKS would inject a VALID
+	// one — so it only ever bought data hygiene, at the cost of availability.
 	if err := v.jwksCache.Register(fetchCtx, v.jwksURL,
 		jwk.WithHTTPClient(v.httpClient),
 		jwk.WithConstantInterval(jwksRefreshInterval),
 		jwk.WithWaitReady(false),
+		jwk.WithStrictKeySetParsing(false),
 	); err != nil {
 		return fmt.Errorf("authn: failed to register JWKS URL %s: %w", v.jwksURL, err)
 	}
