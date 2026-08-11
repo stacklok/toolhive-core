@@ -70,8 +70,12 @@ var ErrPrivateIPAddress = errors.New("the provided URL redirects to a private IP
 // is blocked wholesale via privateIPBlocks to avoid a false-negative bypass.
 var nat64Prefixes []*net.IPNet
 
-// embeddedIPv4 returns the IPv4 address embedded in the low 32 bits of a NAT64
-// address if ip falls inside a NAT64 translation prefix, or nil otherwise.
+// sixToFourPrefix identifies 6to4 addresses, whose embedded IPv4 address
+// occupies bytes 2 through 5 of the IPv6 address (RFC 3056 §2).
+var sixToFourPrefix *net.IPNet
+
+// embeddedIPv4 returns the IPv4 address embedded in a NAT64 or 6to4 address,
+// or nil otherwise.
 func embeddedIPv4(ip net.IP) net.IP {
 	v6 := ip.To16()
 	if v6 == nil || ip.To4() != nil {
@@ -81,6 +85,9 @@ func embeddedIPv4(ip net.IP) net.IP {
 		if block.Contains(ip) {
 			return net.IPv4(v6[12], v6[13], v6[14], v6[15])
 		}
+	}
+	if sixToFourPrefix.Contains(ip) {
+		return net.IPv4(v6[2], v6[3], v6[4], v6[5])
 	}
 	return nil
 }
@@ -93,6 +100,7 @@ func init() {
 		"172.16.0.0/12",   // RFC1918
 		"192.168.0.0/16",  // RFC1918
 		"169.254.0.0/16",  // RFC3927 link-local
+		"2001::/32",       // RFC4380 Teredo (embedded client IPv4 is obfuscated)
 		"::1/128",         // IPv6 loopback
 		"fe80::/10",       // IPv6 link-local
 		"fc00::/7",        // IPv6 unique local addr
@@ -124,20 +132,23 @@ func init() {
 		}
 		nat64Prefixes = append(nat64Prefixes, block)
 	}
+	_, block, err := net.ParseCIDR("2002::/16")
+	if err != nil {
+		panic(fmt.Errorf("parse error on 6to4 prefix: %w", err))
+	}
+	sixToFourPrefix = block
 }
 
 // IsPrivateIP reports whether ip is a private, loopback, link-local,
 // unspecified, or otherwise reserved/non-public address.
 //
-// NAT64-translated addresses are evaluated by the IPv4 address they embed: a
-// NAT64 address whose low 32 bits map to a private/link-local IPv4 (e.g.
-// 64:ff9b:1::a9fe:a9fe -> 169.254.169.254, the cloud metadata endpoint) is
-// treated as private, because behind a NAT64 gateway it reaches exactly that
-// internal IPv4, while NAT64 addresses embedding a genuinely public IPv4 remain
-// allowed. This /96 decoding covers the well-known 64:ff9b::/96 (RFC 6052) and
-// the 64:ff9b:1::/96 sub-prefix of the RFC 8215 local-use range; the rest of
-// 64:ff9b:1::/48 uses a non-/96 embedding that cannot be decoded from the
-// address alone and is blocked wholesale (see privateIPBlocks).
+// NAT64- and 6to4-translated addresses are evaluated by the IPv4 address they
+// embed. A translated address whose embedded IPv4 is private or link-local is
+// treated as private, because it reaches that internal IPv4 through its
+// translator. NAT64 addresses embed the IPv4 in their low 32 bits; 6to4
+// addresses embed it in bytes 2 through 5. Teredo addresses are blocked
+// wholesale because their embedded client IPv4 is obfuscated and cannot be
+// safely derived from the IPv6 literal.
 func IsPrivateIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 		return true
@@ -282,16 +293,10 @@ const (
 	hostLoopbackV6 = "[::1]"
 )
 
-// IsLocalhost checks if a host is a loopback address (for development).
-// Recognised forms: "localhost", "localhost:<port>", "127.0.0.1", "127.0.0.1:<port>",
-// "[::1]", "[::1]:<port>".
+// IsLocalhost checks whether a host is localhost or a literal loopback address.
+// It accepts plain-host and host:port forms without resolving hostnames.
 func IsLocalhost(host string) bool {
-	return strings.HasPrefix(host, hostLocalhost+":") ||
-		strings.HasPrefix(host, hostLoopbackV4+":") ||
-		strings.HasPrefix(host, hostLoopbackV6+":") ||
-		host == hostLocalhost ||
-		host == hostLoopbackV4 ||
-		host == hostLoopbackV6
+	return IsLoopbackHost(host)
 }
 
 // IsLoopbackHost reports whether the Host header value refers to a loopback
