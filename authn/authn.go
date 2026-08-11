@@ -331,6 +331,45 @@ type Validator struct {
 	negativeKids map[string]time.Time
 }
 
+// ValidateConfig validates cfg and returns a normalized copy with defaults
+// applied. It is exactly the static policy checking and defaulting NewValidator
+// performs before it builds anything, exposed on its own.
+//
+// It exists for a caller that defers construction. A resource server whose issuer
+// may not be reachable yet has good reason to build its Validator lazily in the
+// background — but that also defers every error, so a plain typo in the issuer or
+// a contradictory audience policy would stop being a startup failure and become a
+// per-request one, discovered from a log line rather than at deploy time.
+// ValidateConfig separates the two: static policy can be rejected synchronously
+// while discovery and JWKS work stay asynchronous.
+//
+// It performs NO I/O. No HTTP client is built, no file is read, no discovery or
+// JWKS fetch is made, no cache or goroutine is started, and no context is
+// required. cfg is not mutated, and every caller-owned slice is cloned, so the
+// returned Config shares no backing array with the argument.
+//
+// A successful return does NOT promise that NewValidator will succeed: everything
+// dynamic remains unchecked. Whether CACertPath and AuthTokenFile exist and parse,
+// whether the issuer resolves, whether its discovery document is conformant, and
+// whether the JWKS is reachable are all still open questions — deliberately, since
+// they are precisely the part a deferring caller wants to keep asynchronous.
+//
+// On failure the zero Config is returned, so a half-defaulted value cannot be used
+// by mistake.
+func ValidateConfig(cfg Config) (Config, error) {
+	// Clone BEFORE validating so the returned Config owns its policy outright.
+	// Assigning the caller's slices through would let a caller that mutates one
+	// afterwards silently rewrite trusted policy — and race Validate while doing
+	// it, once the Config reaches a Validator. validate() only reads these, so
+	// cloning first is equivalent to cloning after, and safer to keep that way.
+	cfg.Audiences = slices.Clone(cfg.Audiences)
+	cfg.AcceptedTokenTypes = slices.Clone(cfg.AcceptedTokenTypes)
+	if err := cfg.validate(); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
 // NewValidator validates cfg and constructs a Validator.
 //
 // The ctx argument governs the LIFETIME of the validator's background JWKS
@@ -345,17 +384,15 @@ type Validator struct {
 // Errors returned here are ordinary construction errors, not the *Error type:
 // *Error is reserved for Validate/ParseBearer runtime failures.
 func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
-	if err := cfg.validate(); err != nil {
+	// Validation, defaulting and the defensive slice cloning all live in
+	// ValidateConfig, which is exported for callers that need to reject a
+	// misconfiguration before committing to construction. Routing through it here
+	// keeps ONE validation path, so the exported check and the constructor cannot
+	// drift into disagreeing about what a valid Config is.
+	cfg, err := ValidateConfig(cfg)
+	if err != nil {
 		return nil, err
 	}
-
-	// Config is copied by value, but Audiences and AcceptedTokenTypes would
-	// still alias the caller's backing arrays: mutating either slice afterwards
-	// would silently rewrite trusted policy, and would race Validate while
-	// doing it. Clone both so the validator owns its policy for its whole
-	// lifetime.
-	cfg.Audiences = slices.Clone(cfg.Audiences)
-	cfg.AcceptedTokenTypes = slices.Clone(cfg.AcceptedTokenTypes)
 
 	httpClient, err := newHTTPClient(cfg.HTTPClient, cfg.AllowPrivateIP, cfg.CACertPath, cfg.AuthTokenFile)
 	if err != nil {

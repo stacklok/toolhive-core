@@ -33,6 +33,8 @@ const unreachableJWKSURL = "http://127.0.0.1:1/jwks.json"
 // errors (leeway, audience length, token length, body cap).
 const wantErrExceeds = "exceeds"
 
+const idTokenJWT = "id_token+jwt"
+
 // validConfig returns a Config that passes validation.
 func validConfig() Config {
 	return Config{
@@ -246,6 +248,144 @@ func TestNewValidatorConfigValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestValidateConfigAgreesWithNewValidator pins the single-validation-path
+// requirement: NewValidator routes through ValidateConfig, so the exported check
+// and the constructor cannot drift into disagreeing about what a valid Config is.
+// Rather than duplicate the table above, this asserts the two produce the SAME
+// error for each rejection. Every case here fails before any I/O, so calling
+// NewValidator is offline and cheap.
+func TestValidateConfigAgreesWithNewValidator(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"no issuer and no jwks_url", func(c *Config) { c.Issuer = ""; c.JWKSURL = "" }},
+		{"non-https issuer", func(c *Config) { c.Issuer = "http://issuer.example.com" }},
+		{"no audience and no AllowAnyAudience", func(c *Config) { c.Audiences = nil }},
+		{"audiences together with AllowAnyAudience", func(c *Config) { c.AllowAnyAudience = true }},
+		{"negative leeway", func(c *Config) { c.Leeway = -time.Second }},
+		{"leeway above the maximum", func(c *Config) { c.Leeway = time.Hour }},
+		{"DisableLeeway with a non-zero leeway", func(c *Config) {
+			c.DisableLeeway = true
+			c.Leeway = 30 * time.Second
+		}},
+		{"negative max token lifetime", func(c *Config) { c.MaxTokenLifetime = -time.Second }},
+		{"negative max JWKS staleness", func(c *Config) { c.MaxJWKSStaleness = -time.Second }},
+		{"empty accepted token type", func(c *Config) { c.AcceptedTokenTypes = []string{" "} }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validConfig()
+			tt.mutate(&cfg)
+
+			got, valErr := ValidateConfig(cfg)
+			require.Error(t, valErr, "ValidateConfig must reject this config")
+			assert.Equal(t, Config{}, got, "a rejected config must come back zeroed, not half-defaulted")
+
+			v, ctorErr := NewValidator(context.Background(), cfg)
+			require.Error(t, ctorErr, "NewValidator must reject the same config")
+			assert.Nil(t, v)
+			assert.Equal(t, valErr.Error(), ctorErr.Error(),
+				"both paths must report the identical error, or they have drifted")
+		})
+	}
+}
+
+// TestValidateConfigNormalizesWithoutTouchingTheCaller covers the two promises a
+// caller relies on when holding a validated Config: the defaults are actually
+// applied, and neither the caller's struct nor its slice backing arrays are
+// touched.
+func TestValidateConfigNormalizesWithoutTouchingTheCaller(t *testing.T) {
+	t.Parallel()
+
+	t.Run("defaults are applied", func(t *testing.T) {
+		t.Parallel()
+		got, err := ValidateConfig(validConfig())
+		require.NoError(t, err)
+		assert.Equal(t, defaultLeeway, got.Leeway, "zero leeway must default")
+	})
+
+	t.Run("DisableLeeway keeps zero leeway", func(t *testing.T) {
+		t.Parallel()
+		cfg := validConfig()
+		cfg.DisableLeeway = true
+		got, err := ValidateConfig(cfg)
+		require.NoError(t, err)
+		assert.Zero(t, got.Leeway, "DisableLeeway must not be overwritten by the default")
+	})
+
+	t.Run("the caller's Config is not mutated", func(t *testing.T) {
+		t.Parallel()
+		cfg := validConfig()
+		_, err := ValidateConfig(cfg)
+		require.NoError(t, err)
+		assert.Zero(t, cfg.Leeway, "defaulting must land on the copy, not the caller's struct")
+	})
+
+	t.Run("caller slice mutations cannot rewrite the returned policy", func(t *testing.T) {
+		t.Parallel()
+		cfg := validConfig()
+		cfg.AcceptedTokenTypes = []string{"at+jwt"}
+		got, err := ValidateConfig(cfg)
+		require.NoError(t, err)
+
+		// Rewrite both slices through the caller's own headers. Without the clone
+		// these writes would land in the returned Config's backing arrays and
+		// silently redefine the trusted policy.
+		cfg.Audiences[0] = "https://attacker.example.com"
+		cfg.AcceptedTokenTypes[0] = idTokenJWT
+
+		assert.Equal(t, []string{"https://api.example.com"}, got.Audiences)
+		assert.Equal(t, []string{"at+jwt"}, got.AcceptedTokenTypes)
+	})
+}
+
+// TestValidateConfigPerformsNoIO is the contract that makes the function useful to
+// a caller deferring construction: it must reject static policy errors without
+// doing any of the work that can fail dynamically.
+//
+// Both cases assert the sharper version of that claim — not merely that
+// ValidateConfig succeeds, but that NewValidator on the SAME config fails on the
+// I/O ValidateConfig skipped. That doubles as a check on the documented caveat:
+// a successful ValidateConfig is no promise that construction will succeed.
+func TestValidateConfigPerformsNoIO(t *testing.T) {
+	t.Parallel()
+
+	t.Run("no CA bundle is read", func(t *testing.T) {
+		t.Parallel()
+		cfg := validConfig()
+		cfg.CACertPath = filepath.Join(t.TempDir(), "does-not-exist.pem")
+
+		_, err := ValidateConfig(cfg)
+		require.NoError(t, err, "a missing CA bundle is not a static policy error")
+
+		// newHTTPClient reads the bundle, so construction is where this surfaces.
+		v, err := NewValidator(context.Background(), cfg)
+		require.Error(t, err, "NewValidator must be the one to read the bundle and fail")
+		assert.Nil(t, v)
+	})
+
+	t.Run("no JWKS or discovery fetch is attempted", func(t *testing.T) {
+		t.Parallel()
+		cfg := validConfig()
+		// Port 1 on loopback refuses connections, so any fetch fails.
+		cfg.JWKSURL = unreachableJWKSURL
+		cfg.InsecureAllowHTTP = true
+		cfg.AllowPrivateIP = true
+
+		_, err := ValidateConfig(cfg)
+		require.NoError(t, err, "an unreachable JWKS is not a static policy error")
+
+		v, err := NewValidator(context.Background(), cfg)
+		require.Error(t, err, "NewValidator must be the one to fetch and fail")
+		assert.Nil(t, v)
+	})
 }
 
 func TestValidatorCloseIdempotentAndConcurrent(t *testing.T) {
@@ -647,9 +787,9 @@ func TestAcceptedTokenTypesClonedAtConstruction(t *testing.T) {
 	t.Cleanup(v.Close)
 
 	// Rewrite the caller's slice to a type the validator must NOT accept.
-	cfg.AcceptedTokenTypes[0] = "id_token+jwt"
+	cfg.AcceptedTokenTypes[0] = idTokenJWT
 
-	token := rsaKey.mint(t, js.srv.URL, withHeader("typ", "id_token+jwt"))
+	token := rsaKey.mint(t, js.srv.URL, withHeader("typ", idTokenJWT))
 	_, err = v.Validate(context.Background(), token)
 	requireAuthnError(t, err, CodeInvalidToken, ReasonTokenType)
 
