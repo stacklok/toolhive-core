@@ -23,10 +23,53 @@ jobs:
 
       - name: Run govulncheck
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        continue-on-error: true
         with:
           go-version-input: 'stable'
           go-package: ./...
           repo-checkout: false
+          output-format: json
+          output-file: govulncheck-output.json
+
+      - name: Check for vulnerabilities (with exclusions)
+        run: |
+          # Ignored vulnerabilities with justification:
+          #
+          # GO-2026-5932: golang.org/x/crypto/openpgp is deprecated-by-design
+          # ("unsafe, not maintained, should not be used"). No fixed version
+          # exists and none is planned. This module does not import openpgp
+          # directly; it arrives transitively through sigstore-go, whose
+          # signing and verification entry points link it for
+          # backward-compatible OpenPGP support. Remove when sigstore drops
+          # the openpgp dependency.
+          #
+          # This mirrors the identical exclusion in stacklok/toolhive
+          # (.github/workflows/security-scan.yml), which consumes the same
+          # sigstore packages.
+          IGNORED_VULNS="GO-2026-5932"
+
+          echo "::group::govulncheck raw output"
+          cat govulncheck-output.json
+          echo "::endgroup::"
+
+          # Only "finding" entries with an osv field represent vulnerabilities
+          # whose vulnerable symbols are actually reachable.
+          FOUND_VULNS=$(jq -r 'select(.finding != null) | .finding.osv' govulncheck-output.json \
+            | sort -u | grep -E '^GO-' || true)
+
+          UNEXPECTED=""
+          for v in $FOUND_VULNS; do
+            case " $IGNORED_VULNS " in
+              *" $v "*) echo "Ignoring $v (documented exclusion)" ;;
+              *) UNEXPECTED="$UNEXPECTED $v" ;;
+            esac
+          done
+
+          if [ -n "$UNEXPECTED" ]; then
+            echo "::error::Unexcluded vulnerabilities found:$UNEXPECTED"
+            exit 1
+          fi
+          echo "No unexcluded vulnerabilities found."
 
   grype:
     name: Grype Vulnerability Scan
