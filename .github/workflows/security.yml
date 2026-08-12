@@ -37,11 +37,20 @@ jobs:
           #
           # GO-2026-5932: golang.org/x/crypto/openpgp is deprecated-by-design
           # ("unsafe, not maintained, should not be used"). No fixed version
-          # exists and none is planned. This module does not import openpgp
-          # directly; it arrives transitively through sigstore-go, whose
-          # signing and verification entry points link it for
-          # backward-compatible OpenPGP support. Remove when sigstore drops
-          # the openpgp dependency.
+          # exists and none is planned.
+          #
+          # Nothing here imports openpgp. It arrives four levels up:
+          #   container/signer -> sigstore-go/pkg/sign -> rekor/pkg/pki
+          #     -> rekor/pkg/pki/pgp -> golang.org/x/crypto/openpgp
+          # rekor/pkg/pki is a pluggable signature-format registry, so
+          # importing it links every format, PGP included. Every govulncheck
+          # trace is package-init reachability, not a call: the code is
+          # linked but never parses PGP data on any ToolHive path.
+          #
+          # REMOVAL TRIGGER: rekor migrated to ProtonMail/go-crypto/openpgp
+          # in sigstore/rekor#2883 (merged 2026-07-15), which landed after
+          # v1.5.3 (2026-07-02) and so is not in any release yet. Bump rekor
+          # past v1.5.3 once a release contains it, then drop this entry.
           #
           # This mirrors the identical exclusion in stacklok/toolhive
           # (.github/workflows/security-scan.yml), which consumes the same
