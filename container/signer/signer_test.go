@@ -71,19 +71,17 @@ func pushTestArtifact(t *testing.T, registryHost string) (ref string, digestStr 
 	return ref, d.String()
 }
 
-// verifyKeyBundle verifies a serialized bundle against the public key and
-// the given payload digest, through the sibling verifier package's real
-// entry point. Previously this test hand-rolled an equivalent verifier
-// because the two halves lived in different repositories; now that they are
-// siblings, the round trip exercises the actual code path a consumer hits
-// rather than a reimplementation of it.
-func verifyKeyBundle(t *testing.T, raw, pubPEM []byte, payloadDigest []byte) error {
+// verifyKeyBundle verifies a signing result against the public key, through
+// the sibling verifier package's real entry point.
+//
+// It uses res.PayloadDigest rather than recomputing a digest, which is the
+// point: a consumer holding only the Result must be able to verify it. When
+// this helper had to rebuild the simple-signing payload itself, the test
+// passed while the public API was unusable as documented.
+func verifyKeyBundle(t *testing.T, res *Result, pubPEM []byte) error {
 	t.Helper()
-	_, err := verifier.VerifyBundleOfflineWithKey(
-		raw,
-		verifier.DigestAlgorithmSHA256+":"+hex.EncodeToString(payloadDigest),
-		pubPEM,
-	)
+	require.NotEmpty(t, res.PayloadDigest, "a signing result must carry the digest it signed")
+	_, err := verifier.VerifyBundleOfflineWithKey(res.Bundle, res.PayloadDigest, pubPEM)
 	return err
 }
 
@@ -98,14 +96,14 @@ func TestSignOCIRoundTrip(t *testing.T) {
 
 	raw, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{Key: keyPath})
 	require.NoError(t, err)
-	require.NotEmpty(t, raw)
+	require.NotEmpty(t, raw.Bundle)
 
 	// The returned bundle verifies against the signing key over the
 	// simple-signing payload digest.
 	payload, err := SimpleSigningPayload(ref, digestStr)
 	require.NoError(t, err)
 	payloadDigest := sha256.Sum256(payload)
-	require.NoError(t, verifyKeyBundle(t, raw, pubPEM, payloadDigest[:]),
+	require.NoError(t, verifyKeyBundle(t, raw, pubPEM),
 		"the returned bundle must verify against the signing key")
 
 	// The attached signature manifest reconstructs to the SAME signature:
@@ -136,7 +134,7 @@ func TestSignOCIRoundTrip(t *testing.T) {
 
 	// The annotation signature matches the bundle's message signature.
 	parsed := &bundle.Bundle{}
-	require.NoError(t, parsed.UnmarshalJSON(raw))
+	require.NoError(t, parsed.UnmarshalJSON(raw.Bundle))
 	bundleSig := parsed.Bundle.GetMessageSignature().GetSignature()
 	annotationSig, err := base64.StdEncoding.DecodeString(layer.Annotations[annotationCosignSignature])
 	require.NoError(t, err)
@@ -157,10 +155,7 @@ func TestSignOCIRejectsWrongKeyVerification(t *testing.T) {
 	raw, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{Key: keyPath})
 	require.NoError(t, err)
 
-	payload, err := SimpleSigningPayload(ref, digestStr)
-	require.NoError(t, err)
-	payloadDigest := sha256.Sum256(payload)
-	require.Error(t, verifyKeyBundle(t, raw, otherPub, payloadDigest[:]),
+	require.Error(t, verifyKeyBundle(t, raw, otherPub),
 		"a different key must not verify the bundle")
 }
 
@@ -196,7 +191,7 @@ func TestSignOCIEncryptedKey(t *testing.T) {
 	t.Setenv("COSIGN_PASSWORD", "test-password")
 	raw, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{Key: keyPath})
 	require.NoError(t, err, "an encrypted key must decrypt via COSIGN_PASSWORD")
-	require.NotEmpty(t, raw)
+	require.NotEmpty(t, raw.Bundle)
 
 	t.Setenv("COSIGN_PASSWORD", "wrong-password")
 	_, err = NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{Key: keyPath})
@@ -385,10 +380,7 @@ func TestSignOCIAcceptsCosignCLIKeyFormat(t *testing.T) {
 			raw, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{Key: keyPath})
 			require.NoError(t, err, "a key from `cosign generate-key-pair` must be usable")
 
-			payload, err := SimpleSigningPayload(ref, digestStr)
-			require.NoError(t, err)
-			payloadDigest := sha256.Sum256(payload)
-			require.NoError(t, verifyKeyBundle(t, raw, pubPEM, payloadDigest[:]))
+			require.NoError(t, verifyKeyBundle(t, raw, pubPEM))
 		})
 	}
 }
@@ -404,4 +396,118 @@ func TestSignOCICosignKeyWrongPasswordIsReported(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "COSIGN_PASSWORD",
 		"a wrong password must point at the password, not surface an opaque ASN.1 error")
+}
+
+// sigLayers returns the layer descriptors of the cosign signature manifest
+// attached to digestStr.
+func sigLayers(t *testing.T, ref, digestStr string) []v1.Descriptor {
+	t.Helper()
+	parsed, err := name.ParseReference(ref)
+	require.NoError(t, err)
+	h, err := v1.NewHash(digestStr)
+	require.NoError(t, err)
+	sigTag := parsed.Context().Tag(h.Algorithm + "-" + h.Hex + ".sig")
+	img, err := remote.Image(sigTag)
+	require.NoError(t, err)
+	m, err := img.Manifest()
+	require.NoError(t, err)
+	return m.Layers
+}
+
+// TestSignOCIAppendsRatherThanReplacingSignatures covers the multi-signer
+// case: an artifact can legitimately carry signatures from several parties,
+// and signing it again must not delete trust material belonging to someone
+// else. Building the manifest from empty.Image and writing it to the .sig
+// tag silently did exactly that.
+//
+//nolint:paralleltest // uses t.Setenv
+func TestSignOCIAppendsRatherThanReplacingSignatures(t *testing.T) {
+	reg := httptest.NewServer(registry.New())
+	t.Cleanup(reg.Close)
+	host := strings.TrimPrefix(reg.URL, "http://")
+
+	t.Setenv("COSIGN_PASSWORD", "")
+	keyA, pubA := writeTestKey(t)
+	keyB, pubB := writeTestKey(t)
+	ref, digestStr := pushTestArtifact(t, host)
+
+	rawA, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{Key: keyA})
+	require.NoError(t, err)
+	require.Len(t, sigLayers(t, ref, digestStr), 1, "first signature creates the manifest")
+
+	rawB, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{Key: keyB})
+	require.NoError(t, err)
+
+	layers := sigLayers(t, ref, digestStr)
+	require.Len(t, layers, 2, "a second signer must not evict the first signature")
+
+	// Both signatures must still verify — the manifest carries two distinct
+	// annotations, one per key.
+	require.NoError(t, verifyKeyBundle(t, rawA, pubA))
+	require.NoError(t, verifyKeyBundle(t, rawB, pubB))
+
+	sigs := map[string]bool{}
+	for _, l := range layers {
+		sigs[l.Annotations[annotationCosignSignature]] = true
+	}
+	assert.Len(t, sigs, 2, "the two layers must carry distinct signatures")
+}
+
+// TestSignOCIWithSameKeyIsIdempotent keeps repeated pushes from growing the
+// signature manifest without bound.
+//
+//nolint:paralleltest // uses t.Setenv
+func TestSignOCIWithSameKeyIsIdempotent(t *testing.T) {
+	reg := httptest.NewServer(registry.New())
+	t.Cleanup(reg.Close)
+	host := strings.TrimPrefix(reg.URL, "http://")
+
+	t.Setenv("COSIGN_PASSWORD", "")
+	key, _ := writeTestKey(t)
+	ref, digestStr := pushTestArtifact(t, host)
+
+	for range 3 {
+		_, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{Key: key})
+		require.NoError(t, err)
+	}
+	assert.Len(t, sigLayers(t, ref, digestStr), 1,
+		"re-signing with the same key must not append a duplicate layer")
+}
+
+// TestResultCarriesTheDigestItSigned pins the API contract the reviewer of
+// #230 flagged: the bundle signs the simple-signing payload, NOT the
+// artifact digest passed to SignOCI. A consumer holding only the bundle and
+// the artifact digest — which the old []byte return implied was enough —
+// would pass the wrong digest to a bundle verifier and always fail.
+//
+//nolint:paralleltest // uses t.Setenv
+func TestResultCarriesTheDigestItSigned(t *testing.T) {
+	reg := httptest.NewServer(registry.New())
+	t.Cleanup(reg.Close)
+	host := strings.TrimPrefix(reg.URL, "http://")
+
+	t.Setenv("COSIGN_PASSWORD", "")
+	keyPath, pubPEM := writeTestKey(t)
+	ref, digestStr := pushTestArtifact(t, host)
+
+	res, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{Key: keyPath})
+	require.NoError(t, err)
+
+	assert.NotEqual(t, digestStr, res.PayloadDigest,
+		"the signed digest is the payload's, not the artifact's — if these ever match, the contract changed")
+
+	// The artifact digest must NOT verify the bundle. This is the mistake
+	// the previous signature invited.
+	_, err = verifier.VerifyBundleOfflineWithKey(res.Bundle, digestStr, pubPEM)
+	require.Error(t, err, "the artifact digest must not verify a payload-bound bundle")
+
+	// The digest the Result reports must.
+	_, err = verifier.VerifyBundleOfflineWithKey(res.Bundle, res.PayloadDigest, pubPEM)
+	require.NoError(t, err)
+
+	// And PayloadDigest recomputes the same value from ref + digest alone,
+	// which is all a later consumer has.
+	recomputed, err := PayloadDigest(ref, digestStr)
+	require.NoError(t, err)
+	assert.Equal(t, res.PayloadDigest, recomputed)
 }

@@ -22,7 +22,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run govulncheck
+        id: scan
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        # Findings are triaged in the next step against the exclusion list,
+        # so a non-zero exit here is expected and not itself the verdict.
+        # The next step is responsible for turning a genuinely failed scan
+        # into a failed job.
         continue-on-error: true
         with:
           go-version-input: 'stable'
@@ -32,7 +37,11 @@ jobs:
           output-file: govulncheck-output.json
 
       - name: Check for vulnerabilities (with exclusions)
+        env:
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
         run: |
+          set -euo pipefail
+
           # Ignored vulnerabilities with justification:
           #
           # GO-2026-5932: golang.org/x/crypto/openpgp is deprecated-by-design
@@ -57,14 +66,38 @@ jobs:
           # sigstore packages.
           IGNORED_VULNS="GO-2026-5932"
 
+          # A scan that produced nothing is a failed scan, not a clean one.
+          # Without this the gate goes green when the action crashes, since
+          # "no findings parsed" and "no vulnerabilities" look identical.
+          if [ ! -s govulncheck-output.json ]; then
+            echo "::error::govulncheck produced no output (step outcome: ${SCAN_OUTCOME}); refusing to report success"
+            exit 1
+          fi
+
           echo "::group::govulncheck raw output"
           cat govulncheck-output.json
           echo "::endgroup::"
 
+          # jq failures must be fatal. Truncated or malformed output would
+          # otherwise yield an empty finding list indistinguishable from a
+          # clean scan.
+          if ! jq -r 'select(.finding != null) | .finding.osv' govulncheck-output.json > found-osv.txt; then
+            echo "::error::could not parse govulncheck output; treating as a failed scan"
+            exit 1
+          fi
+
           # Only "finding" entries with an osv field represent vulnerabilities
-          # whose vulnerable symbols are actually reachable.
-          FOUND_VULNS=$(jq -r 'select(.finding != null) | .finding.osv' govulncheck-output.json \
-            | sort -u | grep -E '^GO-' || true)
+          # whose vulnerable symbols are actually reachable. grep exiting 1
+          # here means "no matches", which is a legitimately clean result —
+          # that is the only non-zero status tolerated.
+          FOUND_VULNS=$(sort -u found-osv.txt | { grep -E '^GO-' || true; })
+
+          # The action exits non-zero both when it finds vulnerabilities and
+          # when it fails outright. Findings tell those apart.
+          if [ "${SCAN_OUTCOME}" = "failure" ] && [ -z "${FOUND_VULNS}" ]; then
+            echo "::error::govulncheck failed without reporting any finding — the scan itself errored"
+            exit 1
+          fi
 
           UNEXPECTED=""
           for v in $FOUND_VULNS; do

@@ -16,6 +16,8 @@ package signer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -38,13 +40,30 @@ type Options struct {
 	Key string
 }
 
+// Result is the outcome of a signing operation.
+type Result struct {
+	// Bundle is the serialized Sigstore bundle, for durable storage and
+	// later offline re-verification.
+	Bundle []byte
+	// PayloadDigest is the "<algorithm>:<hex>" digest of the simple-signing
+	// payload the bundle actually signs.
+	//
+	// This is deliberately surfaced because it is NOT the artifact digest
+	// passed to SignOCI. Following the cosign convention, the signature
+	// covers a payload that *embeds* the artifact digest rather than the
+	// digest itself, so verifying Bundle offline requires this value —
+	// passing the artifact digest to a bundle verifier will always fail.
+	// See [PayloadDigest] to recompute it from a reference and digest alone.
+	PayloadDigest string
+}
+
 // Signer signs OCI artifacts and attaches the signature to the registry.
 type Signer interface {
 	// SignOCI signs the artifact at ref pinned to the given manifest digest
 	// ("sha256:..."), attaches the signature as a cosign signature manifest
-	// next to the artifact, and returns the serialized Sigstore bundle for
-	// storage.
-	SignOCI(ctx context.Context, ref, digest string, opts Options) ([]byte, error)
+	// next to the artifact, and returns the bundle together with the digest
+	// it signs.
+	SignOCI(ctx context.Context, ref, digest string, opts Options) (*Result, error)
 }
 
 // Default implements Signer with file-based cosign keys.
@@ -72,7 +91,7 @@ func NewDefault(keychain authn.Keychain) *Default {
 // verifier reconstructing the bundle from the registry manifest (or
 // re-verifying the stored bundle offline) therefore checks exactly the
 // signature that was attached — one signature, two representations.
-func (d *Default) SignOCI(ctx context.Context, ref, digestStr string, opts Options) ([]byte, error) {
+func (d *Default) SignOCI(ctx context.Context, ref, digestStr string, opts Options) (*Result, error) {
 	if opts.Key == "" {
 		return nil, ErrKeyRequired
 	}
@@ -97,7 +116,9 @@ func (d *Default) SignOCI(ctx context.Context, ref, digestStr string, opts Optio
 		return nil, errors.New("signing produced no message signature")
 	}
 
-	if err := attachCosignSignature(ctx, d.keychain, ref, digestStr, payload, msgSig.GetSignature()); err != nil {
+	if err := attachCosignSignature(
+		ctx, d.keychain, ref, digestStr, payload, msgSig.GetSignature(), keypair.GetPublicKey(),
+	); err != nil {
 		return nil, fmt.Errorf("attaching signature manifest: %w", err)
 	}
 
@@ -109,5 +130,24 @@ func (d *Default) SignOCI(ctx context.Context, ref, digestStr string, opts Optio
 	if err != nil {
 		return nil, fmt.Errorf("serializing sigstore bundle: %w", err)
 	}
-	return raw, nil
+	return &Result{Bundle: raw, PayloadDigest: payloadDigest(payload)}, nil
+}
+
+// PayloadDigest returns the digest of the simple-signing payload that a
+// signature over the artifact at ref pinned to digestStr covers.
+//
+// Consumers verifying a stored bundle generally hold only the reference and
+// the artifact digest — not the [Result] from signing — so this is the
+// supported way to recover the value a bundle verifier needs.
+func PayloadDigest(imageRef, digestStr string) (string, error) {
+	payload, err := SimpleSigningPayload(imageRef, digestStr)
+	if err != nil {
+		return "", err
+	}
+	return payloadDigest(payload), nil
+}
+
+func payloadDigest(payload []byte) string {
+	sum := sha256.Sum256(payload)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
