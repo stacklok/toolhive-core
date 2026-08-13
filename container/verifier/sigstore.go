@@ -190,10 +190,19 @@ func getBundleVerificationMaterial(manifestLayer v1.Descriptor) (
 		return nil, fmt.Errorf("error getting signing certificate: %w", err)
 	}
 
-	// 2. Get the transparency log entries
-	tlogEntries, err := getVerificationMaterialTlogEntries(manifestLayer)
-	if err != nil {
-		return nil, fmt.Errorf("error getting tlog entries: %w", err)
+	// 2. Get the transparency log entries, when present. A certificate-bearing
+	// signature is not required to carry one — e.g. a Fulcio deployment run
+	// without a paired transparency log — so an absent bundle annotation
+	// means "no tlog entry", the same way an absent certificate annotation
+	// means "key-signed" above. Calling getVerificationMaterialTlogEntries
+	// unconditionally here would fail to unmarshal the empty annotation and
+	// discard an otherwise valid certificate-only layer entirely.
+	var tlogEntries []*protorekor.TransparencyLogEntry
+	if manifestLayer.Annotations["dev.sigstore.cosign/bundle"] != "" {
+		tlogEntries, err = getVerificationMaterialTlogEntries(manifestLayer)
+		if err != nil {
+			return nil, fmt.Errorf("error getting tlog entries: %w", err)
+		}
 	}
 	// 3. Construct the verification material
 	return &protobundle.VerificationMaterial{

@@ -208,7 +208,7 @@ func attachCosignSignature(
 // signedByIdentity and signedByKey for why these must be different checks.
 func alreadySigned(base v1.Image, payload []byte, pub crypto.PublicKey, cert *certMaterial) (bool, error) {
 	if cert != nil {
-		return signedByIdentity(base, cert.summary)
+		return signedByIdentity(base, payload, cert.summary)
 	}
 	return signedByKey(base, payload, pub)
 }
@@ -304,16 +304,22 @@ func signedByKey(img v1.Image, payload []byte, pub crypto.PublicKey) (bool, erro
 }
 
 // signedByIdentity reports whether img already carries a certificate-bearing
-// signature layer from the same signer identity as summary — i.e. whether
-// this keyless signer has already signed this artifact. This is the
-// keyless counterpart to signedByKey: comparing certificate bytes, or the
-// signature itself, would never dedupe, because keyless signing mints a
-// fresh ephemeral keypair and certificate on every run. Identity —
-// certificate SAN plus OIDC issuer — is what stays stable across runs, and
-// is also what a verifier's trust policy binds to (see
-// container/verifier's identityPolicyOption), so it is the right notion of
-// "already signed by this signer".
-func signedByIdentity(img v1.Image, summary fulciocert.Summary) (bool, error) {
+// signature layer from the same signer identity as summary that ALSO
+// cryptographically verifies against payload — i.e. whether this keyless
+// signer has already produced a valid signature over this exact artifact.
+// Identity match alone is not enough to dedupe on: a layer whose signature
+// does not verify against its own certificate is not "already signed",
+// merely damaged, and treating it as equivalent would let a corrupted or
+// mismatched existing layer permanently block a legitimate re-sign from
+// ever attaching a valid signature. This is the keyless counterpart to
+// signedByKey: comparing certificate bytes, or the signature itself, would
+// never dedupe, because keyless signing mints a fresh ephemeral keypair and
+// certificate on every run. Identity — certificate SAN plus OIDC issuer —
+// is what stays stable across runs, and is also what a verifier's trust
+// policy binds to (see container/verifier's identityPolicyOption), so it is
+// the right notion of "already signed by this signer", checked alongside —
+// never instead of — the cryptographic check.
+func signedByIdentity(img v1.Image, payload []byte, summary fulciocert.Summary) (bool, error) {
 	manifest, err := img.Manifest()
 	if err != nil {
 		return false, fmt.Errorf("reading signature manifest layers: %w", err)
@@ -334,12 +340,41 @@ func signedByIdentity(img v1.Image, summary fulciocert.Summary) (bool, error) {
 		if err != nil {
 			continue
 		}
-		if existingSummary.SubjectAlternativeName == summary.SubjectAlternativeName &&
-			existingSummary.Issuer == summary.Issuer {
+		if existingSummary.SubjectAlternativeName != summary.SubjectAlternativeName ||
+			existingSummary.Issuer != summary.Issuer {
+			continue
+		}
+		if verifies, _ := certLayerVerifies(l, existing, payload); verifies {
 			return true, nil
 		}
+		// Same identity, but this layer's signature does not verify against
+		// its own certificate and payload — it is corrupt or stale, not a
+		// prior valid signing. Fall through rather than dedupe on it, so a
+		// new, valid signature still gets appended.
 	}
 	return false, nil
+}
+
+// certLayerVerifies reports whether layer's attached signature annotation
+// cryptographically verifies against cert's public key and payload. A
+// decode or verifier-construction failure is reported as "does not verify"
+// rather than propagated: the annotation is registry-supplied data, and the
+// caller's fallback (treat as not-yet-signed, append a new layer) is
+// already the correct response to a layer that fails to check out.
+func certLayerVerifies(layer v1.Descriptor, cert *x509.Certificate, payload []byte) (bool, error) {
+	encoded := layer.Annotations[annotationCosignSignature]
+	if encoded == "" {
+		return false, errors.New("layer carries a certificate but no signature annotation")
+	}
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return false, fmt.Errorf("decoding signature annotation: %w", err)
+	}
+	sigVerifier, err := signature.LoadVerifier(cert.PublicKey, crypto.SHA256)
+	if err != nil {
+		return false, fmt.Errorf("loading verifier for existing certificate: %w", err)
+	}
+	return sigVerifier.VerifySignature(bytes.NewReader(raw), bytes.NewReader(payload)) == nil, nil
 }
 
 // certMaterial is the certificate and transparency-log evidence for a
@@ -427,9 +462,24 @@ func certificateAnnotation(certDER []byte) string {
 // without a transparency-log entry (e.g. signing against a private,
 // non-transparency-logged Fulcio deployment) — in which case the empty
 // string is returned and no annotation is written.
+//
+// This layout has no field for a Rekor v2 style inclusion proof (a Merkle
+// proof against a signed checkpoint) — only the v1 inclusion promise (a
+// signed entry timestamp) fits. An entry with no promise would otherwise
+// silently produce an annotation with an empty SignedEntryTimestamp, which
+// container/verifier's reconstructed bundle fails to validate far away from
+// this call site; failing here instead keeps the error at the point the bad
+// data was produced. Target-only-Rekor-v1 is a deliberate current scope
+// limit, not an oversight — see the keyless design notes.
 func rekorBundleAnnotation(entry *protorekor.TransparencyLogEntry) (string, error) {
 	if entry == nil {
 		return "", nil
+	}
+	set := entry.GetInclusionPromise().GetSignedEntryTimestamp()
+	if len(set) == 0 {
+		return "", errors.New(
+			"transparency-log entry carries no inclusion promise (SignedEntryTimestamp): " +
+				"the cosign bundle annotation cannot represent a proof-only (Rekor v2) entry")
 	}
 	bun := struct {
 		SignedEntryTimestamp string `json:"SignedEntryTimestamp"`
@@ -440,7 +490,7 @@ func rekorBundleAnnotation(entry *protorekor.TransparencyLogEntry) (string, erro
 			LogID          string `json:"logID"`
 		} `json:"Payload"`
 	}{
-		SignedEntryTimestamp: base64.StdEncoding.EncodeToString(entry.GetInclusionPromise().GetSignedEntryTimestamp()),
+		SignedEntryTimestamp: base64.StdEncoding.EncodeToString(set),
 	}
 	bun.Payload.Body = base64.StdEncoding.EncodeToString(entry.GetCanonicalizedBody())
 	bun.Payload.IntegratedTime = entry.GetIntegratedTime()

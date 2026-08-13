@@ -783,7 +783,13 @@ func TestRekorBundleAnnotationMatchesVerifierReadShape(t *testing.T) {
 // TestAttachCosignSignatureCertBearingWithoutTlog covers signing against a
 // Fulcio deployment with no transparency log: the certificate annotation
 // must still be written, and the bundle annotation must simply be absent
-// rather than written empty or malformed.
+// rather than written empty or malformed. It must also still round-trip
+// through verifier.RetrieveBundles as a keyless bundle — this is the
+// regression case for a bug where getBundleVerificationMaterial called
+// getVerificationMaterialTlogEntries unconditionally whenever a certificate
+// annotation was present, so it tried (and failed) to unmarshal the empty
+// "dev.sigstore.cosign/bundle" annotation and the layer was silently
+// discarded, surfacing as ErrNoBundles.
 func TestAttachCosignSignatureCertBearingWithoutTlog(t *testing.T) {
 	t.Parallel()
 	reg := httptest.NewServer(registry.New())
@@ -802,6 +808,105 @@ func TestAttachCosignSignatureCertBearingWithoutTlog(t *testing.T) {
 	assert.NotEmpty(t, layers[0].Annotations[annotationCosignCertificate])
 	assert.Empty(t, layers[0].Annotations[annotationCosignBundle],
 		"no tlog entry means no bundle annotation, not an empty one")
+
+	bundles, err := verifier.RetrieveBundles(t.Context(), ref, nil)
+	require.NoError(t, err, "a certificate-only bundle with no tlog entry must still round-trip")
+	require.Len(t, bundles, 1)
+	assert.True(t, bundles[0].HasCertificate())
+}
+
+// TestRekorBundleAnnotationRejectsProofOnlyEntry covers the other tlog
+// shape: a Rekor v2 style entry carrying only an inclusion proof (a Merkle
+// proof against a signed checkpoint), with no inclusion promise (SET). The
+// classic cosign bundle annotation has no field for a proof, so silently
+// emitting one built from an empty SET would produce an annotation that
+// looks well-formed but fails sigstore-go's bundle validation later, far
+// from where the bad data originated. rekorBundleAnnotation must fail here
+// instead, at attach time.
+func TestRekorBundleAnnotationRejectsProofOnlyEntry(t *testing.T) {
+	t.Parallel()
+
+	entry := &protorekor.TransparencyLogEntry{
+		LogIndex:       42,
+		LogId:          &protocommon.LogId{KeyId: []byte{0xab, 0xcd}},
+		KindVersion:    &protorekor.KindVersion{Kind: fixtureRekorKind, Version: fixtureRekorAPIVersion},
+		IntegratedTime: 1700000000,
+		InclusionProof: &protorekor.InclusionProof{
+			LogIndex: 42,
+			RootHash: []byte{0x01, 0x02},
+			TreeSize: 100,
+		},
+		CanonicalizedBody: []byte(`{"apiVersion":"0.0.1","kind":"hashedrekord"}`),
+	}
+
+	_, err := rekorBundleAnnotation(entry)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "inclusion promise")
+
+	// The same rejection must surface through the full attach path, not
+	// just the helper in isolation, since that is where a real caller would
+	// hit it.
+	reg := httptest.NewServer(registry.New())
+	t.Cleanup(reg.Close)
+	host := strings.TrimPrefix(reg.URL, "http://")
+	ref, digestStr := pushTestArtifact(t, host)
+	payload, perr := SimpleSigningPayload(ref, digestStr)
+	require.NoError(t, perr)
+
+	certDER, priv := generateFulcioStyleCert(t, "https://example.com/signer", "https://issuer.example.com")
+	digest := sha256.Sum256(payload)
+	sig, serr := priv.Sign(rand.Reader, digest[:], nil)
+	require.NoError(t, serr)
+	pb := &protobundle.Bundle{
+		Content: &protobundle.Bundle_MessageSignature{
+			MessageSignature: &protocommon.MessageSignature{
+				MessageDigest: &protocommon.HashOutput{Algorithm: protocommon.HashAlgorithm_SHA2_256, Digest: digest[:]},
+				Signature:     sig,
+			},
+		},
+		VerificationMaterial: &protobundle.VerificationMaterial{
+			Content:     &protobundle.VerificationMaterial_Certificate{Certificate: &protocommon.X509Certificate{RawBytes: certDER}},
+			TlogEntries: []*protorekor.TransparencyLogEntry{entry},
+		},
+	}
+	err = attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pb, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "inclusion promise")
+}
+
+// TestAttachCosignSignatureCertDedupeIgnoresUnverifiableExistingLayer covers
+// the dedupe-crypto-check fix: an existing layer whose certificate identity
+// matches but whose signature does NOT verify (tampered, or signed over a
+// different payload) must not be treated as "already signed" — otherwise a
+// single corrupted layer would permanently block a valid re-sign from ever
+// attaching. The malformed layer is left in place (append-never-replace
+// still holds) and a second, valid layer must be appended alongside it.
+func TestAttachCosignSignatureCertDedupeIgnoresUnverifiableExistingLayer(t *testing.T) {
+	t.Parallel()
+	reg := httptest.NewServer(registry.New())
+	t.Cleanup(reg.Close)
+	host := strings.TrimPrefix(reg.URL, "http://")
+
+	ref, digestStr := pushTestArtifact(t, host)
+	payload, err := SimpleSigningPayload(ref, digestStr)
+	require.NoError(t, err)
+	otherDigestStr := "sha256:" + strings.Repeat("ab", 32)
+	otherPayload, err := SimpleSigningPayload(ref, otherDigestStr)
+	require.NoError(t, err)
+
+	// Attach a layer whose signature is over a DIFFERENT payload than the
+	// one about to be signed, but under the same certificate/identity — the
+	// same SAN+issuer match signedByIdentity's dedupe would otherwise trust.
+	badPb := certBearingBundle(t, otherPayload, "https://example.com/signer", "https://issuer.example.com", false)
+	require.NoError(t, attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, otherPayload, badPb, nil))
+	require.Len(t, sigLayers(t, ref, digestStr), 1)
+
+	// Now attach a genuinely valid signature over the real payload, same
+	// identity. It must NOT be deduped away by the mismatched layer above.
+	goodPb := certBearingBundle(t, payload, "https://example.com/signer", "https://issuer.example.com", false)
+	require.NoError(t, attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, goodPb, nil))
+	assert.Len(t, sigLayers(t, ref, digestStr), 2,
+		"an existing same-identity layer whose signature does not verify must not suppress a valid re-sign")
 }
 
 // TestAttachCosignSignatureCertBearingWithTlogAnnotatesBundle covers the
