@@ -41,6 +41,7 @@ import (
 	// and canonicalizes.
 	_ "github.com/sigstore/rekor/pkg/types/hashedrekord/v0.0.1"
 	rekorutil "github.com/sigstore/rekor/pkg/util"
+	verifybundle "github.com/sigstore/sigstore-go/pkg/bundle"
 	fulciocert "github.com/sigstore/sigstore-go/pkg/fulcio/certificate"
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/tlog"
@@ -835,4 +836,165 @@ func TestKeylessBundleOptionsDefaultToPublicGood(t *testing.T) {
 	assert.Equal(t, "token", opts.CertificateProviderOptions.IDToken)
 	assert.Nil(t, opts.TrustedRoot,
 		"signing must not verify against a trusted root it cannot scope to the target deployment")
+}
+
+// TestSignOCIKeylessDedupeReturnsAttachedBundle is the regression test for
+// the "same signature, two representations" contract on the dedupe path.
+// Re-signing with the same identity makes attachCosignSignature a no-op
+// (TestSignOCIKeylessReSignAppendsForNewIdentity is its append-side
+// sibling), but every keyless signing operation mints a fresh ephemeral
+// key, Fulcio certificate, and Rekor entry — so the freshly built bundle's
+// own signature never matches whatever is actually on the registry when
+// nothing gets appended. SignOCI must return the bundle that IS attached,
+// not the one it built in memory and then discarded.
+func TestSignOCIKeylessDedupeReturnsAttachedBundle(t *testing.T) {
+	t.Parallel()
+	s := newTestSigstore(t)
+	reg := httptest.NewServer(registry.New())
+	t.Cleanup(reg.Close)
+	ref, digestStr := pushTestArtifact(t, strings.TrimPrefix(reg.URL, "http://"))
+
+	opts := Options{IdentityToken: identityToken(t, testKeylessSAN), FulcioURL: s.fulcioURL, RekorURL: s.rekorURL}
+	first, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, opts)
+	require.NoError(t, err)
+
+	second, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, opts)
+	require.NoError(t, err)
+
+	require.Len(t, sigLayers(t, ref, digestStr), 1,
+		"re-signing the same identity must not append a duplicate layer")
+
+	// Compare the underlying cryptographic material, not the raw JSON:
+	// sign.Bundle's own output (what first.Bundle would be, and what
+	// second.Bundle would WRONGLY be without the fix) is bundle media type
+	// v0.3, while verifier.RetrieveBundles always reconstructs the classic
+	// v0.1 shape from OCI annotations — a real, pre-existing difference in
+	// serialization shape that exists regardless of dedupe, so it is not
+	// the right thing to assert byte-identical.
+	firstSig, firstCert := decodeBundleSignatureAndCert(t, first.Bundle)
+	secondSig, secondCert := decodeBundleSignatureAndCert(t, second.Bundle)
+	assert.Equal(t, firstSig, secondSig,
+		"the dedupe path must return the signature actually attached, not a freshly built, never-written one")
+	assert.Equal(t, firstCert, secondCert, "the dedupe path must return the certificate actually attached")
+
+	// Guard against the equality above passing for the wrong reason (e.g.
+	// signing happening to be deterministic in this fixture): a THIRD call
+	// must also converge on that exact same material, not merely produce
+	// "some" pair that happens to match.
+	third, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, opts)
+	require.NoError(t, err)
+	thirdSig, thirdCert := decodeBundleSignatureAndCert(t, third.Bundle)
+	assert.Equal(t, firstSig, thirdSig)
+	assert.Equal(t, firstCert, thirdCert)
+}
+
+// decodeBundleSignatureAndCert extracts the message signature and leaf
+// certificate DER from a serialized sigstore bundle, for comparing the
+// underlying cryptographic material across two bundles independent of
+// their JSON shape.
+func decodeBundleSignatureAndCert(t *testing.T, raw []byte) (sig, certDER []byte) {
+	t.Helper()
+	var bun verifybundle.Bundle
+	require.NoError(t, bun.UnmarshalJSON(raw))
+	msgSig := bun.GetMessageSignature()
+	require.NotNil(t, msgSig)
+	cert, err := certMaterialFromBundle(bun.Bundle)
+	require.NoError(t, err)
+	require.NotNil(t, cert)
+	return msgSig.GetSignature(), cert.certDER
+}
+
+// TestSignOCIRespectsContextCancellation is the regression test for a
+// canceled ctx not stopping an in-flight Fulcio call. sigstore-go's Fulcio
+// client (pkg/sign.Fulcio.GetCertificate, sigstore-go v1.3.0) builds its
+// HTTP request with http.NewRequest, not http.NewRequestWithContext, and
+// only consults ctx between retries — once a request is actually in
+// flight, canceling ctx has no effect on it; SignOCI would otherwise block
+// until Fulcio's own client-level timeout (30s by default). signBundle
+// races ctx.Done() against the call instead, so SignOCI must return
+// promptly on cancellation regardless of what the dependency does.
+func TestSignOCIRespectsContextCancellation(t *testing.T) {
+	t.Parallel()
+
+	block := make(chan struct{})
+	fulcioMux := http.NewServeMux()
+	fulcioMux.HandleFunc("POST /api/v2/signingCert", func(http.ResponseWriter, *http.Request) {
+		<-block // never responds within the test's lifetime
+	})
+	fulcio := httptest.NewServer(fulcioMux)
+	// Cleanup order matters: httptest.Server.Close blocks until in-flight
+	// requests complete, so the handler must be unblocked FIRST. t.Cleanup
+	// runs LIFO, so registering fulcio.Close before closing block makes
+	// close(block) run first.
+	t.Cleanup(fulcio.Close)
+	t.Cleanup(func() { close(block) })
+
+	reg := httptest.NewServer(registry.New())
+	t.Cleanup(reg.Close)
+	ref, digestStr := pushTestArtifact(t, strings.TrimPrefix(reg.URL, "http://"))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := NewDefault(nil).SignOCI(ctx, ref, digestStr, Options{
+		IdentityToken: identityToken(t, testKeylessSAN),
+		FulcioURL:     fulcio.URL,
+		RekorURL:      "http://127.0.0.1:0", // unreachable; never consulted before ctx fires
+	})
+	elapsed := time.Since(start)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, elapsed, 2*time.Second,
+		"SignOCI must return promptly on ctx cancellation, not block for the underlying HTTP client's own timeout")
+}
+
+// TestSignOCIRecoversFromMalformedRekorResponse is the regression test for
+// a nil-pointer panic reachable through untrusted network input.
+// sigstore/rekor's own response parsing (pkg/tle.GenerateTransparencyLogEntry,
+// reached via sigstore-go's Rekor v1 client) dereferences
+// Verification.InclusionProof unconditionally, and a syntactically
+// well-formed Rekor response that simply omits the optional "verification"
+// object reaches that dereference. SignOCI's signBundle wrapper must
+// recover this into a returned error: signing happens for the lifetime of
+// a long-lived `thv serve` process, so an unrecovered panic here would
+// take the whole process down over one bad response from a misconfigured
+// (not necessarily malicious) Rekor deployment.
+func TestSignOCIRecoversFromMalformedRekorResponse(t *testing.T) {
+	t.Parallel()
+	s := newTestSigstore(t)
+
+	fulcioMux := http.NewServeMux()
+	fulcioMux.HandleFunc("POST /api/v2/signingCert", s.handleSigningCert)
+	fulcio := httptest.NewServer(fulcioMux)
+	t.Cleanup(fulcio.Close)
+
+	// A syntactically valid Rekor response — 201 Created, ETag identifying
+	// the entry, a decodable body — that simply has no "verification" key.
+	// LogID must be present and valid hex for GenerateTransparencyLogEntry
+	// to reach as far as the Verification dereference.
+	rekorMux := http.NewServeMux()
+	rekorMux.HandleFunc("POST /api/v1/log/entries", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", "test-entry-uuid")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"test-entry-uuid":{` +
+			`"logID":"` + strings.Repeat("ab", 32) + `",` +
+			`"logIndex":1,"integratedTime":1700000000,"body":"e30="}}`))
+	})
+	rekor := httptest.NewServer(rekorMux)
+	t.Cleanup(rekor.Close)
+
+	reg := httptest.NewServer(registry.New())
+	t.Cleanup(reg.Close)
+	ref, digestStr := pushTestArtifact(t, strings.TrimPrefix(reg.URL, "http://"))
+
+	// If this panics unrecovered, the whole test BINARY aborts, not just
+	// this test — which is precisely the failure mode being guarded against.
+	_, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{
+		IdentityToken: identityToken(t, testKeylessSAN),
+		FulcioURL:     fulcio.URL,
+		RekorURL:      rekor.URL,
+	})
+	require.Error(t, err, "a malformed Rekor response must surface as an error, never as a crash")
 }

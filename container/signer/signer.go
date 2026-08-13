@@ -22,15 +22,22 @@
 package signer
 
 import (
+	"bytes"
 	"context"
+	"crypto"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/go-containerregistry/pkg/authn"
+	protobundle "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v1"
 	verifybundle "github.com/sigstore/sigstore-go/pkg/bundle"
 	"github.com/sigstore/sigstore-go/pkg/sign"
+	"github.com/sigstore/sigstore/pkg/signature"
+
+	"github.com/stacklok/toolhive-core/container/verifier"
 )
 
 // Public-good Sigstore endpoints, used when Options leaves the corresponding
@@ -183,35 +190,183 @@ func (d *Default) SignOCI(ctx context.Context, ref, digestStr string, opts Optio
 		return nil, err
 	}
 
-	// sign.Bundle invokes the keypair's SignData over the payload and
-	// records both the signature and the payload digest in the bundle. On
-	// the keyless path it additionally calls Fulcio for a certificate over
-	// the ephemeral key and submits the signature to Rekor, folding both
-	// into the bundle's verification material.
-	pb, err := sign.Bundle(&sign.PlainData{Data: payload}, keypair, bundleOpts)
+	pb, err := signBundle(ctx, payload, keypair, bundleOpts)
 	if err != nil {
-		return nil, fmt.Errorf("building sigstore bundle: %w", err)
+		return nil, err
 	}
 	msgSig := pb.GetMessageSignature()
 	if msgSig == nil || len(msgSig.GetSignature()) == 0 {
 		return nil, errors.New("signing produced no message signature")
 	}
 
-	if err := attachCosignSignature(
-		ctx, d.keychain, ref, digestStr, payload, pb, keypair.GetPublicKey(),
-	); err != nil {
+	// Validated BEFORE the registry is touched: a malformed-but-parseable
+	// response from Fulcio/Rekor could otherwise attach successfully and
+	// only THEN fail validation below, returning an error despite having
+	// already mutated the registry.
+	if _, err := verifybundle.NewBundle(pb); err != nil {
+		return nil, fmt.Errorf("validating sigstore bundle: %w", err)
+	}
+
+	attached, err := attachCosignSignature(ctx, d.keychain, ref, digestStr, payload, pb, keypair.GetPublicKey())
+	if err != nil {
 		return nil, fmt.Errorf("attaching signature manifest: %w", err)
 	}
 
-	bun, err := verifybundle.NewBundle(pb)
+	raw, err := resultBundleJSON(ctx, d.keychain, ref, digestStr, payload, pb, keypair.GetPublicKey(), attached)
 	if err != nil {
-		return nil, fmt.Errorf("finalizing sigstore bundle: %w", err)
-	}
-	raw, err := bun.MarshalJSON()
-	if err != nil {
-		return nil, fmt.Errorf("serializing sigstore bundle: %w", err)
+		return nil, err
 	}
 	return &Result{Bundle: raw, PayloadDigest: payloadDigest(payload)}, nil
+}
+
+// signBundle runs sign.Bundle on its own goroutine so SignOCI honors ctx
+// cancellation even though it cannot always rely on the underlying
+// dependency to: sigstore-go's Fulcio client (pkg/sign.Fulcio.GetCertificate,
+// as of sigstore-go v1.3.0) builds its HTTP request with http.NewRequest,
+// not http.NewRequestWithContext, and only consults ctx between retries —
+// once a request is actually in flight, a canceled ctx has no effect until
+// the HTTP client's own timeout fires (30s by default). Racing ctx.Done()
+// against the call lets a canceled SignOCI return promptly regardless; the
+// abandoned goroutine still exits on its own once the underlying call
+// completes or times out, so nothing leaks unbounded.
+//
+// The same boundary recovers a panic, for a related but distinct reason:
+// sigstore/rekor's own response parsing (pkg/tle.GenerateTransparencyLogEntry,
+// reached via sigstore-go's Rekor v1 client) dereferences several
+// Verification/InclusionProof response fields unconditionally, and a
+// well-formed JSON response that simply omits that object — a misconfigured
+// or non-standard Rekor deployment, not necessarily a hostile one — reaches
+// that dereference and panics. SignOCI is this package's public API surface
+// and, per the package doc, signing happens for the lifetime of a long-lived
+// `thv serve` process; an unrecovered panic here would take the whole
+// process down over a single bad network response. Recovering only around
+// this specific call (not, say, wrapping SignOCI's own logic) keeps the
+// recover() scoped to untrusted external input, not to bugs in this
+// package's own code.
+func signBundle(ctx context.Context, payload []byte, keypair sign.Keypair, opts sign.BundleOptions) (*protobundle.Bundle, error) {
+	type signOutcome struct {
+		pb  *protobundle.Bundle
+		err error
+	}
+	outcome := make(chan signOutcome, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				outcome <- signOutcome{
+					err: fmt.Errorf("signing failed unexpectedly (a Fulcio or Rekor response could not be processed): %v", r),
+				}
+			}
+		}()
+		pb, err := sign.Bundle(&sign.PlainData{Data: payload}, keypair, opts)
+		outcome <- signOutcome{pb: pb, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-outcome:
+		if res.err != nil {
+			return nil, fmt.Errorf("building sigstore bundle: %w", res.err)
+		}
+		return res.pb, nil
+	}
+}
+
+// resultBundleJSON returns the serialized bundle that accurately reflects
+// what is now on the registry, per attachCosignSignature's attached result.
+//
+// When attached is true, pb IS what was just written — "one signature, two
+// representations," as documented on SignOCI. When attached is false,
+// attachCosignSignature detected this identity/key had already signed the
+// artifact and left the pre-existing layer alone: pb was built but never
+// written anywhere, and every signing operation is randomised (a fresh
+// ephemeral key and Fulcio certificate for keyless; ECDSA's own randomised
+// nonce for a key re-sign), so pb's signature does not match what is
+// actually attached. Returning pb in that case would violate the same
+// contract from the other direction — the caller would hold a
+// self-consistent bundle that nonetheless does not correspond to the
+// artifact's actual registry state. The genuinely attached bundle is
+// retrieved and returned instead.
+func resultBundleJSON(
+	ctx context.Context,
+	keychain authn.Keychain,
+	ref, digestStr string,
+	payload []byte,
+	pb *protobundle.Bundle,
+	pub crypto.PublicKey,
+	attached bool,
+) ([]byte, error) {
+	if attached {
+		bun, err := verifybundle.NewBundle(pb)
+		if err != nil {
+			return nil, fmt.Errorf("finalizing sigstore bundle: %w", err)
+		}
+		raw, err := bun.MarshalJSON()
+		if err != nil {
+			return nil, fmt.Errorf("serializing sigstore bundle: %w", err)
+		}
+		return raw, nil
+	}
+	return previouslyAttachedBundleJSON(ctx, keychain, ref, digestStr, payload, pb, pub)
+}
+
+// previouslyAttachedBundleJSON retrieves the signature layer that made this
+// signing operation a no-op and returns its serialized bundle — the one
+// genuinely on the registry, as opposed to the freshly (but never attached)
+// built pb.
+func previouslyAttachedBundleJSON(
+	ctx context.Context,
+	keychain authn.Keychain,
+	ref, digestStr string,
+	payload []byte,
+	pb *protobundle.Bundle,
+	pub crypto.PublicKey,
+) ([]byte, error) {
+	full := ref
+	if !strings.Contains(ref, "@") {
+		full = ref + "@" + digestStr
+	}
+	bundles, err := verifier.RetrieveBundles(ctx, full, keychain)
+	if err != nil {
+		return nil, fmt.Errorf("retrieving previously attached signature: %w", err)
+	}
+	cert, err := certMaterialFromBundle(pb)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range bundles {
+		if bundleMatchesSigner(b, payload, cert, pub) {
+			return b.Raw, nil
+		}
+	}
+	return nil, errors.New("previously attached signature not found among the artifact's signature layers")
+}
+
+// bundleMatchesSigner reports whether b is the layer this signing operation
+// deduped against: the same certificate identity for keyless (SAN + OIDC
+// issuer — never certificate bytes, which are fresh every keyless run), or
+// a signature over payload that verifies with pub for the key-signed flow
+// (never signature bytes, which ECDSA randomises on every call).
+func bundleMatchesSigner(b verifier.Bundle, payload []byte, cert *certMaterial, pub crypto.PublicKey) bool {
+	if b.Parsed == nil {
+		return false
+	}
+	if cert != nil {
+		existing, err := certMaterialFromBundle(b.Parsed.Bundle)
+		if err != nil || existing == nil {
+			return false
+		}
+		return existing.summary.SubjectAlternativeName == cert.summary.SubjectAlternativeName &&
+			existing.summary.Issuer == cert.summary.Issuer
+	}
+	msgSig := b.Parsed.GetMessageSignature()
+	if msgSig == nil || len(msgSig.GetSignature()) == 0 {
+		return false
+	}
+	sigVerifier, err := signature.LoadVerifier(pub, crypto.SHA256)
+	if err != nil {
+		return false
+	}
+	return sigVerifier.VerifySignature(bytes.NewReader(msgSig.GetSignature()), bytes.NewReader(payload)) == nil
 }
 
 // signingMaterial resolves opts into the key pair to sign with and the

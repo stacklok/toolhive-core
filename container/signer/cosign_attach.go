@@ -127,6 +127,13 @@ func parseManifestDigest(digestStr string) (digest.Digest, error) {
 // pub is the public key used for the key-signed dedupe check below — it is
 // separate from pb because the key-signed bundle itself carries no key
 // material, only a hint.
+//
+// The returned bool reports whether a new layer was actually appended:
+// false means the artifact was already signed by this identity/key and
+// attachCosignSignature was a no-op. This matters to the caller — pb's
+// signature is randomised per call, so when nothing was appended, pb does
+// NOT represent what is now on the registry; only the pre-existing layer
+// does. See SignOCI's use of this to decide what to return as Result.Bundle.
 func attachCosignSignature(
 	ctx context.Context,
 	keychain authn.Keychain,
@@ -134,28 +141,28 @@ func attachCosignSignature(
 	payload []byte,
 	pb *protobundle.Bundle,
 	pub crypto.PublicKey,
-) error {
+) (bool, error) {
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
-		return fmt.Errorf("parsing image reference: %w", err)
+		return false, fmt.Errorf("parsing image reference: %w", err)
 	}
 	d, err := parseManifestDigest(digestStr)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	msgSig := pb.GetMessageSignature()
 	if msgSig == nil || len(msgSig.GetSignature()) == 0 {
-		return errors.New("bundle carries no message signature to attach")
+		return false, errors.New("bundle carries no message signature to attach")
 	}
 	cert, err := certMaterialFromBundle(pb)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	h, err := v1.NewHash(d.String())
 	if err != nil {
-		return fmt.Errorf("parsing digest hash: %w", err)
+		return false, fmt.Errorf("parsing digest hash: %w", err)
 	}
 	sigTag := ref.Context().Tag(fmt.Sprint(h.Algorithm, "-", h.Hex, ".sig"))
 	remoteOpts := []remote.Option{remote.WithAuthFromKeychain(keychain), remote.WithContext(ctx)}
@@ -167,21 +174,21 @@ func attachCosignSignature(
 	// on the next push. This mirrors cosign's own append behaviour.
 	base, err := existingSignatureImage(sigTag, remoteOpts)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	already, err := alreadySigned(base, payload, pub, cert)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if already {
 		// Re-signing with the same key/identity is a no-op; pushing
 		// repeatedly must not grow the manifest without bound.
-		return nil
+		return false, nil
 	}
 	annotations, err := signatureAnnotations(msgSig.GetSignature(), cert)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	layer := static.NewLayer(payload, mediaTypeCosignSimpleSigningV1JSON)
@@ -191,14 +198,14 @@ func attachCosignSignature(
 		MediaType:   mediaTypeCosignSimpleSigningV1JSON,
 	})
 	if err != nil {
-		return fmt.Errorf("building signature manifest: %w", err)
+		return false, fmt.Errorf("building signature manifest: %w", err)
 	}
 	img = mutate.MediaType(img, types.OCIManifestSchema1)
 
 	if err := remote.Write(sigTag, img, remoteOpts...); err != nil {
-		return fmt.Errorf("pushing signature manifest: %w", err)
+		return false, fmt.Errorf("pushing signature manifest: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // alreadySigned reports whether base already carries a signature layer
