@@ -7,8 +7,11 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net/http"
@@ -24,12 +27,24 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/static"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/opencontainers/go-digest"
+	protobundle "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v1"
+	protorekor "github.com/sigstore/protobuf-specs/gen/pb-go/rekor/v1"
+	fulciocert "github.com/sigstore/sigstore-go/pkg/fulcio/certificate"
 	"github.com/sigstore/sigstore/pkg/signature"
 )
 
 const (
 	mediaTypeCosignSimpleSigningV1JSON = "application/vnd.dev.cosign.simplesigning.v1+json"
 	annotationCosignSignature          = "dev.cosignproject.cosign/signature"
+	// annotationCosignCertificate and annotationCosignBundle are the
+	// additional annotations a keyless (Fulcio) signature carries, on top of
+	// annotationCosignSignature. They MUST match exactly what
+	// container/verifier/sigstore.go reads on the retrieval side: that
+	// package classifies a layer as key-signed whenever
+	// annotationCosignCertificate is absent, so a keyless layer missing it
+	// would silently be misclassified.
+	annotationCosignCertificate = "dev.sigstore.cosign/certificate"
+	annotationCosignBundle      = "dev.sigstore.cosign/bundle"
 )
 
 // cosignSimpleSigning is the payload cosign signs: it embeds the artifact's
@@ -101,11 +116,23 @@ func parseManifestDigest(digestStr string) (digest.Digest, error) {
 // annotations. This is the classic cosign layout, chosen deliberately for
 // interop — "cosign verify --key" and any Sigstore-aware registry tooling
 // can discover and verify it.
+//
+// pb is the Sigstore bundle produced for payload, in the exact shape
+// [sign.Bundle] returns: its message signature is what gets attached, and
+// its verification material determines the layout. A bundle whose
+// verification material carries a certificate (the keyless/Fulcio flow) also
+// gets the certificate and transparency-log annotations
+// container/verifier/sigstore.go reads back; a bundle carrying only a public
+// key hint (the plain key-pair flow) attaches just the signature, as before.
+// pub is the public key used for the key-signed dedupe check below — it is
+// separate from pb because the key-signed bundle itself carries no key
+// material, only a hint.
 func attachCosignSignature(
 	ctx context.Context,
 	keychain authn.Keychain,
 	imageRef, digestStr string,
-	payload, signatureBytes []byte,
+	payload []byte,
+	pb *protobundle.Bundle,
 	pub crypto.PublicKey,
 ) error {
 	ref, err := name.ParseReference(imageRef)
@@ -113,6 +140,15 @@ func attachCosignSignature(
 		return fmt.Errorf("parsing image reference: %w", err)
 	}
 	d, err := parseManifestDigest(digestStr)
+	if err != nil {
+		return err
+	}
+
+	msgSig := pb.GetMessageSignature()
+	if msgSig == nil || len(msgSig.GetSignature()) == 0 {
+		return errors.New("bundle carries no message signature to attach")
+	}
+	cert, err := certMaterialFromBundle(pb)
 	if err != nil {
 		return err
 	}
@@ -134,27 +170,25 @@ func attachCosignSignature(
 		return err
 	}
 
-	already, err := signedByKey(base, payload, pub)
+	already, err := alreadySigned(base, payload, pub, cert)
 	if err != nil {
 		return err
 	}
 	if already {
-		// Re-signing with the same key is a no-op; pushing repeatedly must
-		// not grow the manifest without bound. Comparing signature bytes
-		// would not work — ECDSA is randomised, so the same key produces a
-		// different signature every time — so this asks the question that
-		// actually matters: is one of the existing signatures already ours?
+		// Re-signing with the same key/identity is a no-op; pushing
+		// repeatedly must not grow the manifest without bound.
 		return nil
 	}
-	encodedSig := base64.StdEncoding.EncodeToString(signatureBytes)
+	annotations, err := signatureAnnotations(msgSig.GetSignature(), cert)
+	if err != nil {
+		return err
+	}
 
 	layer := static.NewLayer(payload, mediaTypeCosignSimpleSigningV1JSON)
 	img, err := mutate.Append(base, mutate.Addendum{
-		Layer: layer,
-		Annotations: map[string]string{
-			annotationCosignSignature: encodedSig,
-		},
-		MediaType: mediaTypeCosignSimpleSigningV1JSON,
+		Layer:       layer,
+		Annotations: annotations,
+		MediaType:   mediaTypeCosignSimpleSigningV1JSON,
 	})
 	if err != nil {
 		return fmt.Errorf("building signature manifest: %w", err)
@@ -165,6 +199,39 @@ func attachCosignSignature(
 		return fmt.Errorf("pushing signature manifest: %w", err)
 	}
 	return nil
+}
+
+// alreadySigned reports whether base already carries a signature layer
+// equivalent to the one about to be attached, dispatching to the dedupe
+// check that matches the signature's layout: identity comparison for a
+// certificate-bearing (keyless) signature, key comparison otherwise. See
+// signedByIdentity and signedByKey for why these must be different checks.
+func alreadySigned(base v1.Image, payload []byte, pub crypto.PublicKey, cert *certMaterial) (bool, error) {
+	if cert != nil {
+		return signedByIdentity(base, cert.summary)
+	}
+	return signedByKey(base, payload, pub)
+}
+
+// signatureAnnotations builds the layer annotations for an attached
+// signature: always the signature itself, plus the certificate and
+// (when present) transparency-log annotations for a keyless signature.
+func signatureAnnotations(signatureBytes []byte, cert *certMaterial) (map[string]string, error) {
+	annotations := map[string]string{
+		annotationCosignSignature: base64.StdEncoding.EncodeToString(signatureBytes),
+	}
+	if cert == nil {
+		return annotations, nil
+	}
+	annotations[annotationCosignCertificate] = certificateAnnotation(cert.certDER)
+	bundleAnnotation, err := rekorBundleAnnotation(cert.tlogEntry)
+	if err != nil {
+		return nil, err
+	}
+	if bundleAnnotation != "" {
+		annotations[annotationCosignBundle] = bundleAnnotation
+	}
+	return annotations, nil
 }
 
 // existingSignatureImage fetches the signature manifest already at tag, or
@@ -234,4 +301,155 @@ func signedByKey(img v1.Image, payload []byte, pub crypto.PublicKey) (bool, erro
 		}
 	}
 	return false, nil
+}
+
+// signedByIdentity reports whether img already carries a certificate-bearing
+// signature layer from the same signer identity as summary — i.e. whether
+// this keyless signer has already signed this artifact. This is the
+// keyless counterpart to signedByKey: comparing certificate bytes, or the
+// signature itself, would never dedupe, because keyless signing mints a
+// fresh ephemeral keypair and certificate on every run. Identity —
+// certificate SAN plus OIDC issuer — is what stays stable across runs, and
+// is also what a verifier's trust policy binds to (see
+// container/verifier's identityPolicyOption), so it is the right notion of
+// "already signed by this signer".
+func signedByIdentity(img v1.Image, summary fulciocert.Summary) (bool, error) {
+	manifest, err := img.Manifest()
+	if err != nil {
+		return false, fmt.Errorf("reading signature manifest layers: %w", err)
+	}
+	for _, l := range manifest.Layers {
+		pemCert := l.Annotations[annotationCosignCertificate]
+		if pemCert == "" {
+			continue
+		}
+		existing, err := parseLeafCertificate([]byte(pemCert))
+		if err != nil {
+			// A layer we cannot parse is not one of ours; leave it alone
+			// rather than failing the whole push over someone else's
+			// malformed annotation.
+			continue
+		}
+		existingSummary, err := fulciocert.SummarizeCertificate(existing)
+		if err != nil {
+			continue
+		}
+		if existingSummary.SubjectAlternativeName == summary.SubjectAlternativeName &&
+			existingSummary.Issuer == summary.Issuer {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// certMaterial is the certificate and transparency-log evidence for a
+// keyless (Fulcio) signature, extracted from the Sigstore bundle passed to
+// attachCosignSignature.
+type certMaterial struct {
+	// certDER is the leaf signing certificate, DER-encoded.
+	certDER []byte
+	// summary is the signer identity (SAN + OIDC issuer) the certificate
+	// carries, used by signedByIdentity for dedupe.
+	summary fulciocert.Summary
+	// tlogEntry is the Rekor transparency-log entry covering the signature,
+	// when the bundle carries one.
+	tlogEntry *protorekor.TransparencyLogEntry
+}
+
+// certMaterialFromBundle extracts the leaf certificate and transparency-log
+// entry from pb's verification material, structurally mirroring
+// container/verifier/bundles.go's Bundle.HasCertificate: a bundle whose
+// verification material carries neither a certificate nor a certificate
+// chain is the key-signed layout, and certMaterialFromBundle reports that by
+// returning a nil *certMaterial (not an error) — attachCosignSignature falls
+// back to the key-signed dedupe and annotation path in that case. Only a
+// certificate that IS present but fails to parse is an error: a bundle
+// claiming to be keyless with unusable certificate material must not be
+// silently treated as key-signed.
+func certMaterialFromBundle(pb *protobundle.Bundle) (*certMaterial, error) {
+	vm := pb.GetVerificationMaterial()
+	var certDER []byte
+	switch {
+	case vm.GetCertificate() != nil:
+		certDER = vm.GetCertificate().GetRawBytes()
+	case vm.GetX509CertificateChain() != nil && len(vm.GetX509CertificateChain().GetCertificates()) > 0:
+		// The verifier's read side only ever reconstructs a single
+		// certificate from the "dev.sigstore.cosign/certificate"
+		// annotation (see getVerificationMaterialX509CertificateChain), so
+		// only the leaf is written here too — intermediates are not
+		// carried through this layout today.
+		certDER = vm.GetX509CertificateChain().GetCertificates()[0].GetRawBytes()
+	default:
+		return nil, nil
+	}
+
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return nil, fmt.Errorf("parsing signing certificate: %w", err)
+	}
+	summary, err := fulciocert.SummarizeCertificate(cert)
+	if err != nil {
+		return nil, fmt.Errorf("summarizing signing certificate identity: %w", err)
+	}
+
+	var tlogEntry *protorekor.TransparencyLogEntry
+	if entries := vm.GetTlogEntries(); len(entries) > 0 {
+		tlogEntry = entries[0]
+	}
+	return &certMaterial{certDER: certDER, summary: summary, tlogEntry: tlogEntry}, nil
+}
+
+// parseLeafCertificate decodes a single PEM-encoded certificate block, the
+// shape written by certificateAnnotation and read by
+// container/verifier/sigstore.go's getVerificationMaterialX509CertificateChain.
+func parseLeafCertificate(pemCert []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(pemCert)
+	if block == nil {
+		return nil, errors.New("failed to decode PEM block")
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
+// certificateAnnotation PEM-encodes certDER for the
+// "dev.sigstore.cosign/certificate" annotation, matching exactly what
+// container/verifier/sigstore.go's getVerificationMaterialX509CertificateChain
+// decodes back.
+func certificateAnnotation(certDER []byte) string {
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}))
+}
+
+// rekorBundleAnnotation renders entry into the JSON shape
+// container/verifier/sigstore.go's getVerificationMaterialTlogEntries reads
+// back from the "dev.sigstore.cosign/bundle" annotation — cosign's classic
+// RekorBundle layout: a base64 SignedEntryTimestamp alongside a Payload
+// carrying the hex log ID, integrated time, log index, and base64
+// canonicalized entry body. entry may be nil — a bundle can be keyless
+// without a transparency-log entry (e.g. signing against a private,
+// non-transparency-logged Fulcio deployment) — in which case the empty
+// string is returned and no annotation is written.
+func rekorBundleAnnotation(entry *protorekor.TransparencyLogEntry) (string, error) {
+	if entry == nil {
+		return "", nil
+	}
+	bun := struct {
+		SignedEntryTimestamp string `json:"SignedEntryTimestamp"`
+		Payload              struct {
+			Body           string `json:"body"`
+			IntegratedTime int64  `json:"integratedTime"`
+			LogIndex       int64  `json:"logIndex"`
+			LogID          string `json:"logID"`
+		} `json:"Payload"`
+	}{
+		SignedEntryTimestamp: base64.StdEncoding.EncodeToString(entry.GetInclusionPromise().GetSignedEntryTimestamp()),
+	}
+	bun.Payload.Body = base64.StdEncoding.EncodeToString(entry.GetCanonicalizedBody())
+	bun.Payload.IntegratedTime = entry.GetIntegratedTime()
+	bun.Payload.LogIndex = entry.GetLogIndex()
+	bun.Payload.LogID = hex.EncodeToString(entry.GetLogId().GetKeyId())
+
+	raw, err := json.Marshal(bun)
+	if err != nil {
+		return "", fmt.Errorf("encoding rekor bundle annotation: %w", err)
+	}
+	return string(raw), nil
 }
