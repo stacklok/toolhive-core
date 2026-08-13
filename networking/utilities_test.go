@@ -184,8 +184,23 @@ func TestIsLocalhost(t *testing.T) {
 			expected: true,
 		},
 		{
+			name:     "127.0.0.2 without port",
+			input:    "127.0.0.2",
+			expected: true,
+		},
+		{
+			name:     "127.0.0.2 with port",
+			input:    "127.0.0.2:8080",
+			expected: true,
+		},
+		{
 			name:     "IPv6 localhost without port",
 			input:    hostLoopbackV6,
+			expected: true,
+		},
+		{
+			name:     "bare IPv6 localhost",
+			input:    "::1",
 			expected: true,
 		},
 		{
@@ -293,17 +308,17 @@ func TestIsLocalhost(t *testing.T) {
 		{
 			name:     "case insensitive localhost",
 			input:    "LOCALHOST",
-			expected: false, // Current implementation is case sensitive
+			expected: true,
 		},
 		{
 			name:     "case insensitive localhost with port",
 			input:    "LOCALHOST:8080",
-			expected: false, // Current implementation is case sensitive
+			expected: true,
 		},
 		{
 			name:     "mixed case localhost",
 			input:    "LocalHost",
-			expected: false, // Current implementation is case sensitive
+			expected: true,
 		},
 		{
 			name:     "localhost with spaces",
@@ -361,6 +376,17 @@ func TestIsPrivateIP(t *testing.T) {
 		{"documentation TEST-NET-3", "203.0.113.1", true},
 		{"public IPv4", testPublicIPv4, false},
 		{"public IPv6", "2001:db8::1", false},
+		{"global IPv6 outside blocked ranges", "2606:4700:4700::1111", false},
+
+		// Teredo (RFC 4380) obfuscates the client IPv4, so the whole prefix is blocked.
+		{"Teredo example", "2001:0000:4136:e378:8000:63bf:3fff:fdd2", true},
+		{"another Teredo address", "2001:0:1:2:3:4:5:6", true},
+
+		// 6to4 (RFC 3056): classify bytes 2 through 5 as the embedded IPv4.
+		{"6to4 -> IMDS link-local", "2002:a9fe:a9fe::", true},
+		{"6to4 -> RFC1918 10.x", "2002:0a00:0001::", true},
+		{"6to4 -> loopback", "2002:7f00:0001::", true},
+		{"6to4 -> public", "2002:0808:0808::", false},
 
 		// Unspecified / "this host" / reserved ranges (defense-in-depth).
 		{"unspecified IPv4", "0.0.0.0", true},
@@ -473,6 +499,31 @@ func TestAddressReferencesPrivateIp(t *testing.T) {
 			name:        "NAT64 to public IPv4 with port",
 			address:     "[64:ff9b::8.8.8.8]:443",
 			expectError: false,
+		},
+		{
+			name:        "6to4 to public IPv4 with port",
+			address:     "[2002:0808:0808::]:443",
+			expectError: false,
+		},
+		{
+			name:        "Teredo with port",
+			address:     "[2001:0000:4136:e378:8000:63bf:3fff:fdd2]:443",
+			expectError: true,
+		},
+		{
+			name:        "6to4 to IMDS link-local with port",
+			address:     "[2002:a9fe:a9fe::]:443",
+			expectError: true,
+		},
+		{
+			name:        "6to4 to RFC1918 with port",
+			address:     "[2002:0a00:0001::]:443",
+			expectError: true,
+		},
+		{
+			name:        "6to4 to loopback with port",
+			address:     "[2002:7f00:0001::]:443",
+			expectError: true,
 		},
 		{
 			name:        "unspecified IPv4 with port",
