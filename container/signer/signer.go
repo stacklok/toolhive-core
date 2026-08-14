@@ -26,6 +26,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -106,6 +107,10 @@ type Options struct {
 	// short-lived certificate binding it to the token's identity, and the
 	// signature is submitted to Rekor. Obtaining the token is the caller's
 	// responsibility — see the package doc.
+	//
+	// This token is sent as a bearer credential to FulcioURL. A caller
+	// setting FulcioURL to anything other than an HTTPS (or loopback, for
+	// tests) endpoint sends it in the clear.
 	IdentityToken string
 	// FulcioURL overrides the certificate authority for keyless signing.
 	// Empty means DefaultFulcioURL; the default is applied at signing time,
@@ -126,6 +131,15 @@ type Options struct {
 type Result struct {
 	// Bundle is the serialized Sigstore bundle, for durable storage and
 	// later offline re-verification.
+	//
+	// Its JSON shape is not stable across calls for the same identity: a
+	// freshly attached signature serializes as sign.Bundle's own bundle
+	// media type (v0.3), while a signature this call deduped against (see
+	// SignOCI's "one signature, two representations" doc) is reconstructed
+	// by verifier.RetrieveBundles from the classic cosign annotations —
+	// the v0.1 shape, carrying an inclusion promise rather than a proof.
+	// Both verify identically; a caller comparing stored bundles byte-for-
+	// byte across calls, or inspecting mediaType, will see this difference.
 	Bundle []byte
 	// PayloadDigest is the "<algorithm>:<hex>" digest of the simple-signing
 	// payload the bundle actually signs.
@@ -342,12 +356,26 @@ func previouslyAttachedBundleJSON(
 }
 
 // bundleMatchesSigner reports whether b is the layer this signing operation
-// deduped against: the same certificate identity for keyless (SAN + OIDC
-// issuer — never certificate bytes, which are fresh every keyless run), or
-// a signature over payload that verifies with pub for the key-signed flow
+// deduped against: for keyless, the same certificate identity (SAN + OIDC
+// issuer — never certificate bytes, which are fresh every keyless run) AND
+// a signature that verifies against THAT certificate's own key over
+// payload; for key-signed, a signature over payload that verifies with pub
 // (never signature bytes, which ECDSA randomises on every call).
+//
+// The cryptographic check on the keyless branch matters, not just the
+// identity match: signedByIdentity (the attach-side dedupe this mirrors)
+// treats identity as a candidate, not a verdict — the layer must still
+// verify against its own certificate before dedupe accepts it, so that a
+// same-identity layer whose signature happens not to verify (corrupt, or
+// signed over a different payload) doesn't get selected here instead of a
+// genuinely valid layer. Skipping this check would let SignOCI return a
+// Result.Bundle whose signature does not match its own PayloadDigest.
 func bundleMatchesSigner(b verifier.Bundle, payload []byte, cert *certMaterial, pub crypto.PublicKey) bool {
 	if b.Parsed == nil {
+		return false
+	}
+	msgSig := b.Parsed.GetMessageSignature()
+	if msgSig == nil || len(msgSig.GetSignature()) == 0 {
 		return false
 	}
 	if cert != nil {
@@ -355,12 +383,19 @@ func bundleMatchesSigner(b verifier.Bundle, payload []byte, cert *certMaterial, 
 		if err != nil || existing == nil {
 			return false
 		}
-		return existing.summary.SubjectAlternativeName == cert.summary.SubjectAlternativeName &&
-			existing.summary.Issuer == cert.summary.Issuer
-	}
-	msgSig := b.Parsed.GetMessageSignature()
-	if msgSig == nil || len(msgSig.GetSignature()) == 0 {
-		return false
+		if existing.summary.SubjectAlternativeName != cert.summary.SubjectAlternativeName ||
+			existing.summary.Issuer != cert.summary.Issuer {
+			return false
+		}
+		existingCert, err := x509.ParseCertificate(existing.certDER)
+		if err != nil {
+			return false
+		}
+		sigVerifier, err := signature.LoadVerifier(existingCert.PublicKey, crypto.SHA256)
+		if err != nil {
+			return false
+		}
+		return sigVerifier.VerifySignature(bytes.NewReader(msgSig.GetSignature()), bytes.NewReader(payload)) == nil
 	}
 	sigVerifier, err := signature.LoadVerifier(pub, crypto.SHA256)
 	if err != nil {

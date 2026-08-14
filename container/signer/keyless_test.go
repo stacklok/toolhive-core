@@ -34,6 +34,7 @@ import (
 	cttls "github.com/google/certificate-transparency-go/tls"
 	ctx509 "github.com/google/certificate-transparency-go/x509"
 	ctx509util "github.com/google/certificate-transparency-go/x509util"
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/registry"
 	"github.com/sigstore/rekor/pkg/generated/models"
 	"github.com/sigstore/rekor/pkg/types"
@@ -902,6 +903,81 @@ func decodeBundleSignatureAndCert(t *testing.T, raw []byte) (sig, certDER []byte
 	require.NoError(t, err)
 	require.NotNil(t, cert)
 	return msgSig.GetSignature(), cert.certDER
+}
+
+// TestSignOCIKeylessDedupeSkipsUnverifiableExistingLayer covers the same
+// class of bug TestAttachCosignSignatureCertDedupeIgnoresUnverifiableExistingLayer
+// (signer_test.go) fixed on the attach side, but for bundleMatchesSigner —
+// the SEPARATE function that decides what SignOCI RETURNS when it dedupes.
+// Identity match (SAN + OIDC issuer) alone is not enough to select a layer:
+// a same-identity layer whose signature does not verify against THIS
+// payload (corrupt, or signed over a different one) must be skipped in
+// favor of one that does. Skipping this check would let SignOCI return a
+// Result.Bundle whose signature does not match the PayloadDigest it also
+// returns — a caller could never successfully verify it offline.
+func TestSignOCIKeylessDedupeSkipsUnverifiableExistingLayer(t *testing.T) {
+	t.Parallel()
+	s := newTestSigstore(t)
+	reg := httptest.NewServer(registry.New())
+	t.Cleanup(reg.Close)
+	ref, digestStr := pushTestArtifact(t, strings.TrimPrefix(reg.URL, "http://"))
+	opts := Options{IdentityToken: identityToken(t, testKeylessSAN), FulcioURL: s.fulcioURL, RekorURL: s.rekorURL}
+
+	payload, err := SimpleSigningPayload(ref, digestStr)
+	require.NoError(t, err)
+
+	// A genuinely Fulcio-signed bundle for the SAME identity, but over a
+	// DIFFERENT payload — obtained by signing (and attaching, at an
+	// unrelated sig tag) against a digest that need not correspond to any
+	// real content; SimpleSigningPayload only needs the two strings.
+	otherDigestStr := "sha256:" + strings.Repeat("cd", 32)
+	otherPayload, err := SimpleSigningPayload(ref, otherDigestStr)
+	require.NoError(t, err)
+	otherResult, err := NewDefault(nil).SignOCI(t.Context(), ref, otherDigestStr, opts)
+	require.NoError(t, err)
+	var otherBun verifybundle.Bundle
+	require.NoError(t, otherBun.UnmarshalJSON(otherResult.Bundle))
+
+	// Attach that bundle directly at the REAL target's sig tag, as the
+	// first layer — same identity as opts, signature over otherPayload,
+	// which will not verify against payload.
+	attached, err := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, otherPayload, otherBun.Bundle, nil)
+	require.NoError(t, err)
+	require.True(t, attached)
+	require.Len(t, sigLayers(t, ref, digestStr), 1)
+
+	// A real sign+attach for the actual target appends the genuinely valid
+	// layer second — attach's own dedupe (already correct) skips the
+	// damaged layer above since it doesn't verify, so this appends rather
+	// than deduping.
+	valid, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, opts)
+	require.NoError(t, err)
+	require.Len(t, sigLayers(t, ref, digestStr), 2, "the damaged layer must not have deduped the valid signing")
+	validSig, validCert := decodeBundleSignatureAndCert(t, valid.Bundle)
+
+	// Re-sign once more with the same identity: this dedupes (the valid
+	// layer from above verifies), so SignOCI must return THAT layer's
+	// material — not the damaged layer that happens to be first in
+	// RetrieveBundles' iteration order.
+	redundant, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, opts)
+	require.NoError(t, err)
+	require.Len(t, sigLayers(t, ref, digestStr), 2, "the third call must dedupe against the valid layer, not append again")
+
+	redundantSig, redundantCert := decodeBundleSignatureAndCert(t, redundant.Bundle)
+	assert.Equal(t, validSig, redundantSig,
+		"the dedupe path must select the layer that verifies against payload, not the damaged one")
+	assert.Equal(t, validCert, redundantCert)
+
+	// Confirm the returned bundle is actually self-consistent: its own
+	// signature verifies against its own PayloadDigest, not otherPayload.
+	sigVerifier, err := signature.LoadVerifier(func() crypto.PublicKey {
+		cert, parseErr := x509.ParseCertificate(redundantCert)
+		require.NoError(t, parseErr)
+		return cert.PublicKey
+	}(), crypto.SHA256)
+	require.NoError(t, err)
+	assert.NoError(t, sigVerifier.VerifySignature(bytes.NewReader(redundantSig), bytes.NewReader(payload)),
+		"the returned bundle's signature must verify against the payload its own PayloadDigest names")
 }
 
 // TestSignOCIRespectsContextCancellation is the regression test for a
