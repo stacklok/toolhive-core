@@ -59,6 +59,7 @@ import (
 const (
 	testKeylessSAN    = "signer@example.com"
 	testKeylessIssuer = "https://oidc.example.com"
+	testFakeIDToken   = "token"
 )
 
 // testSigstore is a complete Sigstore deployment running in-process: a Fulcio
@@ -750,7 +751,7 @@ func TestSignOCIKeylessReSignAppendsForNewIdentity(t *testing.T) {
 
 	signAs := func(subject string) {
 		t.Helper()
-		_, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{
+		_, err := newDefaultForTest(nil, s).SignOCI(t.Context(), ref, digestStr, Options{
 			IdentityToken: identityToken(t, subject),
 			FulcioURL:     s.fulcioURL,
 			RekorURL:      s.rekorURL,
@@ -771,7 +772,9 @@ func TestSignOCIKeylessReSignAppendsForNewIdentity(t *testing.T) {
 }
 
 // TestSignOCIKeylessSurfacesFulcioFailure proves a rejected identity token
-// fails signing rather than silently falling back to some other layout.
+// fails signing rather than silently falling back to some other layout, and
+// that the error names Fulcio as the stage that failed — not Rekor, which
+// the RekorURL below proves was never even reached.
 func TestSignOCIKeylessSurfacesFulcioFailure(t *testing.T) {
 	t.Parallel()
 
@@ -791,7 +794,7 @@ func TestSignOCIKeylessSurfacesFulcioFailure(t *testing.T) {
 		RekorURL: "http://127.0.0.1:1",
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "building sigstore bundle")
+	assert.Contains(t, err.Error(), "requesting signing certificate from Fulcio")
 }
 
 // TestSignOCIRejectsAmbiguousSigningMethod documents the precedence choice:
@@ -829,14 +832,36 @@ func TestKeylessBundleOptionsDefaultToPublicGood(t *testing.T) {
 	assert.Equal(t, "https://fulcio.sigstore.dev", DefaultFulcioURL)
 	assert.Equal(t, "https://rekor.sigstore.dev", DefaultRekorURL)
 
-	opts := keylessBundleOptions(t.Context(), Options{IdentityToken: "token"})
+	opts, err := keylessBundleOptions(t.Context(), Options{IdentityToken: testFakeIDToken})
+	require.NoError(t, err)
 	require.NotNil(t, opts.CertificateProvider, "keyless signing must go through Fulcio")
 	require.Len(t, opts.TransparencyLogs, 1,
 		"keyless signing must submit to exactly one transparency log")
 	require.NotNil(t, opts.CertificateProviderOptions)
-	assert.Equal(t, "token", opts.CertificateProviderOptions.IDToken)
+	assert.Equal(t, testFakeIDToken, opts.CertificateProviderOptions.IDToken)
 	assert.Nil(t, opts.TrustedRoot,
 		"signing must not verify against a trusted root it cannot scope to the target deployment")
+}
+
+// TestKeylessBundleOptionsRejectsInsecureEndpoint is the regression test for
+// the identity token going out as a bearer credential: a non-HTTPS,
+// non-loopback FulcioURL or RekorURL must be rejected before either is
+// ever contacted, since sigstore-go's Fulcio client attaches the token to
+// its request unconditionally, regardless of scheme.
+func TestKeylessBundleOptionsRejectsInsecureEndpoint(t *testing.T) {
+	t.Parallel()
+
+	_, err := keylessBundleOptions(t.Context(), Options{IdentityToken: testFakeIDToken, FulcioURL: "http://fulcio.example.com"})
+	require.Error(t, err, "a non-loopback plain-HTTP FulcioURL must be rejected")
+
+	_, err = keylessBundleOptions(t.Context(), Options{IdentityToken: testFakeIDToken, RekorURL: "http://rekor.example.com"})
+	require.Error(t, err, "a non-loopback plain-HTTP RekorURL must be rejected")
+
+	// Loopback stays permitted — this is what every keyless test in this
+	// package relies on for its fake Fulcio/Rekor servers.
+	opts, err := keylessBundleOptions(t.Context(), Options{IdentityToken: testFakeIDToken, FulcioURL: "http://127.0.0.1:12345"})
+	require.NoError(t, err, "loopback HTTP must remain permitted for tests")
+	require.NotNil(t, opts.CertificateProvider)
 }
 
 // TestSignOCIKeylessDedupeReturnsAttachedBundle is the regression test for
@@ -856,10 +881,11 @@ func TestSignOCIKeylessDedupeReturnsAttachedBundle(t *testing.T) {
 	ref, digestStr := pushTestArtifact(t, strings.TrimPrefix(reg.URL, "http://"))
 
 	opts := Options{IdentityToken: identityToken(t, testKeylessSAN), FulcioURL: s.fulcioURL, RekorURL: s.rekorURL}
-	first, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, opts)
+	signer := newDefaultForTest(nil, s)
+	first, err := signer.SignOCI(t.Context(), ref, digestStr, opts)
 	require.NoError(t, err)
 
-	second, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, opts)
+	second, err := signer.SignOCI(t.Context(), ref, digestStr, opts)
 	require.NoError(t, err)
 
 	require.Len(t, sigLayers(t, ref, digestStr), 1,
@@ -882,7 +908,7 @@ func TestSignOCIKeylessDedupeReturnsAttachedBundle(t *testing.T) {
 	// signing happening to be deterministic in this fixture): a THIRD call
 	// must also converge on that exact same material, not merely produce
 	// "some" pair that happens to match.
-	third, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, opts)
+	third, err := signer.SignOCI(t.Context(), ref, digestStr, opts)
 	require.NoError(t, err)
 	thirdSig, thirdCert := decodeBundleSignatureAndCert(t, third.Bundle)
 	assert.Equal(t, firstSig, thirdSig)
@@ -922,6 +948,7 @@ func TestSignOCIKeylessDedupeSkipsUnverifiableExistingLayer(t *testing.T) {
 	t.Cleanup(reg.Close)
 	ref, digestStr := pushTestArtifact(t, strings.TrimPrefix(reg.URL, "http://"))
 	opts := Options{IdentityToken: identityToken(t, testKeylessSAN), FulcioURL: s.fulcioURL, RekorURL: s.rekorURL}
+	signer := newDefaultForTest(nil, s)
 
 	payload, err := SimpleSigningPayload(ref, digestStr)
 	require.NoError(t, err)
@@ -933,7 +960,7 @@ func TestSignOCIKeylessDedupeSkipsUnverifiableExistingLayer(t *testing.T) {
 	otherDigestStr := "sha256:" + strings.Repeat("cd", 32)
 	otherPayload, err := SimpleSigningPayload(ref, otherDigestStr)
 	require.NoError(t, err)
-	otherResult, err := NewDefault(nil).SignOCI(t.Context(), ref, otherDigestStr, opts)
+	otherResult, err := signer.SignOCI(t.Context(), ref, otherDigestStr, opts)
 	require.NoError(t, err)
 	var otherBun verifybundle.Bundle
 	require.NoError(t, otherBun.UnmarshalJSON(otherResult.Bundle))
@@ -941,7 +968,7 @@ func TestSignOCIKeylessDedupeSkipsUnverifiableExistingLayer(t *testing.T) {
 	// Attach that bundle directly at the REAL target's sig tag, as the
 	// first layer — same identity as opts, signature over otherPayload,
 	// which will not verify against payload.
-	attached, err := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, otherPayload, otherBun.Bundle, nil)
+	attached, err := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, otherPayload, otherBun.Bundle, nil, nil)
 	require.NoError(t, err)
 	require.True(t, attached)
 	require.Len(t, sigLayers(t, ref, digestStr), 1)
@@ -950,7 +977,7 @@ func TestSignOCIKeylessDedupeSkipsUnverifiableExistingLayer(t *testing.T) {
 	// layer second — attach's own dedupe (already correct) skips the
 	// damaged layer above since it doesn't verify, so this appends rather
 	// than deduping.
-	valid, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, opts)
+	valid, err := signer.SignOCI(t.Context(), ref, digestStr, opts)
 	require.NoError(t, err)
 	require.Len(t, sigLayers(t, ref, digestStr), 2, "the damaged layer must not have deduped the valid signing")
 	validSig, validCert := decodeBundleSignatureAndCert(t, valid.Bundle)
@@ -959,7 +986,7 @@ func TestSignOCIKeylessDedupeSkipsUnverifiableExistingLayer(t *testing.T) {
 	// layer from above verifies), so SignOCI must return THAT layer's
 	// material — not the damaged layer that happens to be first in
 	// RetrieveBundles' iteration order.
-	redundant, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, opts)
+	redundant, err := signer.SignOCI(t.Context(), ref, digestStr, opts)
 	require.NoError(t, err)
 	require.Len(t, sigLayers(t, ref, digestStr), 2, "the third call must dedupe against the valid layer, not append again")
 
@@ -1023,6 +1050,41 @@ func TestSignOCIRespectsContextCancellation(t *testing.T) {
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Less(t, elapsed, 2*time.Second,
 		"SignOCI must return promptly on ctx cancellation, not block for the underlying HTTP client's own timeout")
+}
+
+// TestSignOCIKeylessSurfacesRekorFailure is TestSignOCIKeylessSurfacesFulcioFailure's
+// complement: Fulcio succeeds (a real certificate is issued), Rekor fails,
+// and the error must name Rekor as the stage — not Fulcio, and not the
+// generic "building sigstore bundle" wording this used to have before
+// keylessSignBundle could tell the two stages apart.
+func TestSignOCIKeylessSurfacesRekorFailure(t *testing.T) {
+	t.Parallel()
+	s := newTestSigstore(t)
+
+	fulcioMux := http.NewServeMux()
+	fulcioMux.HandleFunc("POST /api/v2/signingCert", s.handleSigningCert)
+	fulcio := httptest.NewServer(fulcioMux)
+	t.Cleanup(fulcio.Close)
+
+	// 400, not 503/429: those are retried with backoff (keylessRetries), which
+	// would make this test slow without changing what it proves.
+	rekor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "malformed request", http.StatusBadRequest)
+	}))
+	t.Cleanup(rekor.Close)
+
+	reg := httptest.NewServer(registry.New())
+	t.Cleanup(reg.Close)
+	ref, digestStr := pushTestArtifact(t, strings.TrimPrefix(reg.URL, "http://"))
+
+	_, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{
+		IdentityToken: identityToken(t, testKeylessSAN),
+		FulcioURL:     fulcio.URL,
+		RekorURL:      rekor.URL,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "submitting to Rekor")
+	assert.NotContains(t, err.Error(), "Fulcio")
 }
 
 // TestSignOCIRecoversFromMalformedRekorResponse is the regression test for

@@ -705,7 +705,7 @@ func TestAttachCosignSignatureCertBearingRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 
 	pb := certBearingBundle(t, payload, "https://example.com/signer", "https://issuer.example.com", true)
-	_, attachErr1 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pb, nil)
+	_, attachErr1 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pb, nil, nil)
 	require.NoError(t, attachErr1)
 
 	layers := sigLayers(t, ref, digestStr)
@@ -802,7 +802,7 @@ func TestAttachCosignSignatureCertBearingWithoutTlog(t *testing.T) {
 	require.NoError(t, err)
 
 	pb := certBearingBundle(t, payload, "https://example.com/signer", "https://issuer.example.com", false)
-	_, attachErr2 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pb, nil)
+	_, attachErr2 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pb, nil, nil)
 	require.NoError(t, attachErr2)
 
 	layers := sigLayers(t, ref, digestStr)
@@ -871,7 +871,7 @@ func TestRekorBundleAnnotationRejectsProofOnlyEntry(t *testing.T) {
 			TlogEntries: []*protorekor.TransparencyLogEntry{entry},
 		},
 	}
-	_, err = attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pb, nil)
+	_, err = attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pb, nil, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "inclusion promise")
 }
@@ -900,14 +900,14 @@ func TestAttachCosignSignatureCertDedupeIgnoresUnverifiableExistingLayer(t *test
 	// one about to be signed, but under the same certificate/identity — the
 	// same SAN+issuer match signedByIdentity's dedupe would otherwise trust.
 	badPb := certBearingBundle(t, otherPayload, "https://example.com/signer", "https://issuer.example.com", false)
-	_, attachErr3 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, otherPayload, badPb, nil)
+	_, attachErr3 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, otherPayload, badPb, nil, nil)
 	require.NoError(t, attachErr3)
 	require.Len(t, sigLayers(t, ref, digestStr), 1)
 
 	// Now attach a genuinely valid signature over the real payload, same
 	// identity. It must NOT be deduped away by the mismatched layer above.
 	goodPb := certBearingBundle(t, payload, "https://example.com/signer", "https://issuer.example.com", false)
-	_, attachErr4 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, goodPb, nil)
+	_, attachErr4 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, goodPb, nil, nil)
 	require.NoError(t, attachErr4)
 	assert.Len(t, sigLayers(t, ref, digestStr), 2,
 		"an existing same-identity layer whose signature does not verify must not suppress a valid re-sign")
@@ -930,7 +930,7 @@ func TestAttachCosignSignatureCertBearingWithTlogAnnotatesBundle(t *testing.T) {
 	require.NoError(t, err)
 
 	pb := certBearingBundle(t, payload, "https://example.com/signer", "https://issuer.example.com", true)
-	_, attachErr5 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pb, nil)
+	_, attachErr5 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pb, nil, nil)
 	require.NoError(t, attachErr5)
 
 	layers := sigLayers(t, ref, digestStr)
@@ -954,7 +954,22 @@ func TestAttachCosignSignatureCertBearingWithTlogAnnotatesBundle(t *testing.T) {
 // does for the key-signed path) can never dedupe a keyless re-sign. Three
 // "runs" by the same signer identity — same SAN, same OIDC issuer, but a
 // brand new certificate and key each time — must collapse to one layer.
-func TestAttachCosignSignatureCertDedupeSameIdentity(t *testing.T) {
+// TestAttachCosignSignatureCertDedupeRequiresChainOfTrust is the regression
+// test for a security fix: identity match (certificate SAN + OIDC issuer)
+// alone must NOT dedupe a keyless signature. Both fields are ordinary,
+// attacker-visible data embedded in a certificate — certBearingBundle's
+// fixture certs are self-signed, exactly the shape a forged certificate
+// carrying a victim's identity would take, and their signatures ARE
+// internally self-consistent (each verifies against its own certificate's
+// key). Before this fix, that self-consistency alone was enough to dedupe:
+// this identical call, repeated three times, appended nothing after the
+// first — a signing-pipeline bypass, since a registry writer's forged,
+// self-signed, same-identity layer would be silently treated as "already
+// signed," and the real caller's own signing operation would be skipped.
+// The fix requires the existing layer's certificate to chain-verify against
+// a trusted root before accepting a dedupe match; a self-signed certificate
+// can never satisfy that, so this must now append every time.
+func TestAttachCosignSignatureCertDedupeRequiresChainOfTrust(t *testing.T) {
 	t.Parallel()
 	reg := httptest.NewServer(registry.New())
 	t.Cleanup(reg.Close)
@@ -966,12 +981,13 @@ func TestAttachCosignSignatureCertDedupeSameIdentity(t *testing.T) {
 
 	for range 3 {
 		pb := certBearingBundle(t, payload, "https://example.com/signer", "https://issuer.example.com", false)
-		_, attachErr6 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pb, nil)
-		require.NoError(t, attachErr6)
+		_, attachErr := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pb, nil, nil)
+		require.NoError(t, attachErr)
 	}
 
-	assert.Len(t, sigLayers(t, ref, digestStr), 1,
-		"re-signing with the same keyless identity must not append a duplicate layer")
+	assert.Len(t, sigLayers(t, ref, digestStr), 3,
+		"a self-signed certificate — even with a matching SAN and OIDC issuer, both attacker-visible fields — "+
+			"must never dedupe without chain-of-trust verification")
 }
 
 // TestAttachCosignSignatureCertAppendsDifferentIdentity covers the other
@@ -990,18 +1006,18 @@ func TestAttachCosignSignatureCertAppendsDifferentIdentity(t *testing.T) {
 	require.NoError(t, err)
 
 	pbA := certBearingBundle(t, payload, "https://example.com/signer-a", "https://issuer.example.com", false)
-	_, attachErr7 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pbA, nil)
+	_, attachErr7 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pbA, nil, nil)
 	require.NoError(t, attachErr7)
 	require.Len(t, sigLayers(t, ref, digestStr), 1)
 
 	pbB := certBearingBundle(t, payload, "https://example.com/signer-b", "https://issuer.example.com", false)
-	_, attachErr8 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pbB, nil)
+	_, attachErr8 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pbB, nil, nil)
 	require.NoError(t, attachErr8)
 	assert.Len(t, sigLayers(t, ref, digestStr), 2,
 		"a different keyless signer SAN must not be deduped away")
 
 	pbC := certBearingBundle(t, payload, "https://example.com/signer-a", "https://other-issuer.example.com", false)
-	_, attachErr9 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pbC, nil)
+	_, attachErr9 := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pbC, nil, nil)
 	require.NoError(t, attachErr9)
 	assert.Len(t, sigLayers(t, ref, digestStr), 3,
 		"a different OIDC issuer for the same SAN must not be deduped away")
@@ -1028,7 +1044,7 @@ func TestAttachCosignSignatureKeySignedDedupeUnaffected(t *testing.T) {
 	for range 3 {
 		pb := keySignedBundle(t, payload, priv)
 		_, attachErr10 := attachCosignSignature(
-			t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pb, priv.Public())
+			t.Context(), authn.DefaultKeychain, ref, digestStr, payload, pb, priv.Public(), nil)
 		require.NoError(t, attachErr10)
 	}
 

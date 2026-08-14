@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -30,7 +31,11 @@ import (
 	protobundle "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v1"
 	protorekor "github.com/sigstore/protobuf-specs/gen/pb-go/rekor/v1"
 	fulciocert "github.com/sigstore/sigstore-go/pkg/fulcio/certificate"
+	"github.com/sigstore/sigstore-go/pkg/root"
+	"github.com/sigstore/sigstore-go/pkg/verify"
 	"github.com/sigstore/sigstore/pkg/signature"
+
+	"github.com/stacklok/toolhive-core/container/verifier"
 )
 
 const (
@@ -141,6 +146,7 @@ func attachCosignSignature(
 	payload []byte,
 	pb *protobundle.Bundle,
 	pub crypto.PublicKey,
+	tm root.TrustedMaterial,
 ) (bool, error) {
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
@@ -177,7 +183,7 @@ func attachCosignSignature(
 		return false, err
 	}
 
-	already, err := alreadySigned(base, payload, pub, cert)
+	already, err := alreadySigned(ctx, keychain, imageRef, digestStr, base, payload, pub, cert, tm)
 	if err != nil {
 		return false, err
 	}
@@ -208,14 +214,18 @@ func attachCosignSignature(
 	return true, nil
 }
 
-// alreadySigned reports whether base already carries a signature layer
-// equivalent to the one about to be attached, dispatching to the dedupe
-// check that matches the signature's layout: identity comparison for a
-// certificate-bearing (keyless) signature, key comparison otherwise. See
-// signedByIdentity and signedByKey for why these must be different checks.
-func alreadySigned(base v1.Image, payload []byte, pub crypto.PublicKey, cert *certMaterial) (bool, error) {
+// alreadySigned reports whether the artifact already carries a signature
+// layer equivalent to the one about to be attached, dispatching to the
+// dedupe check that matches the signature's layout: a chain-verified
+// identity check for a certificate-bearing (keyless) signature, key
+// comparison against base's raw layers otherwise. See keylessAlreadySigned
+// and signedByKey for why these must be different checks.
+func alreadySigned(
+	ctx context.Context, keychain authn.Keychain, imageRef, digestStr string,
+	base v1.Image, payload []byte, pub crypto.PublicKey, cert *certMaterial, tm root.TrustedMaterial,
+) (bool, error) {
 	if cert != nil {
-		return signedByIdentity(base, payload, cert.summary)
+		return keylessAlreadySigned(ctx, keychain, imageRef, digestStr, payload, cert, tm)
 	}
 	return signedByKey(base, payload, pub)
 }
@@ -310,78 +320,87 @@ func signedByKey(img v1.Image, payload []byte, pub crypto.PublicKey) (bool, erro
 	return false, nil
 }
 
-// signedByIdentity reports whether img already carries a certificate-bearing
-// signature layer from the same signer identity as summary that ALSO
-// cryptographically verifies against payload — i.e. whether this keyless
-// signer has already produced a valid signature over this exact artifact.
-// Identity match alone is not enough to dedupe on: a layer whose signature
-// does not verify against its own certificate is not "already signed",
-// merely damaged, and treating it as equivalent would let a corrupted or
-// mismatched existing layer permanently block a legitimate re-sign from
-// ever attaching a valid signature. This is the keyless counterpart to
-// signedByKey: comparing certificate bytes, or the signature itself, would
-// never dedupe, because keyless signing mints a fresh ephemeral keypair and
-// certificate on every run. Identity — certificate SAN plus OIDC issuer —
-// is what stays stable across runs, and is also what a verifier's trust
-// policy binds to (see container/verifier's identityPolicyOption), so it is
-// the right notion of "already signed by this signer", checked alongside —
-// never instead of — the cryptographic check.
-func signedByIdentity(img v1.Image, payload []byte, summary fulciocert.Summary) (bool, error) {
-	manifest, err := img.Manifest()
-	if err != nil {
-		return false, fmt.Errorf("reading signature manifest layers: %w", err)
+// keylessAlreadySigned reports whether the artifact at imageRef/digestStr
+// already carries a genuinely trusted keyless signature from cert's
+// identity over payload. See keylessLayerTrusted for why identity match
+// alone (certificate SAN plus OIDC issuer — the keyless counterpart to
+// signedByKey's public-key comparison, since keyless signing mints a fresh
+// ephemeral keypair and certificate on every run) is NOT enough to dedupe
+// on: unlike signedByKey's pub, which the caller supplies as ground truth,
+// the SAN and issuer extensions are attacker-visible fields inside the
+// certificate itself, so a self-signed certificate can claim any identity —
+// this must additionally chain-verify.
+//
+// This re-reads the registry through verifier.RetrieveBundles rather than
+// scanning the existing signature manifest's raw layers directly (as the
+// key-signed path does): only RetrieveBundles' reconstruction carries the
+// certificate and transparency-log material coreverifier.VerifyBundle
+// needs, and rebuilding that here would duplicate container/verifier's own
+// read side. A failure here — including "nothing attached yet" — is
+// treated as not-yet-signed rather than propagated: at worst this appends a
+// redundant layer, which append-never-replace already makes safe, and that
+// is a better failure mode than blocking a legitimate sign over a
+// transient read problem.
+func keylessAlreadySigned(
+	ctx context.Context, keychain authn.Keychain, imageRef, digestStr string,
+	payload []byte, cert *certMaterial, tm root.TrustedMaterial,
+) (bool, error) {
+	full := imageRef
+	if !strings.Contains(imageRef, "@") {
+		full = imageRef + "@" + digestStr
 	}
-	for _, l := range manifest.Layers {
-		pemCert := l.Annotations[annotationCosignCertificate]
-		if pemCert == "" {
-			continue
-		}
-		existing, err := parseLeafCertificate([]byte(pemCert))
-		if err != nil {
-			// A layer we cannot parse is not one of ours; leave it alone
-			// rather than failing the whole push over someone else's
-			// malformed annotation.
-			continue
-		}
-		existingSummary, err := fulciocert.SummarizeCertificate(existing)
-		if err != nil {
-			continue
-		}
-		if existingSummary.SubjectAlternativeName != summary.SubjectAlternativeName ||
-			existingSummary.Issuer != summary.Issuer {
-			continue
-		}
-		if verifies, _ := certLayerVerifies(l, existing, payload); verifies {
+	bundles, err := verifier.RetrieveBundles(ctx, full, keychain)
+	if err != nil {
+		return false, nil //nolint:nilerr // see doc comment: a read failure here means "append", not "fail the sign"
+	}
+	opts, err := verifier.DefaultVerifierOptions()
+	if err != nil {
+		return false, nil //nolint:nilerr // embedded verifier options; failure here is not expected in practice
+	}
+	for _, b := range bundles {
+		if b.HasCertificate() && keylessLayerTrusted(b, tm, opts, payload, cert.summary) {
 			return true, nil
 		}
-		// Same identity, but this layer's signature does not verify against
-		// its own certificate and payload — it is corrupt or stale, not a
-		// prior valid signing. Fall through rather than dedupe on it, so a
-		// new, valid signature still gets appended.
 	}
 	return false, nil
 }
 
-// certLayerVerifies reports whether layer's attached signature annotation
-// cryptographically verifies against cert's public key and payload. A
-// decode or verifier-construction failure is reported as "does not verify"
-// rather than propagated: the annotation is registry-supplied data, and the
-// caller's fallback (treat as not-yet-signed, append a new layer) is
-// already the correct response to a layer that fails to check out.
-func certLayerVerifies(layer v1.Descriptor, cert *x509.Certificate, payload []byte) (bool, error) {
-	encoded := layer.Annotations[annotationCosignSignature]
-	if encoded == "" {
-		return false, errors.New("layer carries a certificate but no signature annotation")
+// keylessLayerTrusted reports whether bundle b is a genuine, chain-verified
+// Fulcio/Rekor signature from summary's identity over payload — not merely
+// a certificate carrying a matching SAN/issuer extension. Both fields are
+// public, unauthenticated data embedded in the certificate: anyone with
+// registry write access can mint a self-signed certificate carrying a
+// victim's SAN and OIDC-issuer extension, sign the known simple-signing
+// payload with the matching (self-generated) key, and push it as a
+// signature layer. A check that only confirms internal self-consistency
+// (the signature verifies against ITS OWN certificate's key) would accept
+// that forgery as "already signed by this identity" and silently skip
+// attaching the real, Fulcio-backed signature — a signing-pipeline bypass,
+// not a forged verification (a real consumer's install/verify step still
+// rejects the self-signed certificate on chain-of-trust), but a bypass
+// nonetheless. This instead runs the exact chain-of-trust and
+// transparency-log verification a real consumer's install/verify step
+// applies — container/verifier's embedded trust root and
+// DefaultVerifierOptions — so only a genuinely Fulcio-issued, Rekor-logged
+// certificate can dedupe.
+//
+// The digest check runs before the (comparatively expensive) chain
+// verification: a chain-valid signature over some OTHER payload from this
+// same identity says nothing about whether THIS payload has already been
+// signed, and checking it first also avoids wasted verification work.
+func keylessLayerTrusted(
+	b verifier.Bundle, tm root.TrustedMaterial, opts []verify.VerifierOption, payload []byte, summary fulciocert.Summary,
+) bool {
+	sum := sha256.Sum256(payload)
+	if b.DigestAlgo != "sha256" || b.DigestHex != hex.EncodeToString(sum[:]) {
+		return false
 	}
-	raw, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil {
-		return false, fmt.Errorf("decoding signature annotation: %w", err)
+	vr, err := verifier.VerifyBundle(b, tm, nil, opts...)
+	if err != nil || vr.Signature == nil || vr.Signature.Certificate == nil {
+		return false
 	}
-	sigVerifier, err := signature.LoadVerifier(cert.PublicKey, crypto.SHA256)
-	if err != nil {
-		return false, fmt.Errorf("loading verifier for existing certificate: %w", err)
-	}
-	return sigVerifier.VerifySignature(bytes.NewReader(raw), bytes.NewReader(payload)) == nil, nil
+	return vr.Signature.Certificate.SubjectAlternativeName == summary.SubjectAlternativeName &&
+		vr.Signature.Certificate.Issuer == summary.Issuer
 }
 
 // certMaterial is the certificate and transparency-log evidence for a

@@ -26,7 +26,6 @@ import (
 	"context"
 	"crypto"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -35,10 +34,13 @@ import (
 	"github.com/google/go-containerregistry/pkg/authn"
 	protobundle "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v1"
 	verifybundle "github.com/sigstore/sigstore-go/pkg/bundle"
+	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/sign"
+	"github.com/sigstore/sigstore-go/pkg/verify"
 	"github.com/sigstore/sigstore/pkg/signature"
 
 	"github.com/stacklok/toolhive-core/container/verifier"
+	"github.com/stacklok/toolhive-core/networking"
 )
 
 // Public-good Sigstore endpoints, used when Options leaves the corresponding
@@ -108,13 +110,18 @@ type Options struct {
 	// signature is submitted to Rekor. Obtaining the token is the caller's
 	// responsibility — see the package doc.
 	//
-	// This token is sent as a bearer credential to FulcioURL. A caller
-	// setting FulcioURL to anything other than an HTTPS (or loopback, for
-	// tests) endpoint sends it in the clear.
+	// This token is sent as a bearer credential to FulcioURL, which is why
+	// FulcioURL and RekorURL are validated to be HTTPS (loopback excepted,
+	// for tests) before either is contacted — see keylessBundleOptions.
 	IdentityToken string
 	// FulcioURL overrides the certificate authority for keyless signing.
-	// Empty means DefaultFulcioURL; the default is applied at signing time,
-	// so a zero Options value targets the public-good deployment.
+	// Empty means DefaultFulcioURL. Defaulting happens at signing time and
+	// only when IdentityToken selects the keyless flow — a zero Options
+	// value alone still errors with ErrKeyRequired, it does not sign
+	// against the public-good deployment by default. Once IdentityToken IS
+	// set, though, an empty FulcioURL/RekorURL is a deliberate posture
+	// change from "no key ⇒ always error": keyless signing then performs
+	// outbound network egress to public-good Sigstore services by default.
 	FulcioURL string
 	// RekorURL overrides the transparency log for keyless signing. Empty
 	// means DefaultRekorURL, applied at signing time as with FulcioURL.
@@ -166,6 +173,17 @@ type Signer interface {
 // pairs and keyless signing via Fulcio and Rekor.
 type Default struct {
 	keychain authn.Keychain
+	// trustedMaterial resolves the trust material keyless dedupe checks an
+	// existing layer's certificate against (see keylessLayerTrusted). Nil in
+	// every production Default — keylessTrustedMaterial falls back to
+	// verifier.OfflineTrustedMaterial, the embedded public-good Sigstore
+	// root, which is what DefaultFulcioURL/DefaultRekorURL actually issue
+	// against. It exists as a field (not a hardcoded call) only so tests
+	// signing against a synthetic Fulcio/Rekor deployment — one that, by
+	// construction, cannot chain to the embedded production root — can
+	// supply their own trust material and exercise dedupe actually firing,
+	// not just the fail-closed path. See newDefaultForTest.
+	trustedMaterial func() (root.TrustedMaterial, error)
 }
 
 var _ Signer = (*Default)(nil)
@@ -178,6 +196,25 @@ func NewDefault(keychain authn.Keychain) *Default {
 		keychain = authn.DefaultKeychain
 	}
 	return &Default{keychain: keychain}
+}
+
+// newDefaultForTest creates a signer whose keyless dedupe check verifies
+// against tm instead of the embedded production Sigstore root — for tests
+// signing against a synthetic Fulcio/Rekor deployment that cannot chain to
+// the real one. Production code always uses NewDefault.
+func newDefaultForTest(keychain authn.Keychain, tm root.TrustedMaterial) *Default {
+	d := NewDefault(keychain)
+	d.trustedMaterial = func() (root.TrustedMaterial, error) { return tm, nil }
+	return d
+}
+
+// keylessTrustedMaterial resolves the trust material for keyless dedupe
+// verification — see the doc comment on Default.trustedMaterial.
+func (d *Default) keylessTrustedMaterial() (root.TrustedMaterial, error) {
+	if d.trustedMaterial != nil {
+		return d.trustedMaterial()
+	}
+	return verifier.OfflineTrustedMaterial()
 }
 
 // SignOCI signs the artifact following the cosign convention: the signature
@@ -204,7 +241,7 @@ func (d *Default) SignOCI(ctx context.Context, ref, digestStr string, opts Optio
 		return nil, err
 	}
 
-	pb, err := signBundle(ctx, payload, keypair, bundleOpts)
+	pb, err := signBundle(ctx, payload, keypair, bundleOpts, opts.IdentityToken != "")
 	if err != nil {
 		return nil, err
 	}
@@ -221,43 +258,81 @@ func (d *Default) SignOCI(ctx context.Context, ref, digestStr string, opts Optio
 		return nil, fmt.Errorf("validating sigstore bundle: %w", err)
 	}
 
-	attached, err := attachCosignSignature(ctx, d.keychain, ref, digestStr, payload, pb, keypair.GetPublicKey())
+	tm, err := d.keylessTrustedMaterial()
+	if err != nil {
+		return nil, fmt.Errorf("loading trusted material: %w", err)
+	}
+
+	attached, err := attachCosignSignature(ctx, d.keychain, ref, digestStr, payload, pb, keypair.GetPublicKey(), tm)
 	if err != nil {
 		return nil, fmt.Errorf("attaching signature manifest: %w", err)
 	}
 
-	raw, err := resultBundleJSON(ctx, d.keychain, ref, digestStr, payload, pb, keypair.GetPublicKey(), attached)
+	raw, err := resultBundleJSON(ctx, d.keychain, ref, digestStr, payload, pb, keypair.GetPublicKey(), tm, attached)
 	if err != nil {
 		return nil, err
 	}
 	return &Result{Bundle: raw, PayloadDigest: payloadDigest(payload)}, nil
 }
 
-// signBundle runs sign.Bundle on its own goroutine so SignOCI honors ctx
-// cancellation even though it cannot always rely on the underlying
-// dependency to: sigstore-go's Fulcio client (pkg/sign.Fulcio.GetCertificate,
-// as of sigstore-go v1.3.0) builds its HTTP request with http.NewRequest,
-// not http.NewRequestWithContext, and only consults ctx between retries —
-// once a request is actually in flight, a canceled ctx has no effect until
-// the HTTP client's own timeout fires (30s by default). Racing ctx.Done()
-// against the call lets a canceled SignOCI return promptly regardless; the
-// abandoned goroutine still exits on its own once the underlying call
-// completes or times out, so nothing leaks unbounded.
+// signBundle builds the sigstore bundle for payload. For the key-signed
+// path (keyless false) this is a direct, synchronous call: no network is
+// involved, so neither of the two problems keylessSignBundle exists to work
+// around applies, and a panic here would be this package's own bug — it
+// should propagate as one, not be reclassified as a Fulcio or Rekor
+// problem with the real stack trace discarded.
+func signBundle(
+	ctx context.Context, payload []byte, keypair sign.Keypair, opts sign.BundleOptions, keyless bool,
+) (*protobundle.Bundle, error) {
+	if !keyless {
+		pb, err := sign.Bundle(&sign.PlainData{Data: payload}, keypair, opts)
+		if err != nil {
+			return nil, fmt.Errorf("building sigstore bundle: %w", err)
+		}
+		return pb, nil
+	}
+	return keylessSignBundle(ctx, payload, keypair, opts)
+}
+
+// keylessSignBundle runs the keyless flow on its own goroutine so SignOCI
+// honors ctx cancellation even though it cannot always rely on the
+// underlying dependency to: sigstore-go's Fulcio client
+// (pkg/sign.Fulcio.GetCertificate, as of sigstore-go v1.3.0) builds its HTTP
+// request with http.NewRequest, not http.NewRequestWithContext, and only
+// consults ctx between retries — once a request is actually in flight, a
+// canceled ctx has no effect until the HTTP client's own timeout fires (30s
+// by default). Racing ctx.Done() against the call lets a canceled SignOCI
+// return promptly regardless; the abandoned goroutine still exits on its
+// own once the underlying call completes or times out, so nothing leaks
+// unbounded.
 //
-// The same boundary recovers a panic, for a related but distinct reason:
-// sigstore/rekor's own response parsing (pkg/tle.GenerateTransparencyLogEntry,
-// reached via sigstore-go's Rekor v1 client) dereferences several
-// Verification/InclusionProof response fields unconditionally, and a
-// well-formed JSON response that simply omits that object — a misconfigured
-// or non-standard Rekor deployment, not necessarily a hostile one — reaches
-// that dereference and panics. SignOCI is this package's public API surface
-// and, per the package doc, signing happens for the lifetime of a long-lived
-// `thv serve` process; an unrecovered panic here would take the whole
-// process down over a single bad network response. Recovering only around
-// this specific call (not, say, wrapping SignOCI's own logic) keeps the
-// recover() scoped to untrusted external input, not to bugs in this
-// package's own code.
-func signBundle(ctx context.Context, payload []byte, keypair sign.Keypair, opts sign.BundleOptions) (*protobundle.Bundle, error) {
+// The same goroutine boundary recovers a panic, for a related but distinct
+// reason: sigstore/rekor's own response parsing
+// (pkg/tle.GenerateTransparencyLogEntry, reached via sigstore-go's Rekor v1
+// client) dereferences several Verification/InclusionProof response fields
+// unconditionally, and a well-formed JSON response that simply omits that
+// object — a misconfigured or non-standard Rekor deployment, not
+// necessarily a hostile one — reaches that dereference and panics. SignOCI
+// is this package's public API surface and, per the package doc, signing
+// happens for the lifetime of a long-lived `thv serve` process; an
+// unrecovered panic here would take the whole process down over a single
+// bad network response. Scoping this boundary to the keyless path only
+// (rather than wrapping signBundle's key-signed branch too, as an earlier
+// version of this function did) keeps recover() scoped to untrusted
+// external input, not to bugs in this package's own code.
+//
+// Fulcio and Rekor failures are distinguished by calling
+// opts.CertificateProvider directly first — the exact call sign.Bundle
+// would otherwise make internally, but with its error tagged as a Fulcio
+// failure before sign.Bundle ever sees it — then handing sign.Bundle the
+// already-fetched certificate via cachedCertificate, so its own internal
+// GetCertificate call is a cache hit rather than a second Fulcio round
+// trip. With this configuration (no TimestampAuthorities, no TrustedRoot),
+// the only network call remaining inside sign.Bundle at that point is the
+// Rekor submission, so a failure there is unambiguously tagged as Rekor's.
+func keylessSignBundle(
+	ctx context.Context, payload []byte, keypair sign.Keypair, opts sign.BundleOptions,
+) (*protobundle.Bundle, error) {
 	type signOutcome struct {
 		pb  *protobundle.Bundle
 		err error
@@ -271,18 +346,38 @@ func signBundle(ctx context.Context, payload []byte, keypair sign.Keypair, opts 
 				}
 			}
 		}()
-		pb, err := sign.Bundle(&sign.PlainData{Data: payload}, keypair, opts)
-		outcome <- signOutcome{pb: pb, err: err}
+		fulcio := opts.CertificateProvider
+		certDER, err := fulcio.GetCertificate(ctx, keypair, opts.CertificateProviderOptions)
+		if err != nil {
+			outcome <- signOutcome{err: fmt.Errorf("requesting signing certificate from Fulcio: %w", err)}
+			return
+		}
+		cachedOpts := opts
+		cachedOpts.CertificateProvider = &cachedCertificate{certDER: certDER}
+		pb, err := sign.Bundle(&sign.PlainData{Data: payload}, keypair, cachedOpts)
+		if err != nil {
+			outcome <- signOutcome{err: fmt.Errorf("submitting to Rekor: %w", err)}
+			return
+		}
+		outcome <- signOutcome{pb: pb}
 	}()
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case res := <-outcome:
-		if res.err != nil {
-			return nil, fmt.Errorf("building sigstore bundle: %w", res.err)
-		}
-		return res.pb, nil
+		return res.pb, res.err
 	}
+}
+
+// cachedCertificate is a sign.CertificateProvider that returns an
+// already-fetched certificate without making another network call — see
+// keylessSignBundle's doc comment for why.
+type cachedCertificate struct {
+	certDER []byte
+}
+
+func (c *cachedCertificate) GetCertificate(context.Context, sign.Keypair, *sign.CertificateProviderOptions) ([]byte, error) {
+	return c.certDER, nil
 }
 
 // resultBundleJSON returns the serialized bundle that accurately reflects
@@ -307,6 +402,7 @@ func resultBundleJSON(
 	payload []byte,
 	pb *protobundle.Bundle,
 	pub crypto.PublicKey,
+	tm root.TrustedMaterial,
 	attached bool,
 ) ([]byte, error) {
 	if attached {
@@ -320,7 +416,7 @@ func resultBundleJSON(
 		}
 		return raw, nil
 	}
-	return previouslyAttachedBundleJSON(ctx, keychain, ref, digestStr, payload, pb, pub)
+	return previouslyAttachedBundleJSON(ctx, keychain, ref, digestStr, payload, pb, pub, tm)
 }
 
 // previouslyAttachedBundleJSON retrieves the signature layer that made this
@@ -334,6 +430,7 @@ func previouslyAttachedBundleJSON(
 	payload []byte,
 	pb *protobundle.Bundle,
 	pub crypto.PublicKey,
+	tm root.TrustedMaterial,
 ) ([]byte, error) {
 	full := ref
 	if !strings.Contains(ref, "@") {
@@ -347,8 +444,18 @@ func previouslyAttachedBundleJSON(
 	if err != nil {
 		return nil, err
 	}
+	var opts []verify.VerifierOption
+	if cert != nil {
+		// Only needed for the keyless chain-verification branch below;
+		// loading it unconditionally would be wasted work on the
+		// key-signed path, which never reaches keylessLayerTrusted.
+		opts, err = verifier.DefaultVerifierOptions()
+		if err != nil {
+			return nil, fmt.Errorf("loading verifier options: %w", err)
+		}
+	}
 	for _, b := range bundles {
-		if bundleMatchesSigner(b, payload, cert, pub) {
+		if bundleMatchesSigner(b, tm, opts, payload, cert, pub) {
 			return b.Raw, nil
 		}
 	}
@@ -356,46 +463,31 @@ func previouslyAttachedBundleJSON(
 }
 
 // bundleMatchesSigner reports whether b is the layer this signing operation
-// deduped against: for keyless, the same certificate identity (SAN + OIDC
-// issuer — never certificate bytes, which are fresh every keyless run) AND
-// a signature that verifies against THAT certificate's own key over
-// payload; for key-signed, a signature over payload that verifies with pub
-// (never signature bytes, which ECDSA randomises on every call).
+// deduped against: for keyless, a genuine, chain-verified Fulcio/Rekor
+// signature from cert's identity over payload (see keylessLayerTrusted —
+// identity match alone is not enough, since SAN and OIDC issuer are
+// attacker-visible fields inside the certificate itself); for key-signed, a
+// signature over payload that verifies with pub (never signature bytes,
+// which ECDSA randomises on every call).
 //
-// The cryptographic check on the keyless branch matters, not just the
-// identity match: signedByIdentity (the attach-side dedupe this mirrors)
-// treats identity as a candidate, not a verdict — the layer must still
-// verify against its own certificate before dedupe accepts it, so that a
-// same-identity layer whose signature happens not to verify (corrupt, or
-// signed over a different payload) doesn't get selected here instead of a
-// genuinely valid layer. Skipping this check would let SignOCI return a
-// Result.Bundle whose signature does not match its own PayloadDigest.
-func bundleMatchesSigner(b verifier.Bundle, payload []byte, cert *certMaterial, pub crypto.PublicKey) bool {
+// This mirrors keylessAlreadySigned's keyless check exactly (both call
+// keylessLayerTrusted) because they must agree: attach's dedupe decision
+// and this selection must treat the same layer as "already signed" or not,
+// or SignOCI could report success while returning material that doesn't
+// correspond to what attach actually decided.
+func bundleMatchesSigner(
+	b verifier.Bundle, tm root.TrustedMaterial, opts []verify.VerifierOption,
+	payload []byte, cert *certMaterial, pub crypto.PublicKey,
+) bool {
 	if b.Parsed == nil {
 		return false
+	}
+	if cert != nil {
+		return b.HasCertificate() && keylessLayerTrusted(b, tm, opts, payload, cert.summary)
 	}
 	msgSig := b.Parsed.GetMessageSignature()
 	if msgSig == nil || len(msgSig.GetSignature()) == 0 {
 		return false
-	}
-	if cert != nil {
-		existing, err := certMaterialFromBundle(b.Parsed.Bundle)
-		if err != nil || existing == nil {
-			return false
-		}
-		if existing.summary.SubjectAlternativeName != cert.summary.SubjectAlternativeName ||
-			existing.summary.Issuer != cert.summary.Issuer {
-			return false
-		}
-		existingCert, err := x509.ParseCertificate(existing.certDER)
-		if err != nil {
-			return false
-		}
-		sigVerifier, err := signature.LoadVerifier(existingCert.PublicKey, crypto.SHA256)
-		if err != nil {
-			return false
-		}
-		return sigVerifier.VerifySignature(bytes.NewReader(msgSig.GetSignature()), bytes.NewReader(payload)) == nil
 	}
 	sigVerifier, err := signature.LoadVerifier(pub, crypto.SHA256)
 	if err != nil {
@@ -426,7 +518,11 @@ func signingMaterial(ctx context.Context, opts Options) (sign.Keypair, sign.Bund
 		if err != nil {
 			return nil, sign.BundleOptions{}, fmt.Errorf("generating ephemeral signing key: %w", err)
 		}
-		return keypair, keylessBundleOptions(ctx, opts), nil
+		bundleOpts, err := keylessBundleOptions(ctx, opts)
+		if err != nil {
+			return nil, sign.BundleOptions{}, err
+		}
+		return keypair, bundleOpts, nil
 	default:
 		return nil, sign.BundleOptions{}, ErrKeyRequired
 	}
@@ -441,7 +537,7 @@ func signingMaterial(ctx context.Context, opts Options) (sign.Keypair, sign.Bund
 // deployment — a TUF fetch this package has no way to scope to a caller's
 // custom FulcioURL/RekorURL. Verification is the caller's step, through
 // container/verifier, against the root it decides to trust.
-func keylessBundleOptions(ctx context.Context, opts Options) sign.BundleOptions {
+func keylessBundleOptions(ctx context.Context, opts Options) (sign.BundleOptions, error) {
 	fulcioURL := opts.FulcioURL
 	if fulcioURL == "" {
 		fulcioURL = DefaultFulcioURL
@@ -449,6 +545,18 @@ func keylessBundleOptions(ctx context.Context, opts Options) sign.BundleOptions 
 	rekorURL := opts.RekorURL
 	if rekorURL == "" {
 		rekorURL = DefaultRekorURL
+	}
+	// IdentityToken goes out as an Authorization: Bearer header to fulcioURL
+	// (sigstore-go's Fulcio client, unconditionally). A non-HTTPS,
+	// non-loopback URL sends it in the clear — validated here, after
+	// defaulting, so both the caller-supplied and the default case are
+	// covered by one check. Loopback stays permitted for tests, which need
+	// a plain-HTTP fake Fulcio/Rekor.
+	if err := networking.ValidateEndpointURL(fulcioURL); err != nil {
+		return sign.BundleOptions{}, fmt.Errorf("FulcioURL: %w", err)
+	}
+	if err := networking.ValidateEndpointURL(rekorURL); err != nil {
+		return sign.BundleOptions{}, fmt.Errorf("RekorURL: %w", err)
 	}
 	return sign.BundleOptions{
 		Context: ctx,
@@ -464,7 +572,7 @@ func keylessBundleOptions(ctx context.Context, opts Options) sign.BundleOptions 
 				Version: rekorAPIVersionV1,
 			}),
 		},
-	}
+	}, nil
 }
 
 // PayloadDigest returns the digest of the simple-signing payload that a
