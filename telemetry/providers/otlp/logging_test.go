@@ -14,7 +14,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 )
 
-func TestCreateTraceExporter(t *testing.T) {
+func TestCreateLogExporter(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -47,15 +47,6 @@ func TestCreateTraceExporter(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "secure config",
-			config: Config{
-				Endpoint: "secure.example.com:4318",
-				Insecure: false,
-			},
-			ctx:     func() context.Context { return context.Background() },
-			wantErr: false,
-		},
-		{
 			name: testNameCustomPath,
 			config: Config{
 				Endpoint: testEndpointLangfuse,
@@ -66,18 +57,15 @@ func TestCreateTraceExporter(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "error creating sdk-span-exporter due to error (cancelled context)",
+			name: "error creating log exporter due to invalid CA cert",
 			config: Config{
-				Endpoint: "secure.example.com:4318",
-				Insecure: true,
+				Endpoint:   testEndpointLocal,
+				Insecure:   false,
+				CACertPath: testInvalidCACert,
 			},
-			ctx: func() context.Context {
-				ctx, cancel := context.WithCancel(context.Background())
-				cancel()
-				return ctx
-			},
+			ctx:     func() context.Context { return context.Background() },
 			wantErr: true,
-			errMsg:  "context canceled",
+			errMsg:  "failed to configure TLS for log exporter",
 		},
 	}
 
@@ -86,7 +74,7 @@ func TestCreateTraceExporter(t *testing.T) {
 			t.Parallel()
 
 			ctx := tt.ctx()
-			exporter, err := createTraceExporter(ctx, tt.config)
+			exporter, err := createLogExporter(ctx, tt.config)
 
 			if tt.wantErr {
 				assert.Error(t, err)
@@ -104,13 +92,12 @@ func TestCreateTraceExporter(t *testing.T) {
 	}
 }
 
-func TestNewTracerProviderWithShutdown(t *testing.T) {
+func TestNewLoggerProviderWithShutdown(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name           string
 		config         Config
-		ctx            func() context.Context
 		wantErr        bool
 		errMsg         string
 		expectNoOp     bool
@@ -119,52 +106,40 @@ func TestNewTracerProviderWithShutdown(t *testing.T) {
 		{
 			name: "valid config with endpoint returns SDK provider with shutdown",
 			config: Config{
-				Endpoint:     testEndpointLocal,
-				SamplingRate: 0.5,
-				Headers:      map[string]string{testAuthHeader: testBearerToken},
-				Insecure:     true,
+				Endpoint: testEndpointLocal,
+				Headers:  map[string]string{testAuthHeader: testBearerToken},
+				Insecure: true,
 			},
-			ctx:            func() context.Context { return context.Background() },
 			wantErr:        false,
 			expectNoOp:     false,
 			expectShutdown: true,
 		},
 		{
-			name: "no endpoint returns noop provider with nil shutdown",
-			config: Config{
-				SamplingRate: 0.1,
-			},
-			ctx:            func() context.Context { return context.Background() },
+			name:           "no endpoint returns noop provider with nil shutdown",
+			config:         Config{},
 			wantErr:        false,
 			expectNoOp:     true,
 			expectShutdown: false,
 		},
 		{
-			name: "config with custom sampling returns SDK provider with shutdown",
+			name: "config with custom path returns SDK provider with shutdown",
 			config: Config{
-				Endpoint:     testEndpointLocal,
-				SamplingRate: 1.0, // Always sample
-				Insecure:     true,
+				Endpoint: testEndpointLangfuse,
+				Headers:  map[string]string{testAuthHeader: testBasicCred},
 			},
-			ctx:            func() context.Context { return context.Background() },
 			wantErr:        false,
 			expectNoOp:     false,
 			expectShutdown: true,
 		},
 		{
-			name: "error creating trace exporter propagates error",
+			name: "error creating log exporter propagates error",
 			config: Config{
-				Endpoint:     testEndpointLocal,
-				SamplingRate: 1.0,
-				Insecure:     true,
-			},
-			ctx: func() context.Context {
-				ctx, cancel := context.WithCancel(context.Background())
-				cancel()
-				return ctx
+				Endpoint:   testEndpointLocal,
+				Insecure:   false,
+				CACertPath: testInvalidCACert,
 			},
 			wantErr:        true,
-			errMsg:         "failed to create trace exporter",
+			errMsg:         "failed to create logger provider",
 			expectNoOp:     false,
 			expectShutdown: false,
 		},
@@ -174,7 +149,7 @@ func TestNewTracerProviderWithShutdown(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			ctx := tt.ctx()
+			ctx := context.Background()
 			res, err := resource.New(ctx,
 				resource.WithAttributes(
 					semconv.ServiceName("test-service"),
@@ -183,7 +158,7 @@ func TestNewTracerProviderWithShutdown(t *testing.T) {
 			)
 			require.NoError(t, err)
 
-			provider, shutdown, err := NewTracerProviderWithShutdown(ctx, tt.config, res)
+			provider, shutdown, err := NewLoggerProviderWithShutdown(ctx, tt.config, res)
 
 			if tt.wantErr {
 				assert.Error(t, err)
@@ -196,7 +171,6 @@ func TestNewTracerProviderWithShutdown(t *testing.T) {
 				assert.NoError(t, err)
 				assert.NotNil(t, provider)
 
-				// Check provider type
 				providerType := fmt.Sprintf("%T", provider)
 				if tt.expectNoOp {
 					assert.Contains(t, providerType, "noop")
@@ -204,10 +178,8 @@ func TestNewTracerProviderWithShutdown(t *testing.T) {
 					assert.NotContains(t, providerType, "noop")
 				}
 
-				// Check shutdown function
 				if tt.expectShutdown {
 					assert.NotNil(t, shutdown)
-					// Test that shutdown function works
 					shutdownCtx := context.Background()
 					err := shutdown(shutdownCtx)
 					assert.NoError(t, err)

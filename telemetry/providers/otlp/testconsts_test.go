@@ -16,4 +16,6 @@ const (
 	testBearerToken      = "Bearer token"
 	testNameValid        = "valid config"
 	testNameCustomPath   = "endpoint with custom path"
+	testEnvHeaderKey     = "x-env"
+	testInvalidCACert    = "/nonexistent/ca.crt"
 )

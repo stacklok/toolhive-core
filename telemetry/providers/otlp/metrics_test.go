@@ -54,7 +54,7 @@ func TestCreateMetricExporter(t *testing.T) {
 			config: Config{
 				Endpoint:   testEndpointLocal,
 				Insecure:   false,
-				CACertPath: "/nonexistent/ca.crt",
+				CACertPath: testInvalidCACert,
 			},
 			ctx:     func() context.Context { return context.Background() },
 			wantErr: true,
@@ -117,7 +117,7 @@ func TestNewMetricReader(t *testing.T) {
 				Endpoint: "otel-collector.local:4318",
 				Headers: map[string]string{
 					testAPIKeyHeader: testSecretValue,
-					"x-env":          "production",
+					testEnvHeaderKey: "production",
 				},
 				Insecure: false,
 			},
