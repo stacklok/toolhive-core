@@ -87,6 +87,38 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: "at least one sentinel address",
 		},
 		{
+			name:    "TLS client certificate without key is rejected",
+			cfg:     &Config{Addr: testAddr, TLS: &TLSConfig{ClientCert: []byte("certificate")}},
+			wantErr: "TLS config: client certificate and key must be provided together",
+		},
+		{
+			name:    "TLS client key without certificate is rejected",
+			cfg:     &Config{Addr: testAddr, TLS: &TLSConfig{ClientKey: []byte("key")}},
+			wantErr: "TLS config: client certificate and key must be provided together",
+		},
+		{
+			name: "sentinel TLS client certificate without key is rejected",
+			cfg: &Config{
+				SentinelConfig: &SentinelConfig{
+					MasterName:    testMasterName,
+					SentinelAddrs: []string{testSentinelAddr},
+				},
+				SentinelTLS: &TLSConfig{ClientCert: []byte("certificate")},
+			},
+			wantErr: "sentinel TLS config: client certificate and key must be provided together",
+		},
+		{
+			name: "sentinel TLS client key without certificate is rejected",
+			cfg: &Config{
+				SentinelConfig: &SentinelConfig{
+					MasterName:    testMasterName,
+					SentinelAddrs: []string{testSentinelAddr},
+				},
+				SentinelTLS: &TLSConfig{ClientKey: []byte("key")},
+			},
+			wantErr: "sentinel TLS config: client certificate and key must be provided together",
+		},
+		{
 			name: "valid standalone config",
 			cfg: &Config{
 				Addr: testAddr,
