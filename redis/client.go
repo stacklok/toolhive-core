@@ -49,13 +49,19 @@ func NewClient(ctx context.Context, cfg *Config) (goredis.UniversalClient, error
 
 // BuildTLSConfig converts a TLSConfig into a *tls.Config suitable for
 // dialing a Redis endpoint. Returns (nil, nil) when cfg is nil, signalling
-// "no TLS". Returns an error when CACert is present but cannot be parsed.
+// "no TLS". Returns an error when the CA certificate or client certificate
+// and key cannot be parsed, or when only one of ClientCert and ClientKey is
+// set.
 //
 // The returned *tls.Config sets MinVersion to TLS 1.2 and uses the system
-// root CAs unless CACert is supplied.
+// root CAs unless CACert is supplied. When ClientCert and ClientKey are set,
+// it presents them to the server for mutual TLS.
 func BuildTLSConfig(cfg *TLSConfig) (*tls.Config, error) {
 	if cfg == nil {
 		return nil, nil
+	}
+	if err := validateTLSConfig(cfg); err != nil {
+		return nil, fmt.Errorf("redis: invalid TLS configuration: %w", err)
 	}
 	tc := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
@@ -67,6 +73,13 @@ func BuildTLSConfig(cfg *TLSConfig) (*tls.Config, error) {
 			return nil, fmt.Errorf("redis: failed to parse CA certificate PEM data")
 		}
 		tc.RootCAs = pool
+	}
+	if len(cfg.ClientCert) > 0 {
+		cert, err := tls.X509KeyPair(cfg.ClientCert, cfg.ClientKey)
+		if err != nil {
+			return nil, fmt.Errorf("redis: failed to parse client certificate and key: %w", err)
+		}
+		tc.Certificates = []tls.Certificate{cert}
 	}
 	return tc, nil
 }

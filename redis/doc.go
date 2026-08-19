@@ -50,7 +50,9 @@ TLS is opt-in per connection target. When TLS is set, master/cluster
 connections use it. SentinelTLS, when set, applies to sentinel daemon
 connections independently — useful when the master and sentinels present
 different certificate chains. Both fields accept either system CAs (CACert
-nil) or a custom CA bundle.
+nil) or a custom CA bundle. To use mTLS, set ClientCert and ClientKey to a
+PEM-encoded client certificate/key pair; the master and sentinel connections
+can use different pairs.
 
 # Defaults and Validation
 

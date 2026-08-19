@@ -5,6 +5,7 @@ package redis
 
 import (
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -88,6 +89,11 @@ type TLSConfig struct {
 	// CACert is the PEM-encoded CA bundle used to verify the server. When
 	// nil, system root CAs are used.
 	CACert []byte
+
+	// ClientCert and ClientKey are a PEM-encoded client certificate/key pair
+	// presented to the server for mutual TLS. Both fields must be set together.
+	ClientCert []byte
+	ClientKey  []byte
 }
 
 // Validate checks Config for connection-mode topology errors and returns
@@ -116,6 +122,19 @@ func (c *Config) Validate() error {
 		if len(c.SentinelConfig.SentinelAddrs) == 0 {
 			return errors.New("at least one sentinel address is required")
 		}
+	}
+	if err := validateTLSConfig(c.TLS); err != nil {
+		return fmt.Errorf("TLS config: %w", err)
+	}
+	if err := validateTLSConfig(c.SentinelTLS); err != nil {
+		return fmt.Errorf("sentinel TLS config: %w", err)
+	}
+	return nil
+}
+
+func validateTLSConfig(cfg *TLSConfig) error {
+	if cfg != nil && (len(cfg.ClientCert) == 0) != (len(cfg.ClientKey) == 0) {
+		return errors.New("client certificate and key must be provided together")
 	}
 	return nil
 }
