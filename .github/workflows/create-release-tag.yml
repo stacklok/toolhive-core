@@ -1,0 +1,203 @@
+# SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Create Release Tag Workflow
+#
+# Triggered when the VERSION file changes on main (i.e. a release PR merged).
+# It verifies the commit came from a release PR, then creates the git tag AND
+# the GitHub Release in one atomic `gh release create` call.
+#
+# Why atomic (differs from toolhive): toolhive's downstream releaser triggers on
+# the `release` event, so it pushes the tag first and creates the Release after.
+# toolhive-core's existing release.yml triggers on `push: tags: v*` and runs
+# `gh release upload`, which needs the Release to already exist. Creating the tag
+# via `gh release create` makes the tag and Release appear together, so by the
+# time release.yml fires on the tag push the Release is there to upload into.
+#
+# The app token (not GITHUB_TOKEN) is used so the tag push can trigger
+# release.yml -- events from GITHUB_TOKEN do not cascade to other workflows.
+
+name: Create Release Tag
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'VERSION'
+
+permissions:
+  contents: write
+
+jobs:
+  create-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate release app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: VERSION file does not contain valid semver: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Read version: $VERSION"
+
+      - name: Verify release PR
+        id: verify
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          COMMIT_SHA=$(git rev-parse HEAD)
+
+          echo "Commit SHA: $COMMIT_SHA"
+          echo "Commit message: $COMMIT_MSG"
+          echo ""
+
+          VERIFIED=true
+
+          # Check 1: commit message matches a release pattern.
+          # Squash merge:  "Release v1.0.0 (#123)"
+          # Merge commit:  "Merge pull request #123 from stacklok/release/v1.0.0"
+          # Direct:        "Release v1.0.0"
+          if [[ "$COMMIT_MSG" =~ ^Release\ v[0-9]+\.[0-9]+\.[0-9]+ ]] || \
+             [[ "$COMMIT_MSG" =~ release/v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "✅ Commit message matches release pattern"
+          else
+            echo "❌ Commit message does not match release pattern"
+            echo "Expected: 'Release v{semver}' or merge from 'release/v{semver}'"
+            echo "Got: '$COMMIT_MSG'"
+            VERIFIED=false
+          fi
+
+          # Check 2: the version in the commit message matches the VERSION file.
+          if [[ "$COMMIT_MSG" =~ v${VERSION}(\ |$|\)) ]]; then
+            echo "✅ VERSION file matches version in commit message"
+          else
+            echo "❌ VERSION file does not match version in commit message"
+            echo "VERSION file: $VERSION"
+            echo "Commit message: $COMMIT_MSG"
+            VERIFIED=false
+          fi
+
+          echo ""
+          if [ "$VERIFIED" = true ]; then
+            echo "✅ All verification checks passed"
+          else
+            echo "❌ Verification failed"
+            echo ""
+            echo "This could indicate:"
+            echo "  - A manual VERSION file edit (not via release PR)"
+            echo "  - An unexpected commit message format"
+            echo ""
+            echo "Blocking release. Please investigate."
+            exit 1
+          fi
+
+      - name: Extract release triggering actor
+        id: actor
+        run: |
+          # The Release-Triggered-By trailer is added by releaseo to preserve the
+          # original workflow triggerer.
+          TRIGGERED_BY=$(git log -1 --format='%(trailers:key=Release-Triggered-By,valueonly)' | tr -d '[:space:]')
+          if [ -n "$TRIGGERED_BY" ]; then
+            echo "✅ Found release triggering actor: $TRIGGERED_BY"
+            echo "triggered_by=$TRIGGERED_BY" >> "$GITHUB_OUTPUT"
+          else
+            echo "⚠️ No Release-Triggered-By trailer found in commit"
+            echo "triggered_by=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if git tag exists
+        id: check-tag
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag $TAG does not exist"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if GitHub Release exists
+        id: check-release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "GitHub Release $TAG already exists"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "GitHub Release $TAG does not exist"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Create the tag and Release together. `gh release create` creates the tag
+      # ref at --target when it doesn't exist, and points at the existing tag when
+      # it does, so this is idempotent and safe to re-run.
+      - name: Create tag and GitHub Release
+        if: steps.check-release.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          SHA=$(git rev-parse HEAD)
+          TRIGGERED_BY="${{ steps.actor.outputs.triggered_by }}"
+
+          # Use a GitHub App token (not GITHUB_TOKEN) so the tag push triggers
+          # release.yml. Include actor metadata as an HTML comment if available.
+          if [ -n "$TRIGGERED_BY" ]; then
+            gh release create "$TAG" \
+              --target "$SHA" \
+              --title "Release $TAG" \
+              --generate-notes \
+              --notes "<!-- Release-Triggered-By: $TRIGGERED_BY -->"
+          else
+            gh release create "$TAG" \
+              --target "$SHA" \
+              --title "Release $TAG" \
+              --generate-notes
+          fi
+          echo "Created tag and GitHub Release: $TAG"
+
+      - name: Summary
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          TAG_EXISTED="${{ steps.check-tag.outputs.exists }}"
+          RELEASE_EXISTED="${{ steps.check-release.outputs.exists }}"
+
+          {
+            echo "## Release Summary for \`$TAG\`"
+            echo ""
+            echo "| Action | Result |"
+            echo "|--------|--------|"
+            if [ "$RELEASE_EXISTED" == "true" ]; then
+              echo "| Git Tag | Already existed |"
+              echo "| GitHub Release | Already existed |"
+            else
+              if [ "$TAG_EXISTED" == "true" ]; then
+                echo "| Git Tag | Reused existing |"
+              else
+                echo "| Git Tag | ✅ Created |"
+              fi
+              echo "| GitHub Release | ✅ Created |"
+              echo ""
+              echo "\`release.yml\` will now upload schema artifacts to the Release."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
