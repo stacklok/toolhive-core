@@ -39,7 +39,7 @@ require (
 	github.com/lestrrat-go/httprc/v3 v3.0.6
 	github.com/lestrrat-go/jwx/v3 v3.2.0
 	github.com/prometheus/client_golang v1.24.1
-	github.com/secure-systems-lab/go-securesystemslib v0.11.0
+	github.com/secure-systems-lab/go-securesystemslib v0.11.1
 	github.com/shirou/gopsutil/v4 v4.26.7
 	github.com/sigstore/rekor v1.5.3
 	github.com/sigstore/sigstore v1.10.9
