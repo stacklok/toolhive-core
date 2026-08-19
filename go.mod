@@ -33,7 +33,7 @@ require (
 require (
 	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467
 	github.com/go-openapi/runtime v0.33.0
-	github.com/go-openapi/swag/conv v0.27.3
+	github.com/go-openapi/swag/conv v0.28.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/certificate-transparency-go v1.3.3
 	github.com/lestrrat-go/httprc/v3 v3.0.6
@@ -101,7 +101,7 @@ require (
 	github.com/go-openapi/swag/netutils v0.27.0 // indirect
 	github.com/go-openapi/swag/pools v0.27.3 // indirect
 	github.com/go-openapi/swag/stringutils v0.27.3 // indirect
-	github.com/go-openapi/swag/typeutils v0.27.3 // indirect
+	github.com/go-openapi/swag/typeutils v0.28.0 // indirect
 	github.com/go-openapi/swag/yamlutils v0.27.3 // indirect
 	github.com/go-openapi/validate v0.26.1 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
