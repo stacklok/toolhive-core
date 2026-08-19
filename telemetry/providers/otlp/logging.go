@@ -49,6 +49,13 @@ func createLogExporter(ctx context.Context, config Config) (sdklog.Exporter, err
 
 // NewLoggerProviderWithShutdown creates an OTLP logger provider with a shutdown function.
 // When no endpoint is configured, it returns a no-op provider with a nil shutdown function.
+//
+// The Logs API/SDK used here (go.opentelemetry.io/otel/log, go.opentelemetry.io/otel/sdk/log,
+// and the otlploghttp exporter) implements the OpenTelemetry specification's Logs API, which
+// is marked Stable (https://opentelemetry.io/docs/specs/otel/logs/api/). Their Go module
+// version (v0.21.0 as of writing) hasn't crossed 1.0 yet, but that mirrors the Prometheus
+// metrics exporter this package already depends on (go.opentelemetry.io/otel/exporters/prometheus,
+// also 0.x): pre-1.0 module versioning here tracks release cadence, not spec/API stability.
 func NewLoggerProviderWithShutdown(
 	ctx context.Context,
 	config Config,
