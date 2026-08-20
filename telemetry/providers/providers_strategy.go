@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 
+	"go.opentelemetry.io/otel/log"
+	lognoop "go.opentelemetry.io/otel/log/noop"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -69,6 +71,55 @@ func (*OTLPTracerStrategy) CreateTracerProvider(
 	provider, shutdown, err := otlp.NewTracerProviderWithShutdown(ctx, otlpConfig, res, config.ExtraSpanProcessors...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create OTLP tracer provider for endpoint %s: %w", config.OTLPEndpoint, err)
+	}
+	return provider, shutdown, nil
+}
+
+// LoggerStrategy defines the interface for creating logger providers.
+// Implementations create logger providers based on configuration and resource information.
+type LoggerStrategy interface {
+	// CreateLoggerProvider creates a logger provider with optional shutdown function
+	CreateLoggerProvider(ctx context.Context, config Config, res *resource.Resource) (
+		log.LoggerProvider, func(context.Context) error, error)
+}
+
+// NoOpLoggerStrategy creates a no-op logger provider that discards all log records.
+// It's used when logging is disabled or no OTLP endpoint is configured.
+type NoOpLoggerStrategy struct{}
+
+// CreateLoggerProvider creates a no-op logger provider
+func (*NoOpLoggerStrategy) CreateLoggerProvider(
+	_ context.Context,
+	_ Config,
+	_ *resource.Resource,
+) (log.LoggerProvider, func(context.Context) error, error) {
+	slog.Debug("creating no-op logger provider")
+	return lognoop.NewLoggerProvider(), nil, nil
+}
+
+// OTLPLoggerStrategy creates an OTLP logger provider that sends logs to an OTLP collector.
+type OTLPLoggerStrategy struct{}
+
+// CreateLoggerProvider creates an OTLP logger provider with the configured endpoint
+func (*OTLPLoggerStrategy) CreateLoggerProvider(
+	ctx context.Context,
+	config Config,
+	res *resource.Resource,
+) (log.LoggerProvider, func(context.Context) error, error) {
+	//nolint:gosec // G706: OTLP endpoint from config
+	slog.Debug("creating OTLP logger provider",
+		"endpoint", config.OTLPEndpoint)
+
+	otlpConfig := otlp.Config{
+		Endpoint:   config.OTLPEndpoint,
+		Headers:    config.Headers,
+		Insecure:   config.Insecure,
+		CACertPath: config.CACertPath,
+	}
+
+	provider, shutdown, err := otlp.NewLoggerProviderWithShutdown(ctx, otlpConfig, res)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create OTLP logger provider for endpoint %s: %w", config.OTLPEndpoint, err)
 	}
 	return provider, shutdown, nil
 }
@@ -213,6 +264,14 @@ func (s *StrategySelector) SelectTracerStrategy() TracerStrategy {
 	return &NoOpTracerStrategy{}
 }
 
+// SelectLoggerStrategy determines the appropriate logger strategy based on configuration.
+func (s *StrategySelector) SelectLoggerStrategy() LoggerStrategy {
+	if s.hasOTLPLogging() {
+		return &OTLPLoggerStrategy{}
+	}
+	return &NoOpLoggerStrategy{}
+}
+
 // SelectMeterStrategy determines the appropriate meter strategy based on configuration.
 func (s *StrategySelector) SelectMeterStrategy() MeterStrategy {
 	wantsOTLPMetrics := s.hasOTLPMetrics()
@@ -232,7 +291,7 @@ func (s *StrategySelector) SelectMeterStrategy() MeterStrategy {
 
 // IsFullyNoOp returns true if both tracer and meter would be no-op.
 func (s *StrategySelector) IsFullyNoOp() bool {
-	return !s.hasOTLPMetrics() && !s.hasOTLPTracing() && !s.hasPrometheus() && !s.hasExtraProcessors()
+	return !s.hasOTLPMetrics() && !s.hasOTLPTracing() && !s.hasOTLPLogging() && !s.hasPrometheus() && !s.hasExtraProcessors()
 }
 
 // hasOTLPMetrics returns true if OTLP metrics are wanted.
@@ -243,6 +302,11 @@ func (s *StrategySelector) hasOTLPMetrics() bool {
 // hasOTLPTracing returns true if OTLP tracing is wanted.
 func (s *StrategySelector) hasOTLPTracing() bool {
 	return s.config.OTLPEndpoint != "" && s.config.TracingEnabled
+}
+
+// hasOTLPLogging returns true if OTLP logging is wanted.
+func (s *StrategySelector) hasOTLPLogging() bool {
+	return s.config.OTLPEndpoint != "" && s.config.LoggingEnabled
 }
 
 // hasPrometheus returns true if Prometheus metrics are wanted.

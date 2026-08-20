@@ -17,6 +17,7 @@ import "strings"
 const (
 	otlpTracesPath  = "/v1/traces"
 	otlpMetricsPath = "/v1/metrics"
+	otlpLogsPath    = "/v1/logs"
 )
 
 // splitEndpointPath separates an OTLP endpoint string into its host:port and
