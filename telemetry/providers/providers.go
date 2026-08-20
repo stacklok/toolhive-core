@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/log"
+	lognoop "go.opentelemetry.io/otel/log/noop"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -34,6 +36,7 @@ type Config struct {
 	Insecure       bool              // Insecure enables insecure transport (no TLS) for OTLP
 	TracingEnabled bool              // TracingEnabled controls whether tracing is enabled for OTLP
 	MetricsEnabled bool              // MetricsEnabled controls whether metrics are enabled for OTLP
+	LoggingEnabled bool              // LoggingEnabled controls whether logging is enabled for OTLP
 	SamplingRate   float64           // SamplingRate controls trace sampling (0.0 to 1.0)
 
 	// Prometheus configuration
@@ -124,6 +127,14 @@ func WithMetricsEnabled(metricsEnabled bool) ProviderOption {
 	}
 }
 
+// WithLoggingEnabled sets the logging enabled flag
+func WithLoggingEnabled(loggingEnabled bool) ProviderOption {
+	return func(config *Config) error {
+		config.LoggingEnabled = loggingEnabled
+		return nil
+	}
+}
+
 // WithSamplingRate sets the sampling rate
 func WithSamplingRate(samplingRate float64) ProviderOption {
 	return func(config *Config) error {
@@ -161,6 +172,7 @@ func WithExtraSpanProcessors(processors ...sdktrace.SpanProcessor) ProviderOptio
 type CompositeProvider struct {
 	tracerProvider    trace.TracerProvider          // tracerProvider provides distributed tracing
 	meterProvider     metric.MeterProvider          // meterProvider provides metrics collection
+	loggerProvider    log.LoggerProvider            // loggerProvider provides log export
 	prometheusHandler http.Handler                  // prometheusHandler serves Prometheus metrics
 	shutdownFuncs     []func(context.Context) error // shutdownFuncs clean up resources on shutdown
 }
@@ -224,6 +236,7 @@ func createNoOpProvider() *CompositeProvider {
 	return &CompositeProvider{
 		tracerProvider:    tracenoop.NewTracerProvider(),
 		meterProvider:     noop.NewMeterProvider(),
+		loggerProvider:    lognoop.NewLoggerProvider(),
 		prometheusHandler: nil,
 		shutdownFuncs:     []func(context.Context) error{},
 	}
@@ -245,6 +258,10 @@ func buildProviders(
 	}
 
 	if err := createTracingProvider(ctx, config, composite, selector, res); err != nil {
+		return nil, err
+	}
+
+	if err := createLoggingProvider(ctx, config, composite, selector, res); err != nil {
 		return nil, err
 	}
 
@@ -309,6 +326,33 @@ func createTracingProvider(
 	return nil
 }
 
+// createLoggingProvider creates the logging provider for the composite provider
+func createLoggingProvider(
+	ctx context.Context,
+	config Config,
+	composite *CompositeProvider,
+	selector *StrategySelector,
+	res *resource.Resource,
+) error {
+	// Create logger provider using selected strategy
+	loggerStrategy := selector.SelectLoggerStrategy()
+	loggerProvider, loggerShutdown, err := loggerStrategy.CreateLoggerProvider(ctx, config, res)
+	if err != nil {
+		return fmt.Errorf("failed to create logger provider with config (endpoint: %s, logging enabled: %t): %w",
+			config.OTLPEndpoint,
+			config.LoggingEnabled,
+			err)
+	}
+
+	composite.loggerProvider = loggerProvider
+
+	if loggerShutdown != nil {
+		composite.shutdownFuncs = append(composite.shutdownFuncs, loggerShutdown)
+	}
+
+	return nil
+}
+
 // TracerProvider returns the tracer provider
 func (p *CompositeProvider) TracerProvider() trace.TracerProvider {
 	return p.tracerProvider
@@ -317,6 +361,11 @@ func (p *CompositeProvider) TracerProvider() trace.TracerProvider {
 // MeterProvider returns the primary meter provider
 func (p *CompositeProvider) MeterProvider() metric.MeterProvider {
 	return p.meterProvider
+}
+
+// LoggerProvider returns the logger provider
+func (p *CompositeProvider) LoggerProvider() log.LoggerProvider {
+	return p.loggerProvider
 }
 
 // PrometheusHandler returns the Prometheus metrics handler if configured
