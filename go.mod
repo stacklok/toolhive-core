@@ -1,6 +1,6 @@
 module github.com/stacklok/toolhive-core
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/adrg/xdg v0.5.3
@@ -38,6 +38,7 @@ require (
 	github.com/google/certificate-transparency-go v1.3.3
 	github.com/lestrrat-go/httprc/v3 v3.0.6
 	github.com/lestrrat-go/jwx/v3 v3.2.0
+	github.com/lestrrat-go/jwx/v4 v4.4.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/secure-systems-lab/go-securesystemslib v0.11.1
 	github.com/shirou/gopsutil/v4 v4.26.7
