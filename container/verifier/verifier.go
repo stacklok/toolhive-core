@@ -166,12 +166,43 @@ func isVerificationResultMatchingServerProvenance(r *verify.VerificationResult, 
 		return false
 	}
 
-	// If the attestations are not set, we can skip this check
-	if p.Attestation != nil && r.Statement != nil && p.Attestation.Predicate != nil && r.Statement.Predicate != nil {
-		if p.Attestation.PredicateType != r.Statement.PredicateType {
+	return compareAttestation(r, p)
+}
+
+// compareAttestation compares the attestation constraint declared in the
+// server provenance against the in-toto statement carried by the verification
+// result. Following the same per-field convention as compareBaseProperties, an
+// unset expectation means "do not constrain that dimension" rather than "skip
+// the check".
+func compareAttestation(r *verify.VerificationResult, p *registry.Provenance) bool {
+	// A nil attestation places no constraint on the artifact.
+	if p.Attestation == nil {
+		return true
+	}
+
+	// The provenance asks for an attestation, so the artifact has to carry
+	// one. Treating a missing statement as a match would skip the constraint
+	// exactly when it matters.
+	if r.Statement == nil {
+		return false
+	}
+
+	if p.Attestation.PredicateType != "" && p.Attestation.PredicateType != r.Statement.PredicateType {
+		return false
+	}
+
+	if p.Attestation.Predicate != nil {
+		if r.Statement.Predicate == nil {
 			return false
 		}
-		return reflect.DeepEqual(p.Attestation.Predicate, r.Statement.Predicate)
+		// The expected predicate is decoded registry data (map[string]any for
+		// a JSON object) while the statement carries a *structpb.Struct, so
+		// the two are only comparable once the struct is normalised to its map
+		// form. Note that AsMap yields float64 for every number, matching
+		// encoding/json but not YAML's integer decoding.
+		if !reflect.DeepEqual(p.Attestation.Predicate, r.Statement.Predicate.AsMap()) {
+			return false
+		}
 	}
 
 	return true
