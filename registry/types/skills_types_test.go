@@ -23,6 +23,7 @@ const (
 	testSkillIdentifier = "ghcr.io/stacklok/dockyard/skills/commit:1.0.0"
 
 	testCaseFullProvenance = "fully populated provenance"
+	testPredicateType      = "https://slsa.dev/provenance/v1"
 )
 
 // fullProvenance returns a Provenance with every field populated, matching the
@@ -86,14 +87,11 @@ func TestSkill_ProvenanceJSONRoundTrip(t *testing.T) {
 			wantKey: true,
 		},
 		{
-			// The shared Provenance type carries Attestation, so it still
-			// serializes here. Validate rejects it; see
-			// TestSkill_ValidateWithProvenance.
 			name: "provenance with attestation",
 			provenance: &Provenance{
 				SignerIdentity: testSignerIdentity,
 				Attestation: &VerifiedAttestation{
-					PredicateType: "https://slsa.dev/provenance/v1",
+					PredicateType: testPredicateType,
 					Predicate:     map[string]any{"buildType": "workflow"},
 				},
 			},
@@ -177,10 +175,12 @@ func TestSkill_ProvenanceYAMLRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSkill_ValidateWithProvenance verifies that Validate accepts skills with
-// provenance in every degree of population. Provenance is an opt-in tightening
-// per catalog entry, so neither its absence nor a partially filled value may
-// cause validation to fail.
+// TestSkill_ValidateWithProvenance verifies that Validate accepts provenance in
+// every degree of population, since it is an opt-in tightening per catalog
+// entry and neither its absence nor a partially filled value may fail
+// validation. The exception is a constraint the verifier could never satisfy:
+// a non-object attestation predicate is rejected here rather than shipped as an
+// entry that fails against every artifact.
 func TestSkill_ValidateWithProvenance(t *testing.T) {
 	t.Parallel()
 
@@ -211,26 +211,47 @@ func TestSkill_ValidateWithProvenance(t *testing.T) {
 			provenance: &Provenance{},
 		},
 		{
-			// The verifier only compares an expected attestation when the
-			// artifact also carries one, so this constraint would be silently
-			// skipped against a signature with no attestation. Reject it
-			// rather than let a catalog author believe it is enforced.
-			name: "attestation is refused, not silently ignored",
+			name: "fully specified attestation",
 			provenance: &Provenance{
 				SignerIdentity: testSignerIdentity,
 				CertIssuer:     testCertIssuer,
 				Attestation: &VerifiedAttestation{
-					PredicateType: "https://slsa.dev/provenance/v1",
+					PredicateType: testPredicateType,
 					Predicate:     map[string]any{"buildType": "workflow"},
 				},
+			},
+		},
+		{
+			// Means "must be attested, no constraint on what the attestation
+			// says" -- the verifier still requires the artifact to carry a
+			// statement.
+			name: "empty attestation constrains only presence",
+			provenance: &Provenance{
+				SignerIdentity: testSignerIdentity,
+				Attestation:    &VerifiedAttestation{},
+			},
+		},
+		{
+			name: "predicate type without predicate",
+			provenance: &Provenance{
+				Attestation: &VerifiedAttestation{PredicateType: testPredicateType},
+			},
+		},
+		{
+			// normalizeAttestationPredicate requires map[string]any, so a
+			// scalar predicate can never match any artifact. Reject it at
+			// authoring time instead of shipping a constraint that always
+			// fails.
+			name: "scalar predicate is rejected",
+			provenance: &Provenance{
+				Attestation: &VerifiedAttestation{Predicate: "not-an-object"},
 			},
 			expectError: true,
 		},
 		{
-			name: "empty attestation is still refused",
+			name: "array predicate is rejected",
 			provenance: &Provenance{
-				SignerIdentity: testSignerIdentity,
-				Attestation:    &VerifiedAttestation{},
+				Attestation: &VerifiedAttestation{Predicate: []any{"a", "b"}},
 			},
 			expectError: true,
 		},
@@ -292,11 +313,26 @@ func TestValidateSkillBytes_Provenance(t *testing.T) {
 			expectError: true,
 		},
 		{
-			// Not "must be an object" -- the key is refused outright, because
-			// the verifier cannot enforce an attestation constraint against a
-			// signature that carries none.
-			name:        "attestation key is rejected",
-			provenance:  `{"attestation":{"predicate_type":"https://slsa.dev/provenance/v1"}}`,
+			name:       "valid attestation constraint",
+			provenance: `{"attestation":{"predicate_type":"https://slsa.dev/provenance/v1","predicate":{"buildType":"workflow"}}}`,
+		},
+		{
+			name:       "valid empty attestation constraint",
+			provenance: `{"attestation":{}}`,
+		},
+		{
+			name:        "attestation must be an object",
+			provenance:  `{"attestation":"nope"}`,
+			expectError: true,
+		},
+		{
+			name:        "attestation predicate must be an object",
+			provenance:  `{"attestation":{"predicate":"not-an-object"}}`,
+			expectError: true,
+		},
+		{
+			name:        "misspelled attestation key is rejected",
+			provenance:  `{"attestation":{"predicatetype":"x"}}`,
 			expectError: true,
 		},
 		{
