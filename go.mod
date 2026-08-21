@@ -3,12 +3,12 @@ module github.com/stacklok/toolhive-core
 go 1.26
 
 require (
+	cel.dev/cel-go v0.32.0
 	github.com/adrg/xdg v0.5.3
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.38
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.38
 	github.com/aws/aws-sdk-go-v2/feature/rds/auth v1.6.38
-	github.com/google/cel-go v0.31.0
 	github.com/google/go-containerregistry v0.21.9
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
