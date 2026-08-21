@@ -4,11 +4,17 @@
 package verifier
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/authn"
+	in_toto "github.com/in-toto/attestation/go/v1"
+	"github.com/sigstore/sigstore-go/pkg/fulcio/certificate"
+	"github.com/sigstore/sigstore-go/pkg/verify"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/structpb"
+	"gopkg.in/yaml.v3"
 
 	registry "github.com/stacklok/toolhive-core/registry/types"
 )
@@ -63,4 +69,307 @@ func TestVerifyServer_NilProvenance_InvalidRef(t *testing.T) {
 	s := &Sigstore{keychain: authn.DefaultKeychain}
 	err := s.VerifyServer("", nil)
 	require.Error(t, err)
+}
+
+// ------ isVerificationResultMatchingServerProvenance ------
+
+// testSAN is a Fulcio-style subject alternative name. compareBaseProperties
+// runs signerIdentityFromCertificate unconditionally, which errors on an empty
+// SAN, so every fixture certificate carries one.
+const testSAN = "https://github.com/stacklok/toolhive/.github/workflows/build.yml@refs/heads/main"
+
+const (
+	slsaPredicateType = "https://slsa.dev/provenance/v1"
+	buildTypeKey      = "buildType"
+	buildTypeGHA      = "gha"
+	attemptKey        = "attempt"
+	builderKey        = "builder"
+	builderID         = "https://github.com/actions/runner"
+)
+
+// newTestResult builds a minimal verification result whose certificate is
+// populated enough for compareBaseProperties to run cleanly.
+func newTestResult(statement *in_toto.Statement) *verify.VerificationResult {
+	return &verify.VerificationResult{
+		Signature: &verify.SignatureVerificationResult{
+			Certificate: &certificate.Summary{
+				SubjectAlternativeName: testSAN,
+			},
+		},
+		Statement: statement,
+	}
+}
+
+// newTestStatement builds an in-toto statement. A nil predicate leaves
+// Statement.Predicate nil, modelling a statement that carries no predicate.
+func newTestStatement(t *testing.T, predicateType string, predicate map[string]any) *in_toto.Statement {
+	t.Helper()
+	stmt := &in_toto.Statement{PredicateType: predicateType}
+	if predicate != nil {
+		s, err := structpb.NewStruct(predicate)
+		require.NoError(t, err)
+		stmt.Predicate = s
+	}
+	return stmt
+}
+
+func TestIsVerificationResultMatchingServerProvenance_Attestation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		statement *in_toto.Statement
+		expected  *registry.VerifiedAttestation
+		want      bool
+	}{
+		{
+			name:      "nil expected attestation is unconstrained",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{buildTypeKey: buildTypeGHA}),
+			expected:  nil,
+			want:      true,
+		},
+		{
+			name:      "nil expected attestation with no statement is unconstrained",
+			statement: nil,
+			expected:  nil,
+			want:      true,
+		},
+		{
+			// Regression: this used to fall through to a match, skipping the
+			// constraint exactly when the artifact carried no attestation.
+			name:      "expected attestation but statement absent",
+			statement: nil,
+			expected:  &registry.VerifiedAttestation{PredicateType: slsaPredicateType},
+			want:      false,
+		},
+		{
+			name:      "empty expected attestation but statement absent",
+			statement: nil,
+			expected:  &registry.VerifiedAttestation{},
+			want:      false,
+		},
+		{
+			// An empty expectation means "must carry some attestation",
+			// without constraining which one.
+			name:      "empty expected attestation with statement present",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{buildTypeKey: buildTypeGHA}),
+			expected:  &registry.VerifiedAttestation{},
+			want:      true,
+		},
+		{
+			name:      "predicate type matches, predicate unconstrained",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{buildTypeKey: buildTypeGHA}),
+			expected:  &registry.VerifiedAttestation{PredicateType: slsaPredicateType},
+			want:      true,
+		},
+		{
+			name:      "predicate type mismatch",
+			statement: newTestStatement(t, "https://slsa.dev/provenance/v0.2", map[string]any{buildTypeKey: buildTypeGHA}),
+			expected:  &registry.VerifiedAttestation{PredicateType: slsaPredicateType},
+			want:      false,
+		},
+		{
+			name:      "expected predicate but statement carries none",
+			statement: newTestStatement(t, slsaPredicateType, nil),
+			expected: &registry.VerifiedAttestation{
+				PredicateType: slsaPredicateType,
+				Predicate:     map[string]any{buildTypeKey: buildTypeGHA},
+			},
+			want: false,
+		},
+		{
+			name:      "predicate mismatch",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{buildTypeKey: buildTypeGHA}),
+			expected: &registry.VerifiedAttestation{
+				PredicateType: slsaPredicateType,
+				Predicate:     map[string]any{buildTypeKey: "local"},
+			},
+			want: false,
+		},
+		{
+			name: "predicate type and predicate both match",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{
+				buildTypeKey: buildTypeGHA,
+				builderKey:   map[string]any{"id": builderID},
+			}),
+			expected: &registry.VerifiedAttestation{
+				PredicateType: slsaPredicateType,
+				Predicate: map[string]any{
+					buildTypeKey: buildTypeGHA,
+					builderKey:   map[string]any{"id": builderID},
+				},
+			},
+			want: true,
+		},
+		{
+			name:      "predicate matches with predicate type unconstrained",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{buildTypeKey: buildTypeGHA}),
+			expected:  &registry.VerifiedAttestation{Predicate: map[string]any{buildTypeKey: buildTypeGHA}},
+			want:      true,
+		},
+		{
+			// Numbers are normalised on both sides, so an expectation compares
+			// equal whether the decoder produced float64 (encoding/json) or
+			// int (yaml.v3).
+			name:      "numeric predicate matches as float64",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{attemptKey: 1}),
+			expected:  &registry.VerifiedAttestation{Predicate: map[string]any{attemptKey: float64(1)}},
+			want:      true,
+		},
+		{
+			name:      "numeric predicate matches as int",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{attemptKey: 1}),
+			expected:  &registry.VerifiedAttestation{Predicate: map[string]any{attemptKey: 1}},
+			want:      true,
+		},
+		{
+			name:      "numeric predicate still mismatches on value",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{attemptKey: 1}),
+			expected:  &registry.VerifiedAttestation{Predicate: map[string]any{attemptKey: 2}},
+			want:      false,
+		},
+		{
+			// An in-toto predicate is always an object, so a scalar
+			// expectation cannot match and must not pass.
+			name:      "non-object expected predicate does not match",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{buildTypeKey: buildTypeGHA}),
+			expected:  &registry.VerifiedAttestation{Predicate: buildTypeGHA},
+			want:      false,
+		},
+		{
+			// A predicate structpb cannot represent is one we cannot confirm,
+			// so it fails closed rather than passing.
+			name:      "unrepresentable expected predicate does not match",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{buildTypeKey: buildTypeGHA}),
+			expected:  &registry.VerifiedAttestation{Predicate: map[string]any{buildTypeKey: make(chan int)}},
+			want:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := newTestResult(tt.statement)
+			p := &registry.Provenance{Attestation: tt.expected}
+			assert.Equal(t, tt.want, isVerificationResultMatchingServerProvenance(r, p))
+		})
+	}
+}
+
+// Predicate equality must not depend on how the registry entry was decoded.
+// The same provenance expressed as JSON and as YAML has to verify against the
+// same statement, even though encoding/json decodes numbers to float64 while
+// yaml.v3 decodes them to int.
+func TestIsVerificationResultMatchingServerProvenance_PredicateDecoderIndependence(t *testing.T) {
+	t.Parallel()
+
+	const jsonProvenance = `{
+		"attestation": {
+			"predicate_type": "https://slsa.dev/provenance/v1",
+			"predicate": {
+				"buildType": "gha",
+				"attempt": 1,
+				"builder": {"id": "https://github.com/actions/runner", "version": 2},
+				"steps": [1, 2]
+			}
+		}
+	}`
+
+	const yamlProvenance = `
+attestation:
+  predicate_type: https://slsa.dev/provenance/v1
+  predicate:
+    buildType: gha
+    attempt: 1
+    builder:
+      id: https://github.com/actions/runner
+      version: 2
+    steps:
+      - 1
+      - 2
+`
+
+	statement := newTestStatement(t, slsaPredicateType, map[string]any{
+		buildTypeKey: buildTypeGHA,
+		attemptKey:   1,
+		builderKey:   map[string]any{"id": builderID, "version": 2},
+		"steps":      []any{1, 2},
+	})
+	result := newTestResult(statement)
+
+	var fromJSON registry.Provenance
+	require.NoError(t, json.Unmarshal([]byte(jsonProvenance), &fromJSON))
+
+	var fromYAML registry.Provenance
+	require.NoError(t, yaml.Unmarshal([]byte(yamlProvenance), &fromYAML))
+
+	// Guard the premise: the two decoders really do produce different Go
+	// types, so this test would be vacuous if they ever converged.
+	require.NotEqual(t, fromJSON.Attestation.Predicate, fromYAML.Attestation.Predicate,
+		"decoders expected to disagree on numeric types; test is vacuous otherwise")
+
+	assert.True(t, isVerificationResultMatchingServerProvenance(result, &fromJSON), "JSON-decoded provenance should match")
+	assert.True(t, isVerificationResultMatchingServerProvenance(result, &fromYAML), "YAML-decoded provenance should match")
+}
+
+func TestIsVerificationResultMatchingServerProvenance_Guards(t *testing.T) {
+	t.Parallel()
+
+	statement := newTestStatement(t, slsaPredicateType, map[string]any{buildTypeKey: buildTypeGHA})
+
+	tests := []struct {
+		name   string
+		result *verify.VerificationResult
+		prov   *registry.Provenance
+		want   bool
+	}{
+		{
+			name:   "nil result",
+			result: nil,
+			prov:   &registry.Provenance{},
+			want:   false,
+		},
+		{
+			name:   "nil provenance",
+			result: newTestResult(statement),
+			prov:   nil,
+			want:   false,
+		},
+		{
+			name:   "nil signature",
+			result: &verify.VerificationResult{Statement: statement},
+			prov:   &registry.Provenance{},
+			want:   false,
+		},
+		{
+			name: "nil certificate",
+			result: &verify.VerificationResult{
+				Signature: &verify.SignatureVerificationResult{},
+				Statement: statement,
+			},
+			prov: &registry.Provenance{},
+			want: false,
+		},
+		{
+			// Base properties are checked before the attestation, so a
+			// mismatch there short-circuits regardless of the attestation.
+			name:   "base property mismatch short-circuits",
+			result: newTestResult(statement),
+			prov:   &registry.Provenance{RepositoryURI: "https://github.com/other/repo"},
+			want:   false,
+		},
+		{
+			name:   "no constraints at all",
+			result: newTestResult(statement),
+			prov:   &registry.Provenance{},
+			want:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, isVerificationResultMatchingServerProvenance(tt.result, tt.prov))
+		})
+	}
 }

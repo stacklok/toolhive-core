@@ -15,6 +15,7 @@ import (
 	"github.com/sigstore/sigstore-go/pkg/fulcio/certificate"
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/verify"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	registry "github.com/stacklok/toolhive-core/registry/types"
 )
@@ -166,15 +167,71 @@ func isVerificationResultMatchingServerProvenance(r *verify.VerificationResult, 
 		return false
 	}
 
-	// If the attestations are not set, we can skip this check
-	if p.Attestation != nil && r.Statement != nil && p.Attestation.Predicate != nil && r.Statement.Predicate != nil {
-		if p.Attestation.PredicateType != r.Statement.PredicateType {
+	return compareAttestation(r, p)
+}
+
+// compareAttestation compares the attestation constraint declared in the
+// server provenance against the in-toto statement carried by the verification
+// result. Following the same per-field convention as compareBaseProperties, an
+// unset expectation means "do not constrain that dimension" rather than "skip
+// the check".
+func compareAttestation(r *verify.VerificationResult, p *registry.Provenance) bool {
+	// A nil attestation places no constraint on the artifact.
+	if p.Attestation == nil {
+		return true
+	}
+
+	// The provenance asks for an attestation, so the artifact has to carry
+	// one. Treating a missing statement as a match would skip the constraint
+	// exactly when it matters.
+	if r.Statement == nil {
+		return false
+	}
+
+	if p.Attestation.PredicateType != "" && p.Attestation.PredicateType != r.Statement.PredicateType {
+		return false
+	}
+
+	if p.Attestation.Predicate != nil {
+		if r.Statement.Predicate == nil {
 			return false
 		}
-		return reflect.DeepEqual(p.Attestation.Predicate, r.Statement.Predicate)
+		// Round both sides through structpb before comparing. The expected
+		// predicate is decoded registry data whose Go types depend on the
+		// serialisation format - encoding/json yields float64 for every
+		// number where yaml.v3 yields int - while the statement carries a
+		// *structpb.Struct. Comparing the raw values would make verification
+		// depend on how the registry entry happened to be decoded.
+		expected, err := normalizeAttestationPredicate(p.Attestation.Predicate)
+		if err != nil {
+			// An expected predicate we cannot normalise is one we cannot
+			// confirm, so treat it as a mismatch rather than a pass.
+			slog.Error("cannot normalize expected attestation predicate", "error", err)
+			return false
+		}
+		if !reflect.DeepEqual(expected, r.Statement.Predicate.AsMap()) {
+			return false
+		}
 	}
 
 	return true
+}
+
+// normalizeAttestationPredicate renders an expected predicate from the registry
+// into the same shape structpb produces for a statement predicate, so that
+// semantically equal predicates compare equal regardless of whether they were
+// decoded from JSON or YAML. An in-toto predicate is always an object, so an
+// expectation that is not a map cannot match one.
+func normalizeAttestationPredicate(predicate any) (map[string]any, error) {
+	fields, ok := predicate.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("expected predicate is %T, want an object", predicate)
+	}
+	s, err := structpb.NewStruct(fields)
+	if err != nil {
+		return nil, fmt.Errorf("expected predicate is not representable as a struct: %w", err)
+	}
+	return s.AsMap(), nil
 }
 
 // compareBaseProperties compares the base properties of the verification result and the server provenance
