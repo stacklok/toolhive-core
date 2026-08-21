@@ -86,6 +86,9 @@ func TestSkill_ProvenanceJSONRoundTrip(t *testing.T) {
 			wantKey: true,
 		},
 		{
+			// The shared Provenance type carries Attestation, so it still
+			// serializes here. Validate rejects it; see
+			// TestSkill_ValidateWithProvenance.
 			name: "provenance with attestation",
 			provenance: &Provenance{
 				SignerIdentity: testSignerIdentity,
@@ -208,7 +211,11 @@ func TestSkill_ValidateWithProvenance(t *testing.T) {
 			provenance: &Provenance{},
 		},
 		{
-			name: "provenance with attestation",
+			// The verifier only compares an expected attestation when the
+			// artifact also carries one, so this constraint would be silently
+			// skipped against a signature with no attestation. Reject it
+			// rather than let a catalog author believe it is enforced.
+			name: "attestation is refused, not silently ignored",
 			provenance: &Provenance{
 				SignerIdentity: testSignerIdentity,
 				CertIssuer:     testCertIssuer,
@@ -217,6 +224,15 @@ func TestSkill_ValidateWithProvenance(t *testing.T) {
 					Predicate:     map[string]any{"buildType": "workflow"},
 				},
 			},
+			expectError: true,
+		},
+		{
+			name: "empty attestation is still refused",
+			provenance: &Provenance{
+				SignerIdentity: testSignerIdentity,
+				Attestation:    &VerifiedAttestation{},
+			},
+			expectError: true,
 		},
 	}
 
@@ -276,8 +292,23 @@ func TestValidateSkillBytes_Provenance(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name:        "attestation must be an object",
-			provenance:  `{"attestation":"nope"}`,
+			// Not "must be an object" -- the key is refused outright, because
+			// the verifier cannot enforce an attestation constraint against a
+			// signature that carries none.
+			name:        "attestation key is rejected",
+			provenance:  `{"attestation":{"predicate_type":"https://slsa.dev/provenance/v1"}}`,
+			expectError: true,
+		},
+		{
+			// additionalProperties:false turns a typo into a loud failure
+			// instead of a silently dropped security constraint.
+			name:        "misspelled constraint key is rejected",
+			provenance:  `{"signer_identityy":"/.github/workflows/build-skills.yml"}`,
+			expectError: true,
+		},
+		{
+			name:        "unknown constraint key is rejected",
+			provenance:  `{"expected_sbom":"whatever"}`,
 			expectError: true,
 		},
 	}

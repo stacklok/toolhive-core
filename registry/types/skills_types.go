@@ -81,6 +81,12 @@ type Skill struct {
 	// first install instead of trust-on-first-use. Absent means unconstrained
 	// — most catalog entries won't have this for a while, and that must not
 	// break installs; it's an opt-in tightening per entry, not a requirement.
+	//
+	// Only the identity fields are honored. Setting Provenance.Attestation
+	// makes Validate fail: the verifier compares an expected attestation only
+	// when the artifact also carries one, so the constraint would be silently
+	// skipped against a signature that has none. Refusing it loudly keeps the
+	// contract fail-closed until that gap is fixed.
 	Provenance *Provenance `json:"provenance,omitempty" yaml:"provenance,omitempty"`
 	// Metadata is the official metadata of the skill as reported in the
 	// SKILL.md file.

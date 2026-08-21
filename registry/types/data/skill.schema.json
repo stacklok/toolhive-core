@@ -173,7 +173,8 @@
     },
     "provenance": {
       "type": "object",
-      "description": "Expected signer identity for this skill, checked on first install instead of trust-on-first-use. Every field is optional: an absent or empty value leaves that dimension unconstrained. Mirrors the server provenance definition in publisher-provided.schema.json, but without 'format' keywords, because the Go Provenance struct serializes unset fields as empty strings and an empty string does not satisfy 'uri' or 'hostname'.",
+      "description": "Expected signer identity for this skill, checked on first install instead of trust-on-first-use. Every field is optional: an absent or empty value leaves that dimension unconstrained. Mirrors the server provenance definition in publisher-provided.schema.json, with two deliberate differences. First, no 'format' keywords, because the Go Provenance struct serializes unset fields as empty strings and an empty string does not satisfy 'uri' or 'hostname'. Second, 'attestation' is not accepted and 'additionalProperties' is false: the verifier only compares an expected attestation when the artifact also carries one, so a declared attestation constraint would be silently skipped against a signature that has none. Rejecting the key keeps the contract fail-closed -- a constraint this path cannot enforce is refused loudly rather than ignored. The same strictness makes a misspelled constraint key an error instead of a silently dropped guarantee.",
+      "additionalProperties": false,
       "properties": {
         "sigstore_url": {
           "type": "string",
@@ -213,26 +214,6 @@
           "examples": [
             "https://token.actions.githubusercontent.com"
           ]
-        },
-        "attestation": {
-          "$ref": "#/$defs/verified_attestation"
-        }
-      }
-    },
-    "verified_attestation": {
-      "type": "object",
-      "description": "Verified attestation information",
-      "properties": {
-        "predicate_type": {
-          "type": "string",
-          "description": "Type of the attestation predicate",
-          "examples": [
-            "https://slsa.dev/provenance/v0.2",
-            "https://slsa.dev/provenance/v1"
-          ]
-        },
-        "predicate": {
-          "description": "Attestation predicate data"
         }
       }
     },
