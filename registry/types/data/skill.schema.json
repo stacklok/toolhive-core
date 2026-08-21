@@ -85,6 +85,9 @@
         "$ref": "#/$defs/skill_package"
       }
     },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    },
     "metadata": {
       "type": "object",
       "description": "Official metadata from the SKILL.md file",
@@ -165,6 +168,52 @@
         "label": {
           "type": "string",
           "description": "Accessibility label for the icon"
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "description": "Expected signer identity for this skill, checked on first install instead of trust-on-first-use. Every field is optional: an absent or empty value leaves that dimension unconstrained. Mirrors the server provenance definition in publisher-provided.schema.json, with two deliberate differences. First, no 'format' keywords, because the Go Provenance struct serializes unset fields as empty strings and an empty string does not satisfy 'uri' or 'hostname'. Second, 'attestation' is not accepted and 'additionalProperties' is false: the verifier only compares an expected attestation when the artifact also carries one, so a declared attestation constraint would be silently skipped against a signature that has none. Rejecting the key keeps the contract fail-closed -- a constraint this path cannot enforce is refused loudly rather than ignored. The same strictness makes a misspelled constraint key an error instead of a silently dropped guarantee.",
+      "additionalProperties": false,
+      "properties": {
+        "sigstore_url": {
+          "type": "string",
+          "description": "Sigstore TUF repository host for provenance verification",
+          "examples": [
+            "tuf-repo.github.com",
+            "tuf-repo-cdn.sigstore.dev"
+          ]
+        },
+        "repository_uri": {
+          "type": "string",
+          "description": "Repository URI used for provenance verification"
+        },
+        "repository_ref": {
+          "type": "string",
+          "description": "Repository reference used for provenance verification"
+        },
+        "signer_identity": {
+          "type": "string",
+          "description": "Identity of the signer for provenance verification",
+          "examples": [
+            "/.github/workflows/build-skills.yml"
+          ]
+        },
+        "runner_environment": {
+          "type": "string",
+          "description": "Build environment where the skill was built",
+          "examples": [
+            "github-hosted",
+            "gitlab-hosted",
+            "self-hosted"
+          ]
+        },
+        "cert_issuer": {
+          "type": "string",
+          "description": "Certificate issuer for provenance verification",
+          "examples": [
+            "https://token.actions.githubusercontent.com"
+          ]
         }
       }
     },
