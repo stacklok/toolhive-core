@@ -77,6 +77,11 @@ type Skill struct {
 	Icons []SkillIcon `json:"icons,omitempty"`
 	// Packages is the list of packages for the skill.
 	Packages []SkillPackage `json:"packages,omitempty"`
+	// Provenance is the expected signer identity for this skill, checked on
+	// first install instead of trust-on-first-use. Absent means unconstrained
+	// — most catalog entries won't have this for a while, and that must not
+	// break installs; it's an opt-in tightening per entry, not a requirement.
+	Provenance *Provenance `json:"provenance,omitempty" yaml:"provenance,omitempty"`
 	// Metadata is the official metadata of the skill as reported in the
 	// SKILL.md file.
 	Metadata map[string]any `json:"metadata,omitempty"`
