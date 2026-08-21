@@ -82,12 +82,14 @@ type Skill struct {
 	// — most catalog entries won't have this for a while, and that must not
 	// break installs; it's an opt-in tightening per entry, not a requirement.
 	//
-	// Each field constrains independently: an empty one is not checked. Setting
-	// Attestation requires the artifact to be attested at all, so verification
-	// fails against a signature carrying no statement. Attestation.Predicate
-	// must be a JSON object; anything else can never match, and Validate
-	// rejects it rather than letting it through as a constraint that silently
-	// fails every artifact.
+	// Each field constrains independently, and an empty string leaves that
+	// dimension unconstrained. Attestation is the exception: setting it at
+	// all, even to an empty struct, requires the artifact to be attested, so
+	// verification fails against a signature carrying no statement. Its own
+	// PredicateType and Predicate then follow the usual rule and constrain
+	// only when set. Predicate must be a JSON object; anything else can never
+	// match, and Validate rejects it rather than letting it through as a
+	// constraint that silently fails every artifact.
 	Provenance *Provenance `json:"provenance,omitempty" yaml:"provenance,omitempty"`
 	// Metadata is the official metadata of the skill as reported in the
 	// SKILL.md file.

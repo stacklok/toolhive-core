@@ -173,7 +173,7 @@
     },
     "provenance": {
       "type": "object",
-      "description": "Expected provenance for this skill, checked on first install instead of trust-on-first-use. Every field is optional: an absent or empty value leaves that dimension unconstrained. Mirrors the server provenance definition in publisher-provided.schema.json, with two deliberate differences. First, no 'format' keywords, because the Go Provenance struct serializes unset fields as empty strings and an empty string does not satisfy 'uri' or 'hostname'. Second, 'additionalProperties' is false, so a misspelled constraint key is a loud error rather than a silently dropped guarantee.",
+      "description": "Expected provenance for this skill, checked on first install instead of trust-on-first-use. Every field is optional, and an empty string leaves that dimension unconstrained. The exception is 'attestation', where the key's presence is itself the constraint: see its own description. Mirrors the server provenance definition in publisher-provided.schema.json, with two deliberate differences. First, no 'format' keywords, because the Go Provenance struct serializes unset fields as empty strings and an empty string does not satisfy 'uri' or 'hostname'. Second, 'additionalProperties' is false, so a misspelled constraint key is a loud error rather than a silently dropped guarantee.",
       "additionalProperties": false,
       "properties": {
         "sigstore_url": {
