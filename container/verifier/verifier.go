@@ -15,6 +15,7 @@ import (
 	"github.com/sigstore/sigstore-go/pkg/fulcio/certificate"
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/verify"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	registry "github.com/stacklok/toolhive-core/registry/types"
 )
@@ -195,17 +196,42 @@ func compareAttestation(r *verify.VerificationResult, p *registry.Provenance) bo
 		if r.Statement.Predicate == nil {
 			return false
 		}
-		// The expected predicate is decoded registry data (map[string]any for
-		// a JSON object) while the statement carries a *structpb.Struct, so
-		// the two are only comparable once the struct is normalised to its map
-		// form. Note that AsMap yields float64 for every number, matching
-		// encoding/json but not YAML's integer decoding.
-		if !reflect.DeepEqual(p.Attestation.Predicate, r.Statement.Predicate.AsMap()) {
+		// Round both sides through structpb before comparing. The expected
+		// predicate is decoded registry data whose Go types depend on the
+		// serialisation format - encoding/json yields float64 for every
+		// number where yaml.v3 yields int - while the statement carries a
+		// *structpb.Struct. Comparing the raw values would make verification
+		// depend on how the registry entry happened to be decoded.
+		expected, err := normalizeAttestationPredicate(p.Attestation.Predicate)
+		if err != nil {
+			// An expected predicate we cannot normalise is one we cannot
+			// confirm, so treat it as a mismatch rather than a pass.
+			slog.Error("cannot normalize expected attestation predicate", "error", err)
+			return false
+		}
+		if !reflect.DeepEqual(expected, r.Statement.Predicate.AsMap()) {
 			return false
 		}
 	}
 
 	return true
+}
+
+// normalizeAttestationPredicate renders an expected predicate from the registry
+// into the same shape structpb produces for a statement predicate, so that
+// semantically equal predicates compare equal regardless of whether they were
+// decoded from JSON or YAML. An in-toto predicate is always an object, so an
+// expectation that is not a map cannot match one.
+func normalizeAttestationPredicate(predicate any) (map[string]any, error) {
+	fields, ok := predicate.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("expected predicate is %T, want an object", predicate)
+	}
+	s, err := structpb.NewStruct(fields)
+	if err != nil {
+		return nil, fmt.Errorf("expected predicate is not representable as a struct: %w", err)
+	}
+	return s.AsMap(), nil
 }
 
 // compareBaseProperties compares the base properties of the verification result and the server provenance

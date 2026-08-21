@@ -4,6 +4,7 @@
 package verifier
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -13,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/structpb"
+	"gopkg.in/yaml.v3"
 
 	registry "github.com/stacklok/toolhive-core/registry/types"
 )
@@ -81,6 +83,8 @@ const (
 	buildTypeKey      = "buildType"
 	buildTypeGHA      = "gha"
 	attemptKey        = "attempt"
+	builderKey        = "builder"
+	builderID         = "https://github.com/actions/runner"
 )
 
 // newTestResult builds a minimal verification result whose certificate is
@@ -186,13 +190,13 @@ func TestIsVerificationResultMatchingServerProvenance_Attestation(t *testing.T) 
 			name: "predicate type and predicate both match",
 			statement: newTestStatement(t, slsaPredicateType, map[string]any{
 				buildTypeKey: buildTypeGHA,
-				"builder":    map[string]any{"id": "https://github.com/actions/runner"},
+				builderKey:   map[string]any{"id": builderID},
 			}),
 			expected: &registry.VerifiedAttestation{
 				PredicateType: slsaPredicateType,
 				Predicate: map[string]any{
 					buildTypeKey: buildTypeGHA,
-					"builder":    map[string]any{"id": "https://github.com/actions/runner"},
+					builderKey:   map[string]any{"id": builderID},
 				},
 			},
 			want: true,
@@ -204,18 +208,40 @@ func TestIsVerificationResultMatchingServerProvenance_Attestation(t *testing.T) 
 			want:      true,
 		},
 		{
-			// Documents the AsMap normalisation caveat: every number in a
-			// statement predicate comes back as float64, matching how
-			// encoding/json decodes the expected side but not YAML.
+			// Numbers are normalised on both sides, so an expectation compares
+			// equal whether the decoder produced float64 (encoding/json) or
+			// int (yaml.v3).
 			name:      "numeric predicate matches as float64",
 			statement: newTestStatement(t, slsaPredicateType, map[string]any{attemptKey: 1}),
 			expected:  &registry.VerifiedAttestation{Predicate: map[string]any{attemptKey: float64(1)}},
 			want:      true,
 		},
 		{
-			name:      "numeric predicate does not match as int",
+			name:      "numeric predicate matches as int",
 			statement: newTestStatement(t, slsaPredicateType, map[string]any{attemptKey: 1}),
 			expected:  &registry.VerifiedAttestation{Predicate: map[string]any{attemptKey: 1}},
+			want:      true,
+		},
+		{
+			name:      "numeric predicate still mismatches on value",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{attemptKey: 1}),
+			expected:  &registry.VerifiedAttestation{Predicate: map[string]any{attemptKey: 2}},
+			want:      false,
+		},
+		{
+			// An in-toto predicate is always an object, so a scalar
+			// expectation cannot match and must not pass.
+			name:      "non-object expected predicate does not match",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{buildTypeKey: buildTypeGHA}),
+			expected:  &registry.VerifiedAttestation{Predicate: buildTypeGHA},
+			want:      false,
+		},
+		{
+			// A predicate structpb cannot represent is one we cannot confirm,
+			// so it fails closed rather than passing.
+			name:      "unrepresentable expected predicate does not match",
+			statement: newTestStatement(t, slsaPredicateType, map[string]any{buildTypeKey: buildTypeGHA}),
+			expected:  &registry.VerifiedAttestation{Predicate: map[string]any{buildTypeKey: make(chan int)}},
 			want:      false,
 		},
 	}
@@ -228,6 +254,62 @@ func TestIsVerificationResultMatchingServerProvenance_Attestation(t *testing.T) 
 			assert.Equal(t, tt.want, isVerificationResultMatchingServerProvenance(r, p))
 		})
 	}
+}
+
+// Predicate equality must not depend on how the registry entry was decoded.
+// The same provenance expressed as JSON and as YAML has to verify against the
+// same statement, even though encoding/json decodes numbers to float64 while
+// yaml.v3 decodes them to int.
+func TestIsVerificationResultMatchingServerProvenance_PredicateDecoderIndependence(t *testing.T) {
+	t.Parallel()
+
+	const jsonProvenance = `{
+		"attestation": {
+			"predicate_type": "https://slsa.dev/provenance/v1",
+			"predicate": {
+				"buildType": "gha",
+				"attempt": 1,
+				"builder": {"id": "https://github.com/actions/runner", "version": 2},
+				"steps": [1, 2]
+			}
+		}
+	}`
+
+	const yamlProvenance = `
+attestation:
+  predicate_type: https://slsa.dev/provenance/v1
+  predicate:
+    buildType: gha
+    attempt: 1
+    builder:
+      id: https://github.com/actions/runner
+      version: 2
+    steps:
+      - 1
+      - 2
+`
+
+	statement := newTestStatement(t, slsaPredicateType, map[string]any{
+		buildTypeKey: buildTypeGHA,
+		attemptKey:   1,
+		builderKey:   map[string]any{"id": builderID, "version": 2},
+		"steps":      []any{1, 2},
+	})
+	result := newTestResult(statement)
+
+	var fromJSON registry.Provenance
+	require.NoError(t, json.Unmarshal([]byte(jsonProvenance), &fromJSON))
+
+	var fromYAML registry.Provenance
+	require.NoError(t, yaml.Unmarshal([]byte(yamlProvenance), &fromYAML))
+
+	// Guard the premise: the two decoders really do produce different Go
+	// types, so this test would be vacuous if they ever converged.
+	require.NotEqual(t, fromJSON.Attestation.Predicate, fromYAML.Attestation.Predicate,
+		"decoders expected to disagree on numeric types; test is vacuous otherwise")
+
+	assert.True(t, isVerificationResultMatchingServerProvenance(result, &fromJSON), "JSON-decoded provenance should match")
+	assert.True(t, isVerificationResultMatchingServerProvenance(result, &fromYAML), "YAML-decoded provenance should match")
 }
 
 func TestIsVerificationResultMatchingServerProvenance_Guards(t *testing.T) {
