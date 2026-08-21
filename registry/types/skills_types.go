@@ -82,11 +82,12 @@ type Skill struct {
 	// — most catalog entries won't have this for a while, and that must not
 	// break installs; it's an opt-in tightening per entry, not a requirement.
 	//
-	// Only the identity fields are honored. Setting Provenance.Attestation
-	// makes Validate fail: the verifier compares an expected attestation only
-	// when the artifact also carries one, so the constraint would be silently
-	// skipped against a signature that has none. Refusing it loudly keeps the
-	// contract fail-closed until that gap is fixed.
+	// Each field constrains independently: an empty one is not checked. Setting
+	// Attestation requires the artifact to be attested at all, so verification
+	// fails against a signature carrying no statement. Attestation.Predicate
+	// must be a JSON object; anything else can never match, and Validate
+	// rejects it rather than letting it through as a constraint that silently
+	// fails every artifact.
 	Provenance *Provenance `json:"provenance,omitempty" yaml:"provenance,omitempty"`
 	// Metadata is the official metadata of the skill as reported in the
 	// SKILL.md file.
