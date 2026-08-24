@@ -32,8 +32,8 @@ require (
 
 require (
 	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467
-	github.com/go-openapi/runtime v0.33.0
-	github.com/go-openapi/swag/conv v0.29.0
+	github.com/go-openapi/runtime v0.33.1
+	github.com/go-openapi/swag/conv v0.29.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/certificate-transparency-go v1.3.3
 	github.com/in-toto/attestation v1.2.0
@@ -93,7 +93,7 @@ require (
 	github.com/go-openapi/jsonpointer v1.0.0 // indirect
 	github.com/go-openapi/jsonreference v1.0.0 // indirect
 	github.com/go-openapi/loads v0.25.1 // indirect
-	github.com/go-openapi/runtime/server-middleware v0.30.0 // indirect
+	github.com/go-openapi/runtime/server-middleware v0.33.1 // indirect
 	github.com/go-openapi/spec v0.22.9 // indirect
 	github.com/go-openapi/strfmt v0.27.0 // indirect
 	github.com/go-openapi/swag/fileutils v0.28.0 // indirect
@@ -102,7 +102,7 @@ require (
 	github.com/go-openapi/swag/mangling v0.28.0 // indirect
 	github.com/go-openapi/swag/pools v0.28.0 // indirect
 	github.com/go-openapi/swag/stringutils v0.28.0 // indirect
-	github.com/go-openapi/swag/typeutils v0.29.0 // indirect
+	github.com/go-openapi/swag/typeutils v0.29.1 // indirect
 	github.com/go-openapi/swag/yamlutils v0.28.0 // indirect
 	github.com/go-openapi/validate v0.26.3 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
@@ -122,7 +122,7 @@ require (
 	github.com/lestrrat-go/httpcc v1.0.1 // indirect
 	github.com/lestrrat-go/option/v2 v2.0.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/oklog/ulid/v2 v2.1.1 // indirect
+	github.com/oklog/ulid/v2 v2.1.2 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
