@@ -9,6 +9,8 @@ const (
 	testErrConfigNil        = "config is nil"
 	testCaseNoBackend       = "dynamic auth without backend"
 	testErrNoSupportedAuth  = "no supported auth method"
+	testCaseMultipleBackend = "dynamic auth with more than one backend"
+	testErrMultipleBackend  = "more than one is set"
 	testSSLModeDisable      = "disable"
 	testErrRegionMissing    = "AWS RDS IAM region is not configured"
 	testErrRegionConfigured = "dynamicAuth.awsRdsIam.region is required"
