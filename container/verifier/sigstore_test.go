@@ -24,7 +24,7 @@ func TestGetVerificationMaterialTlogEntriesMalformedAnnotations(t *testing.T) {
 		name       string
 		annotation string
 	}{
-		{name: "not json", annotation: `not json at all`},
+		{name: caseNameNotJSON, annotation: `not json at all`},
 		{name: "payload missing", annotation: `{"SignedEntryTimestamp":"c2ln"}`},
 		{name: "payload not an object", annotation: `{"Payload":"scalar"}`},
 		{name: "logIndex wrong type", annotation: `{"Payload":{"logIndex":"nope"}}`},

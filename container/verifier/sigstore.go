@@ -7,6 +7,7 @@ package verifier
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
@@ -27,29 +29,86 @@ import (
 	"github.com/sigstore/sigstore-go/pkg/bundle"
 )
 
+// sigstoreBundle is a bundle reconstructed for an artifact, together with
+// what binds it to that artifact.
+//
+// digestAlgo/digestBytes are always the ARTIFACT's own manifest digest.
+// payload is the cosign simple-signing payload the signature covers, set
+// only for bundles reconstructed from a cosign signature manifest; it is
+// what makes those bundles bindable at all (see artifactDigestPolicy).
 type sigstoreBundle struct {
 	bundle      *bundle.Bundle
 	digestBytes []byte
 	digestAlgo  string
+	payload     []byte
+}
+
+// signatureTarget is everything needed to look up an artifact's cosign
+// signatures AND to check that what is found actually covers that artifact.
+// All three fields come from a single resolution of the reference, so the
+// binding check cannot be skewed by a mutable tag moving between two
+// lookups.
+type signatureTarget struct {
+	// sigTag is the "sha256-<hex>.sig" tag the signature manifest lives at.
+	// It is an ordinary, mutable tag: anyone who can write tags in the
+	// repository can point it at any signature manifest, including a
+	// genuine one copied from an unrelated artifact. That is precisely why
+	// artifactDigest below has to be checked against the signed payload.
+	sigTag name.Tag
+	// artifactDigest is the artifact's resolved manifest digest — the value
+	// a signature's payload must name to count as covering it.
+	artifactDigest v1.Hash
+	// repo is the repository the artifact was resolved in.
+	repo name.Repository
 }
 
 // bundleFromSigstoreSignedImage returns a bundle from a Sigstore signed image
 func bundleFromSigstoreSignedImage(ctx context.Context, imageRef string, keychain authn.Keychain) ([]sigstoreBundle, error) {
-	// Get the signature manifest from the OCI image reference
-	signatureRef, err := getSignatureReferenceFromOCIImage(ctx, imageRef, keychain)
+	// Get the signature manifest from the OCI image reference, along with
+	// the artifact digest each signature has to bind to
+	target, err := getSignatureReferenceFromOCIImage(ctx, imageRef, keychain)
 	if err != nil {
 		return nil, fmt.Errorf("error getting signature reference from OCI image: %w", err)
 	}
 
 	// Parse the manifest and return a list of all simple signing layers we managed to extract
-	simpleSigningLayers, err := getSimpleSigningLayersFromSignatureManifest(ctx, signatureRef, keychain)
+	simpleSigningLayers, err := getSimpleSigningLayersFromSignatureManifest(ctx, target.sigTag.Name(), keychain)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrProvenanceNotFoundOrIncomplete, err.Error())
 	}
 
+	artifactDigestBytes, err := hex.DecodeString(target.artifactDigest.Hex)
+	if err != nil {
+		return nil, fmt.Errorf("error decoding artifact digest: %w", err)
+	}
+
 	// Loop through each and build the sigstore bundles
 	var bundles []sigstoreBundle
+	// rejected records that a signature WAS found and deliberately refused,
+	// so the caller can report that rather than "unsigned" — see
+	// ErrSignatureArtifactMismatch.
+	var rejected error
 	for _, layer := range simpleSigningLayers {
+		// Recover the payload the signature actually covers, and refuse the
+		// layer unless that payload says it covers THIS artifact. Without
+		// this, a signature manifest copied onto this artifact's .sig tag
+		// verifies against its original artifact's payload and reports
+		// success here.
+		payload, err := fetchSimpleSigningPayload(ctx, target.repo, layer, keychain)
+		if err != nil {
+			slog.Error("error fetching simple signing payload",
+				"layer_digest", layer.Digest.String(), "error", err)
+			continue
+		}
+		if err := checkSimpleSigningBinding(
+			payload, target.artifactDigest.Algorithm, target.artifactDigest.Hex, target.repo.Name(),
+		); err != nil {
+			slog.Warn("rejecting signature layer that does not cover this artifact",
+				"layer_digest", layer.Digest.String(), "error", err)
+			rejected = err
+			continue
+		}
+
 		// Build the verification material for the bundle
 		verificationMaterial, err := getBundleVerificationMaterial(layer)
 		if err != nil {
@@ -78,24 +137,26 @@ func bundleFromSigstoreSignedImage(ctx context.Context, imageRef string, keychai
 			continue
 		}
 
-		// Collect the digest of the simple signing layer (this is what is signed)
-		digestBytes, err := hex.DecodeString(layer.Digest.Hex)
-		if err != nil {
-			slog.Error("error decoding the simplesigning layer digest")
-			continue
-		}
-
-		// Store the bundle and the certificate identity we extracted from the simple signing layer
+		// Store the bundle bound to the ARTIFACT digest, keeping the payload
+		// alongside it: the signature covers the payload, the payload names
+		// the artifact, and both halves are needed to re-check that chain
+		// later (offline, from Bundle.Raw).
 		bundles = append(bundles, sigstoreBundle{
 			bundle:      bun,
-			digestAlgo:  layer.Digest.Algorithm,
-			digestBytes: digestBytes,
+			digestAlgo:  target.artifactDigest.Algorithm,
+			digestBytes: artifactDigestBytes,
+			payload:     payload,
 		})
 	}
 
 	// There's no available provenance information about this image if we failed to find valid bundles from the list
-	// of simple signing layers
+	// of simple signing layers. A layer refused for not covering this
+	// artifact is reported as such — it is not the same finding as an
+	// artifact that simply carries no signature.
 	if len(bundles) == 0 {
+		if rejected != nil {
+			return nil, rejected
+		}
 		return nil, ErrProvenanceNotFoundOrIncomplete
 	}
 
@@ -103,35 +164,76 @@ func bundleFromSigstoreSignedImage(ctx context.Context, imageRef string, keychai
 	return bundles, nil
 }
 
-// getSignatureReferenceFromOCIImage returns the simple signing layer from the OCI image reference
-func getSignatureReferenceFromOCIImage(ctx context.Context, imageRef string, keychain authn.Keychain) (string, error) {
+// fetchSimpleSigningPayload downloads the blob a simple-signing layer
+// descriptor points at and returns its bytes.
+//
+// The returned bytes are checked against the descriptor digest before being
+// handed back. That check is not redundant with the registry client's own:
+// the read is capped (the blob is untrusted, registry-supplied data), and a
+// capped read that stops short of EOF never reaches the client's
+// verification. It also matters for correctness downstream — the descriptor
+// digest is what the reconstructed bundle's message signature commits to, so
+// a payload that hashes to anything else would be verified against a digest
+// it does not have.
+func fetchSimpleSigningPayload(
+	ctx context.Context, repo name.Repository, layer v1.Descriptor, keychain authn.Keychain,
+) ([]byte, error) {
+	if layer.Digest.Algorithm != DigestAlgorithmSHA256 {
+		return nil, fmt.Errorf("unsupported simple signing layer digest algorithm: %s", layer.Digest.Algorithm)
+	}
+	remoteLayer, err := remote.Layer(
+		repo.Digest(layer.Digest.String()),
+		remote.WithAuthFromKeychain(keychain), remote.WithContext(ctx),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error fetching simple signing blob: %w", err)
+	}
+	rc, err := remoteLayer.Compressed()
+	if err != nil {
+		return nil, fmt.Errorf("error reading simple signing blob: %w", err)
+	}
+	defer func() { _ = rc.Close() }()
+
+	payload, err := io.ReadAll(io.LimitReader(rc, MaxAttestationsBytesLimit))
+	if err != nil {
+		return nil, fmt.Errorf("error reading simple signing blob: %w", err)
+	}
+	sum := sha256.Sum256(payload)
+	if hex.EncodeToString(sum[:]) != strings.ToLower(layer.Digest.Hex) {
+		return nil, fmt.Errorf("simple signing blob does not match its descriptor digest %s", layer.Digest.String())
+	}
+	return payload, nil
+}
+
+// getSignatureReferenceFromOCIImage resolves imageRef and returns where its
+// cosign signatures live together with the artifact identity they must bind
+// to — see signatureTarget.
+func getSignatureReferenceFromOCIImage(
+	ctx context.Context, imageRef string, keychain authn.Keychain,
+) (signatureTarget, error) {
 	// 0. Get the auth options
 	opts := []remote.Option{remote.WithAuthFromKeychain(keychain), remote.WithContext(ctx)}
 
 	// 1. Get the image reference
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
-		return "", fmt.Errorf("error parsing image reference: %w", err)
+		return signatureTarget{}, fmt.Errorf("error parsing image reference: %w", err)
 	}
 
 	// 2. Get the image descriptor
 	desc, err := remote.Get(ref, opts...)
 	if err != nil {
-		return "", fmt.Errorf("error getting image descriptor: %w", err)
+		return signatureTarget{}, fmt.Errorf("error getting image descriptor: %w", err)
 	}
 
-	// 3. Get the digest
-	digest := ref.Context().Digest(desc.Digest.String())
-	h, err := v1.NewHash(digest.Identifier())
-	if err != nil {
-		return "", fmt.Errorf("error getting hash: %w", err)
-	}
+	// 3. Construct the signature reference - sha256-<hash>.sig
+	repo := ref.Context()
+	sigTag := repo.Tag(fmt.Sprint(desc.Digest.Algorithm, "-", desc.Digest.Hex, ".sig"))
 
-	// 4. Construct the signature reference - sha256-<hash>.sig
-	sigTag := digest.Context().Tag(fmt.Sprint(h.Algorithm, "-", h.Hex, ".sig"))
-
-	// 5. Return the reference
-	return sigTag.Name(), nil
+	// 4. Return the tag together with the resolved artifact identity, so the
+	// caller binds signatures to the digest this same lookup produced rather
+	// than re-resolving a mutable reference.
+	return signatureTarget{sigTag: sigTag, artifactDigest: desc.Digest, repo: repo}, nil
 }
 
 // getSimpleSigningLayersFromSignatureManifest returns the identity and issuer from the certificate

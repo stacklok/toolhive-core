@@ -139,9 +139,18 @@ type Result struct {
 	// Bundle is the serialized Sigstore bundle, for durable storage and
 	// later offline re-verification.
 	//
+	// Re-verify it against the ARTIFACT digest — the same digest passed to
+	// SignOCI — with [verifier.VerifyBundleOffline] or
+	// [verifier.VerifyBundleOfflineWithKey]. Bundle is not bare Sigstore
+	// bundle JSON: it wraps the bundle together with the simple-signing
+	// payload the signature covers, because that payload is the only thing
+	// tying a cosign signature to an artifact. See
+	// [verifier.StoredBundleMediaType] for the shape, and
+	// [verifier.DecodeStoredBundle] to unwrap it.
+	//
 	// Its JSON shape is not stable across calls for the same identity: a
-	// freshly attached signature serializes as sign.Bundle's own bundle
-	// media type (v0.3), while a signature this call deduped against (see
+	// freshly attached signature wraps sign.Bundle's own bundle media type
+	// (v0.3), while a signature this call deduped against (see
 	// SignOCI's "one signature, two representations" doc) is reconstructed
 	// by verifier.RetrieveBundles from the classic cosign annotations —
 	// the v0.1 shape, carrying an inclusion promise rather than a proof.
@@ -149,14 +158,15 @@ type Result struct {
 	// byte across calls, or inspecting mediaType, will see this difference.
 	Bundle []byte
 	// PayloadDigest is the "<algorithm>:<hex>" digest of the simple-signing
-	// payload the bundle actually signs.
+	// payload the signature covers.
 	//
-	// This is deliberately surfaced because it is NOT the artifact digest
-	// passed to SignOCI. Following the cosign convention, the signature
-	// covers a payload that *embeds* the artifact digest rather than the
-	// digest itself, so verifying Bundle offline requires this value —
-	// passing the artifact digest to a bundle verifier will always fail.
-	// See [PayloadDigest] to recompute it from a reference and digest alone.
+	// It is NOT the artifact digest passed to SignOCI: following the cosign
+	// convention, the signature covers a payload that *embeds* the artifact
+	// digest rather than the digest itself. Verifying Bundle does not
+	// require it — Bundle carries the payload, and the verifier entry points
+	// take the artifact digest — so this is informational: it identifies the
+	// blob in the attached signature manifest that this signature signs. See
+	// [PayloadDigest] to recompute it from a reference and digest alone.
 	PayloadDigest string
 }
 
@@ -414,7 +424,16 @@ func resultBundleJSON(
 		if err != nil {
 			return nil, fmt.Errorf("serializing sigstore bundle: %w", err)
 		}
-		return raw, nil
+		// Persist the payload with the bundle. The signature covers the
+		// payload, and only the payload names the artifact — a bundle
+		// stored without it can be verified but no longer bound, which is
+		// the difference between "someone signed this artifact" and
+		// "someone signed something". See verifier.StoredBundleMediaType.
+		stored, err := verifier.EncodeStoredBundle(raw, payload)
+		if err != nil {
+			return nil, fmt.Errorf("serializing sigstore bundle: %w", err)
+		}
+		return stored, nil
 	}
 	return previouslyAttachedBundleJSON(ctx, keychain, ref, digestStr, payload, pb, pub, tm)
 }
