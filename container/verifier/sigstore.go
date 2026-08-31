@@ -29,6 +29,26 @@ import (
 	"github.com/sigstore/sigstore-go/pkg/bundle"
 )
 
+// Limits on the work a single signature manifest can cause. Both the layer
+// list and the blobs it points at are registry-supplied: a manifest can name
+// arbitrarily many simple-signing layers, and each one turned into a blob
+// fetch would let whoever serves that manifest drive an unbounded number of
+// authenticated requests (and log lines) out of one verification.
+//
+// The numbers are far above any real signature manifest — cosign writes one
+// layer per signature, so even a heavily co-signed artifact stays in single
+// digits, and a simple-signing payload is a few hundred bytes of JSON.
+//
+// maxSimpleSigningLayers bounds how many layers of one manifest are
+// processed; layers past it are ignored rather than treated as an error,
+// since a genuine signature is within the first few and the rest are exactly
+// the padding an attacker added. maxSimpleSigningPayloadTotalBytes bounds the
+// total blob bytes read across all of a manifest's layers, on top of the
+// per-blob cap.
+const maxSimpleSigningLayers = 32
+
+var maxSimpleSigningPayloadTotalBytes = MaxAttestationsBytesLimit
+
 // sigstoreBundle is a bundle reconstructed for an artifact, together with
 // what binds it to that artifact.
 //
@@ -82,23 +102,41 @@ func bundleFromSigstoreSignedImage(ctx context.Context, imageRef string, keychai
 		return nil, fmt.Errorf("error decoding artifact digest: %w", err)
 	}
 
+	if len(simpleSigningLayers) > maxSimpleSigningLayers {
+		slog.Warn("signature manifest carries more simple signing layers than will be processed",
+			"layers", len(simpleSigningLayers), "limit", maxSimpleSigningLayers)
+		simpleSigningLayers = simpleSigningLayers[:maxSimpleSigningLayers]
+	}
+
 	// Loop through each and build the sigstore bundles
 	var bundles []sigstoreBundle
 	// rejected records that a signature WAS found and deliberately refused,
 	// so the caller can report that rather than "unsigned" — see
 	// ErrSignatureArtifactMismatch.
 	var rejected error
+	// Distinct signatures over the same artifact share one payload blob (the
+	// payload is derived from the artifact, the signature from the key), so
+	// fetch each distinct blob once and reuse it. Keyed by descriptor digest,
+	// which is safe because the bytes are checked against it.
+	payloads := make(map[string][]byte, len(simpleSigningLayers))
+	budget := maxSimpleSigningPayloadTotalBytes
 	for _, layer := range simpleSigningLayers {
 		// Recover the payload the signature actually covers, and refuse the
 		// layer unless that payload says it covers THIS artifact. Without
 		// this, a signature manifest copied onto this artifact's .sig tag
 		// verifies against its original artifact's payload and reports
 		// success here.
-		payload, err := fetchSimpleSigningPayload(ctx, target.repo, layer, keychain)
-		if err != nil {
-			slog.Error("error fetching simple signing payload",
-				"layer_digest", layer.Digest.String(), "error", err)
-			continue
+		payload, cached := payloads[layer.Digest.String()]
+		if !cached {
+			fetched, err := fetchSimpleSigningPayload(ctx, target.repo, layer, keychain, budget)
+			if err != nil {
+				slog.Error("error fetching simple signing payload",
+					"layer_digest", layer.Digest.String(), "error", err)
+				continue
+			}
+			budget -= int64(len(fetched))
+			payloads[layer.Digest.String()] = fetched
+			payload = fetched
 		}
 		if err := checkSimpleSigningBinding(
 			payload, target.artifactDigest.Algorithm, target.artifactDigest.Hex, target.repo.Name(),
@@ -167,6 +205,11 @@ func bundleFromSigstoreSignedImage(ctx context.Context, imageRef string, keychai
 // fetchSimpleSigningPayload downloads the blob a simple-signing layer
 // descriptor points at and returns its bytes.
 //
+// budget is the remaining share of maxSimpleSigningPayloadTotalBytes; the
+// read is capped at the smaller of it and the per-blob limit. Truncation is
+// not silent: a short read fails the digest check below, so an oversized blob
+// is refused rather than half-parsed.
+//
 // The returned bytes are checked against the descriptor digest before being
 // handed back. That check is not redundant with the registry client's own:
 // the read is capped (the blob is untrusted, registry-supplied data), and a
@@ -176,10 +219,13 @@ func bundleFromSigstoreSignedImage(ctx context.Context, imageRef string, keychai
 // a payload that hashes to anything else would be verified against a digest
 // it does not have.
 func fetchSimpleSigningPayload(
-	ctx context.Context, repo name.Repository, layer v1.Descriptor, keychain authn.Keychain,
+	ctx context.Context, repo name.Repository, layer v1.Descriptor, keychain authn.Keychain, budget int64,
 ) ([]byte, error) {
 	if layer.Digest.Algorithm != DigestAlgorithmSHA256 {
 		return nil, fmt.Errorf("unsupported simple signing layer digest algorithm: %s", layer.Digest.Algorithm)
+	}
+	if budget <= 0 {
+		return nil, errors.New("simple signing payload budget for this manifest is exhausted")
 	}
 	remoteLayer, err := remote.Layer(
 		repo.Digest(layer.Digest.String()),
@@ -194,7 +240,7 @@ func fetchSimpleSigningPayload(
 	}
 	defer func() { _ = rc.Close() }()
 
-	payload, err := io.ReadAll(io.LimitReader(rc, MaxAttestationsBytesLimit))
+	payload, err := io.ReadAll(io.LimitReader(rc, min(budget, MaxAttestationsBytesLimit)))
 	if err != nil {
 		return nil, fmt.Errorf("error reading simple signing blob: %w", err)
 	}

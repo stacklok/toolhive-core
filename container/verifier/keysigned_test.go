@@ -29,6 +29,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// annotationCosignSignature is the manifest-layer annotation cosign stores a
+// signature in — the one these fixtures have to reproduce byte-for-byte for
+// the verifier to reconstruct a bundle from them.
+const annotationCosignSignature = "dev.cosignproject.cosign/signature"
+
 // keySignedArtifact is a pushed artifact plus the key-signed cosign
 // signature attached to it.
 type keySignedArtifact struct {
@@ -98,7 +103,7 @@ func attachKeySignature(t *testing.T, tag name.Tag, payload string) []byte {
 	sigImg, err := mutate.Append(empty.Image, mutate.Addendum{
 		Layer: layer,
 		Annotations: map[string]string{
-			"dev.cosignproject.cosign/signature": base64.StdEncoding.EncodeToString(sig),
+			annotationCosignSignature: base64.StdEncoding.EncodeToString(sig),
 		},
 		MediaType: types.MediaType(MediaTypeCosignSimpleSigningV1JSON),
 	})
@@ -197,6 +202,35 @@ func TestVerifyBundleOfflineRejectsWrongArtifactDigest(t *testing.T) {
 	_, err = VerifyBundleOfflineWithKey(bundles[0].Raw, otherDigest.String(), art.pubPEM)
 	require.ErrorIs(t, err, ErrSignatureArtifactMismatch,
 		"a stored bundle must not verify against an artifact its payload does not name")
+}
+
+// TestVerifyBundleOfflineRejectsPayloadDigest covers the one wrong digest a
+// caller is most likely to hold: the simple-signing payload's own. Callers
+// used to have to compute it themselves and pass it here, so an unadjusted
+// caller reaches this path — and would otherwise be told its signature covers
+// a different artifact, which is true but points nowhere useful.
+func TestVerifyBundleOfflineRejectsPayloadDigest(t *testing.T) {
+	t.Parallel()
+
+	host := newTestRegistry(t)
+	art := pushKeySignedArtifact(t, host, "test/artifact")
+
+	bundles, err := RetrieveBundles(t.Context(), art.ref, nil)
+	require.NoError(t, err)
+	require.Len(t, bundles, 1)
+
+	sum := sha256.Sum256([]byte(art.payload))
+	payloadDigest := DigestAlgorithmSHA256 + ":" + hex.EncodeToString(sum[:])
+
+	_, err = VerifyBundleOfflineWithKey(bundles[0].Raw, payloadDigest, art.pubPEM)
+	require.ErrorIs(t, err, ErrSignatureArtifactMismatch,
+		"the payload's digest is not the artifact's, and must not verify as one")
+	assert.ErrorContains(t, err, "pass the artifact's manifest digest",
+		"the error must name the fix, not just the mismatch")
+
+	// The digest that does work is the one a caller already has.
+	_, err = VerifyBundleOfflineWithKey(bundles[0].Raw, art.artifactDigest(), art.pubPEM)
+	require.NoError(t, err)
 }
 
 // TestRetrieveBundlesRejectsCrossArtifactSignature is the regression test for
@@ -355,8 +389,8 @@ func TestCorruptCertificateIsNotReclassifiedAsKeySigned(t *testing.T) {
 	sigImg, err := mutate.Append(empty.Image, mutate.Addendum{
 		Layer: layer,
 		Annotations: map[string]string{
-			"dev.cosignproject.cosign/signature": base64.StdEncoding.EncodeToString([]byte("sig")),
-			"dev.sigstore.cosign/certificate":    "not a pem certificate",
+			annotationCosignSignature:         base64.StdEncoding.EncodeToString([]byte("sig")),
+			"dev.sigstore.cosign/certificate": "not a pem certificate",
 		},
 		MediaType: types.MediaType(MediaTypeCosignSimpleSigningV1JSON),
 	})
@@ -388,7 +422,7 @@ func TestFetchSimpleSigningPayloadRejectsTamperedBlob(t *testing.T) {
 	_, err := fetchSimpleSigningPayload(t.Context(), parsed.Context(), v1.Descriptor{
 		MediaType: types.MediaType(MediaTypeCosignSimpleSigningV1JSON),
 		Digest:    v1.Hash{Algorithm: DigestAlgorithmSHA256, Hex: hex.EncodeToString(bogus[:])},
-	}, nil)
+	}, nil, maxSimpleSigningPayloadTotalBytes)
 	require.Error(t, err)
 
 	// An unsupported digest algorithm is refused before any network call:
@@ -396,7 +430,7 @@ func TestFetchSimpleSigningPayloadRejectsTamperedBlob(t *testing.T) {
 	_, err = fetchSimpleSigningPayload(t.Context(), parsed.Context(), v1.Descriptor{
 		MediaType: types.MediaType(MediaTypeCosignSimpleSigningV1JSON),
 		Digest:    v1.Hash{Algorithm: "sha512", Hex: strings.Repeat("ab", 64)},
-	}, nil)
+	}, nil, maxSimpleSigningPayloadTotalBytes)
 	require.ErrorContains(t, err, "unsupported simple signing layer digest algorithm")
 }
 

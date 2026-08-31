@@ -4,6 +4,7 @@
 package verifier
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -135,6 +136,22 @@ func TestArtifactDigestPolicy(t *testing.T) {
 		opt, err := artifactDigestPolicy([]byte(payload), DigestAlgorithmSHA256, artifactBytes)
 		require.NoError(t, err)
 		require.NotNil(t, opt)
+	})
+
+	t.Run("passing the payload's own digest is refused, and says so", func(t *testing.T) {
+		t.Parallel()
+		// The call shape callers used before the payload travelled with the
+		// bundle. Refusing it is correct — a digest derived from the payload
+		// says nothing about which artifact the payload names — but the error
+		// has to point at the fix rather than read like a substituted
+		// signature.
+		payload := fmt.Sprintf(
+			`{"critical":{"image":{"docker-manifest-digest":"sha256:%s"},"type":%q}}`,
+			artifactHex, CosignSignatureType)
+		sum := sha256.Sum256([]byte(payload))
+		_, err := artifactDigestPolicy([]byte(payload), DigestAlgorithmSHA256, sum[:])
+		require.ErrorIs(t, err, ErrSignatureArtifactMismatch)
+		assert.ErrorContains(t, err, "pass the artifact's manifest digest")
 	})
 
 	t.Run("a payload naming a different artifact is refused", func(t *testing.T) {

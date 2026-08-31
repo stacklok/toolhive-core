@@ -597,9 +597,14 @@ func keylessBundleOptions(ctx context.Context, opts Options) (sign.BundleOptions
 // PayloadDigest returns the digest of the simple-signing payload that a
 // signature over the artifact at ref pinned to digestStr covers.
 //
-// Consumers verifying a stored bundle generally hold only the reference and
-// the artifact digest — not the [Result] from signing — so this is the
-// supported way to recover the value a bundle verifier needs.
+// It is informational, for inspecting or cross-referencing the blob inside an
+// attached cosign signature manifest. Verification does not need it and must
+// not be given it: every verifier entry point — including
+// [verifier.VerifyBundleOffline] and [verifier.VerifyBundleOfflineWithKey] —
+// takes the ARTIFACT's own manifest digest, the same digestStr passed here,
+// and recovers the payload from the stored bundle itself. Passing this value
+// where an artifact digest is expected fails with
+// [verifier.ErrSignatureArtifactMismatch].
 func PayloadDigest(imageRef, digestStr string) (string, error) {
 	payload, err := SimpleSigningPayload(imageRef, digestStr)
 	if err != nil {

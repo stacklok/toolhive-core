@@ -4,6 +4,7 @@
 package verifier
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -152,9 +153,31 @@ func artifactDigestPolicy(payload []byte, digestAlgo string, digestBytes []byte)
 	if len(payload) == 0 {
 		return verify.WithArtifactDigest(digestAlgo, digestBytes), nil
 	}
-	if err := checkSimpleSigningBinding(payload, digestAlgo, hex.EncodeToString(digestBytes), ""); err != nil {
-		return nil, err
-	}
 	sum := sha256.Sum256(payload)
+	if err := checkSimpleSigningBinding(payload, digestAlgo, hex.EncodeToString(digestBytes), ""); err != nil {
+		return nil, annotatePayloadDigestMisuse(err, digestAlgo, digestBytes, sum[:])
+	}
 	return verify.WithArtifactDigest(DigestAlgorithmSHA256, sum[:]), nil
+}
+
+// annotatePayloadDigestMisuse recognises one specific way a caller can get
+// the artifact digest wrong and says so, instead of leaving them with a bare
+// "signature covers X, not Y".
+//
+// Before this package bound signatures to the artifact, a caller holding a
+// stored cosign bundle had to compute the digest of the simple-signing
+// payload themselves and pass that. Now the payload travels with the bundle
+// and the entry points take the artifact digest, so that older call shape
+// arrives here as a mismatch — correctly refused, since a digest derived
+// from the payload proves nothing about which artifact it names, but
+// mystifying if reported as though the signature were substituted. The two
+// cases are distinguishable: only a caller passing the payload's own digest
+// hands us a value equal to it.
+func annotatePayloadDigestMisuse(err error, digestAlgo string, digestBytes, payloadDigest []byte) error {
+	if digestAlgo != DigestAlgorithmSHA256 || !bytes.Equal(digestBytes, payloadDigest) {
+		return err
+	}
+	return fmt.Errorf("%w: the digest given is the simple-signing payload's own digest, "+
+		"not the artifact's; pass the artifact's manifest digest — the payload is carried "+
+		"in the stored bundle and no longer has to be supplied", ErrSignatureArtifactMismatch)
 }
