@@ -63,5 +63,44 @@ requires Addr, Sentinel requires MasterName plus at least one address). It
 verifies the connection with a Ping before returning. Caller-specific
 validation (key-prefix requirements, ACL enforcement) remains the caller's
 responsibility.
+
+# Dynamic Authentication
+
+Config.DynamicAuth mints short-lived AUTH passwords from a cloud IAM backend
+instead of using a static Password:
+
+  - AWSElastiCacheIAM — ElastiCache/MemoryDB IAM authentication tokens,
+    hand-signed with SigV4 (there is no RDS-style auth.BuildAuthToken helper
+    for these services).
+  - AzureAD — Entra ID (formerly Azure AD) access tokens for Azure Cache for
+    Redis.
+  - GCPMemorystoreIAM — GCP OAuth2 access tokens for Memorystore for Redis
+    Cluster IAM authentication.
+
+Unlike pgx's BeforeConnect hook, go-redis has no per-dial hook that runs
+before its own AUTH/HELLO handshake, and pooled connections are long-lived
+rather than reconnecting per operation. NewClient works around this by
+leaving Password unset and installing an Options.OnConnect hook that issues
+AUTH itself with a freshly minted token, plus a ConnMaxLifetime (defaulted
+per backend, inside the token's TTL, when Config.ConnMaxLifetime is zero)
+that makes go-redis periodically retire and redial pooled connections —
+re-running OnConnect and picking up a current token before the previous one
+would be rejected.
+
+	cli, err := redis.NewClient(ctx, &redis.Config{
+	    Addr:     "my-cluster.abcdef.ng.0001.use1.cache.amazonaws.com:6379",
+	    Username: "app-iam-user",
+	    DynamicAuth: &redis.DynamicAuthConfig{
+	        AWSElastiCacheIAM: &redis.DynamicAuthAWSElastiCacheIAM{
+	            Region:      "us-east-1",
+	            ClusterName: "my-cluster",
+	        },
+	    },
+	})
+
+Config.Username is required when DynamicAuth is set — it is the IAM/ACL
+identity (AWS IAM user, Azure principal object ID, or GCP service account
+email) that minted tokens authenticate as — and Config.Password must be
+empty.
 */
 package redis

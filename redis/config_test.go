@@ -119,6 +119,70 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: "sentinel TLS config: client certificate and key must be provided together",
 		},
 		{
+			name: "dynamicAuth with password is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser, Password: "secret",
+				DynamicAuth: &DynamicAuthConfig{AzureAD: &DynamicAuthAzureAD{}},
+			},
+			wantErr: "password must not be set when dynamicAuth is configured",
+		},
+		{
+			name: "dynamicAuth without username is rejected",
+			cfg: &Config{
+				Addr:        testAddr,
+				DynamicAuth: &DynamicAuthConfig{AzureAD: &DynamicAuthAzureAD{}},
+			},
+			wantErr: "username is required when dynamicAuth is configured",
+		},
+		{
+			name: "dynamicAuth without backend is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser,
+				DynamicAuth: &DynamicAuthConfig{},
+			},
+			wantErr: testErrNoSupportedAuth,
+		},
+		{
+			name: "dynamicAuth with more than one backend is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser,
+				DynamicAuth: &DynamicAuthConfig{
+					AzureAD:           &DynamicAuthAzureAD{},
+					GCPMemorystoreIAM: &DynamicAuthGCPMemorystoreIAM{},
+				},
+			},
+			wantErr: testErrMultipleBackend,
+		},
+		{
+			name: "AWS ElastiCache IAM without region is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser,
+				DynamicAuth: &DynamicAuthConfig{
+					AWSElastiCacheIAM: &DynamicAuthAWSElastiCacheIAM{ClusterName: testClusterName},
+				},
+			},
+			wantErr: "dynamicAuth.awsElastiCacheIam.region is required",
+		},
+		{
+			name: "AWS ElastiCache IAM without cluster name is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser,
+				DynamicAuth: &DynamicAuthConfig{
+					AWSElastiCacheIAM: &DynamicAuthAWSElastiCacheIAM{Region: testRegion},
+				},
+			},
+			wantErr: "dynamicAuth.awsElastiCacheIam.clusterName is required",
+		},
+		{
+			name: "valid AWS ElastiCache IAM dynamicAuth config",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser,
+				DynamicAuth: &DynamicAuthConfig{
+					AWSElastiCacheIAM: &DynamicAuthAWSElastiCacheIAM{Region: testRegion, ClusterName: testClusterName},
+				},
+			},
+		},
+		{
 			name: "valid standalone config",
 			cfg: &Config{
 				Addr: testAddr,

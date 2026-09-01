@@ -130,6 +130,65 @@ func TestNewClient_DoesNotMutateCallerConfig(t *testing.T) {
 	assert.Equal(t, original, *cfg, "NewClient must not modify the caller's Config")
 }
 
+func TestBuildClient_DynamicAuthInstallsOnConnectAndConnMaxLifetime(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{
+		Addr:     testAddr,
+		Username: testDynamicAuthUser,
+		DynamicAuth: &DynamicAuthConfig{
+			AWSElastiCacheIAM: &DynamicAuthAWSElastiCacheIAM{Region: testRegion, ClusterName: testClusterName},
+		},
+	}
+	cfg.applyDefaults()
+	c, err := buildClient(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	standalone, ok := c.(*goredis.Client)
+	require.True(t, ok)
+	opts := standalone.Options()
+	assert.NotNil(t, opts.OnConnect, "dynamicAuth must install an OnConnect hook")
+	assert.Equal(t, DefaultAWSElastiCacheIAMTokenTTL, opts.ConnMaxLifetime,
+		"dynamicAuth must default ConnMaxLifetime to the backend's token TTL")
+	assert.Empty(t, opts.Password, "dynamicAuth must not carry a static password")
+}
+
+func TestBuildClient_DynamicAuthRespectsExplicitConnMaxLifetime(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{
+		Addr:            testAddr,
+		Username:        testDynamicAuthUser,
+		ConnMaxLifetime: 3 * time.Minute,
+		DynamicAuth: &DynamicAuthConfig{
+			AzureAD: &DynamicAuthAzureAD{},
+		},
+	}
+	cfg.applyDefaults()
+	c, err := buildClient(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	standalone, ok := c.(*goredis.Client)
+	require.True(t, ok)
+	assert.Equal(t, 3*time.Minute, standalone.Options().ConnMaxLifetime,
+		"an explicit Config.ConnMaxLifetime must override the backend default")
+}
+
+func TestBuildClient_DynamicAuthPropagatesBackendConstructionError(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{
+		Addr:     testAddr,
+		Username: testDynamicAuthUser,
+		DynamicAuth: &DynamicAuthConfig{
+			AWSElastiCacheIAM: &DynamicAuthAWSElastiCacheIAM{ClusterName: testClusterName}, // missing region
+		},
+	}
+	cfg.applyDefaults()
+	_, err := buildClient(t.Context(), cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), testErrRegionMissing)
+}
+
 func TestBuildTLSConfig(t *testing.T) {
 	t.Parallel()
 
@@ -237,7 +296,7 @@ func TestBuildClient_ClusterWithMutualTLSReturnsClusterClient(t *testing.T) {
 		},
 	}
 	cfg.applyDefaults()
-	c, err := buildClient(cfg)
+	c, err := buildClient(t.Context(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 	_, ok := c.(*goredis.ClusterClient)
@@ -253,7 +312,7 @@ func TestBuildClient_SentinelReturnsFailoverClient(t *testing.T) {
 		},
 	}
 	cfg.applyDefaults()
-	c, err := buildClient(cfg)
+	c, err := buildClient(t.Context(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 	// FailoverClient is returned as goredis.UniversalClient; verify it's a
@@ -282,7 +341,7 @@ func TestBuildClient_SentinelWithMutualTLSInstallsDialer(t *testing.T) {
 		},
 	}
 	cfg.applyDefaults()
-	c, err := buildClient(cfg)
+	c, err := buildClient(t.Context(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 }
