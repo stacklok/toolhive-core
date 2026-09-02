@@ -8,6 +8,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"path"
 
@@ -125,21 +126,60 @@ func embeddedRootJson(tufRootURL string) ([]byte, error) {
 	return embeddedTufRoots.ReadFile(embeddedRootPath)
 }
 
-// getSigstoreBundles returns the sigstore bundles, either through the OCI registry or the GitHub attestation endpoint
+// getSigstoreBundles returns the sigstore bundles for an artifact, gathering
+// both layouts this package understands: attestation manifests discovered
+// through the OCI 1.1 referrers API, and a cosign signature manifest at the
+// "sha256-<hex>.sig" tag.
+//
+// Referrers are queried FIRST, deliberately. A referrer is addressed by the
+// artifact's own digest, so a bundle found that way is bound to the artifact
+// by construction. The cosign ".sig" tag is a mutable tag, so a bundle found
+// there is bound to the artifact only by the check
+// bundleFromSigstoreSignedImage performs on the signed payload. Preferring
+// the structurally-bound layout keeps an attacker who can write tags from
+// choosing which code path runs — defence in depth, not a substitute for
+// that check.
+//
+// Both layouts are gathered rather than short-circuiting on the first hit:
+// an artifact may legitimately carry an attestation and a cosign signature
+// from different signers, and returning only whichever was found first would
+// make verification depend on discovery order.
 func getSigstoreBundles(
 	ctx context.Context,
 	imageRef string,
 	keychain authn.Keychain,
 ) ([]sigstoreBundle, error) {
-	// Try to build a bundle from a Sigstore signed image
-	bundles, err := bundleFromSigstoreSignedImage(ctx, imageRef, keychain)
-	if errors.Is(err, ErrProvenanceNotFoundOrIncomplete) {
-		// If we get this error, it means that the image is not signed
-		// or the signature is incomplete. Let's try to see if we can find attestation for the image.
-		return bundleFromAttestation(ctx, imageRef, keychain)
-	} else if err != nil {
-		return nil, err
+	referrerBundles, referrerErr := bundleFromAttestation(ctx, imageRef, keychain)
+	if referrerErr != nil && !errors.Is(referrerErr, ErrProvenanceNotFoundOrIncomplete) {
+		// Something went wrong before we could even ask about provenance
+		// (an unparseable reference, an unreachable registry). The cosign
+		// path resolves the same reference and would fail the same way.
+		return nil, referrerErr
 	}
-	// If we get here, it means that we got a bundle from a Sigstore signed image
-	return bundles, nil
+
+	sigBundles, sigErr := bundleFromSigstoreSignedImage(ctx, imageRef, keychain)
+	switch {
+	case sigErr == nil:
+	case errors.Is(sigErr, ErrProvenanceNotFoundOrIncomplete), errors.Is(sigErr, ErrSignatureArtifactMismatch):
+		// Recorded rather than returned: a referrer bundle may still make
+		// this artifact verifiable, and the verdict is decided below.
+	default:
+		if len(referrerBundles) == 0 {
+			return nil, sigErr
+		}
+		slog.Warn("reading the cosign signature manifest failed; continuing with attestation bundles",
+			"error", sigErr)
+	}
+
+	bundles := append(referrerBundles, sigBundles...)
+	if len(bundles) > 0 {
+		return bundles, nil
+	}
+	// Nothing usable. A signature that was found and refused for not
+	// covering this artifact is a different verdict from no signature at all
+	// and is reported as itself.
+	if errors.Is(sigErr, ErrSignatureArtifactMismatch) {
+		return nil, sigErr
+	}
+	return nil, ErrProvenanceNotFoundOrIncomplete
 }

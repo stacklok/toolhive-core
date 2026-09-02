@@ -42,7 +42,6 @@ import (
 	// and canonicalizes.
 	_ "github.com/sigstore/rekor/pkg/types/hashedrekord/v0.0.1"
 	rekorutil "github.com/sigstore/rekor/pkg/util"
-	verifybundle "github.com/sigstore/sigstore-go/pkg/bundle"
 	fulciocert "github.com/sigstore/sigstore-go/pkg/fulcio/certificate"
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/tlog"
@@ -637,12 +636,19 @@ func TestSignOCIKeylessRoundTrip(t *testing.T) {
 	assert.True(t, bundles[0].HasCertificate(),
 		"a keyless signature must round-trip through the registry as certificate-bearing")
 
-	// The bundle signs the simple-signing payload digest, which is what the
-	// attached layer's own digest is — the cosign convention.
+	// PayloadDigest names the blob the signature covers — the attached
+	// layer's own digest, per the cosign convention.
 	expectedDigest, err := PayloadDigest(ref, digestStr)
 	require.NoError(t, err)
 	assert.Equal(t, expectedDigest, res.PayloadDigest)
-	assert.Equal(t, strings.TrimPrefix(expectedDigest, "sha256:"), bundles[0].DigestHex)
+
+	// The retrieved bundle, though, binds the ARTIFACT digest: that is what
+	// a caller has, and the payload it carries is what ties the two
+	// together.
+	assert.Equal(t, strings.TrimPrefix(digestStr, "sha256:"), bundles[0].DigestHex)
+	expectedPayload, err := SimpleSigningPayload(ref, digestStr)
+	require.NoError(t, err)
+	assert.Equal(t, expectedPayload, bundles[0].SimpleSigningPayload)
 }
 
 // TestSignOCIKeylessBundleVerifies is the test that matters: a bundle this
@@ -898,8 +904,8 @@ func TestSignOCIKeylessDedupeReturnsAttachedBundle(t *testing.T) {
 	// v0.1 shape from OCI annotations — a real, pre-existing difference in
 	// serialization shape that exists regardless of dedupe, so it is not
 	// the right thing to assert byte-identical.
-	firstSig, firstCert := decodeBundleSignatureAndCert(t, first.Bundle)
-	secondSig, secondCert := decodeBundleSignatureAndCert(t, second.Bundle)
+	firstSig, firstCert := decodeBundleSignatureAndCert(t, first.Bundle, digestStr)
+	secondSig, secondCert := decodeBundleSignatureAndCert(t, second.Bundle, digestStr)
 	assert.Equal(t, firstSig, secondSig,
 		"the dedupe path must return the signature actually attached, not a freshly built, never-written one")
 	assert.Equal(t, firstCert, secondCert, "the dedupe path must return the certificate actually attached")
@@ -910,7 +916,7 @@ func TestSignOCIKeylessDedupeReturnsAttachedBundle(t *testing.T) {
 	// "some" pair that happens to match.
 	third, err := signer.SignOCI(t.Context(), ref, digestStr, opts)
 	require.NoError(t, err)
-	thirdSig, thirdCert := decodeBundleSignatureAndCert(t, third.Bundle)
+	thirdSig, thirdCert := decodeBundleSignatureAndCert(t, third.Bundle, digestStr)
 	assert.Equal(t, firstSig, thirdSig)
 	assert.Equal(t, firstCert, thirdCert)
 }
@@ -919,13 +925,13 @@ func TestSignOCIKeylessDedupeReturnsAttachedBundle(t *testing.T) {
 // certificate DER from a serialized sigstore bundle, for comparing the
 // underlying cryptographic material across two bundles independent of
 // their JSON shape.
-func decodeBundleSignatureAndCert(t *testing.T, raw []byte) (sig, certDER []byte) {
+func decodeBundleSignatureAndCert(t *testing.T, raw []byte, artifactDigest string) (sig, certDER []byte) {
 	t.Helper()
-	var bun verifybundle.Bundle
-	require.NoError(t, bun.UnmarshalJSON(raw))
-	msgSig := bun.GetMessageSignature()
+	stored, err := verifier.DecodeStoredBundle(raw, artifactDigest)
+	require.NoError(t, err)
+	msgSig := stored.Parsed.GetMessageSignature()
 	require.NotNil(t, msgSig)
-	cert, err := certMaterialFromBundle(bun.Bundle)
+	cert, err := certMaterialFromBundle(stored.Parsed.Bundle)
 	require.NoError(t, err)
 	require.NotNil(t, cert)
 	return msgSig.GetSignature(), cert.certDER
@@ -962,13 +968,13 @@ func TestSignOCIKeylessDedupeSkipsUnverifiableExistingLayer(t *testing.T) {
 	require.NoError(t, err)
 	otherResult, err := signer.SignOCI(t.Context(), ref, otherDigestStr, opts)
 	require.NoError(t, err)
-	var otherBun verifybundle.Bundle
-	require.NoError(t, otherBun.UnmarshalJSON(otherResult.Bundle))
+	otherStored, err := verifier.DecodeStoredBundle(otherResult.Bundle, otherDigestStr)
+	require.NoError(t, err)
 
 	// Attach that bundle directly at the REAL target's sig tag, as the
 	// first layer — same identity as opts, signature over otherPayload,
 	// which will not verify against payload.
-	attached, err := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, otherPayload, otherBun.Bundle, nil, nil)
+	attached, err := attachCosignSignature(t.Context(), authn.DefaultKeychain, ref, digestStr, otherPayload, otherStored.Parsed.Bundle, nil, nil)
 	require.NoError(t, err)
 	require.True(t, attached)
 	require.Len(t, sigLayers(t, ref, digestStr), 1)
@@ -980,7 +986,7 @@ func TestSignOCIKeylessDedupeSkipsUnverifiableExistingLayer(t *testing.T) {
 	valid, err := signer.SignOCI(t.Context(), ref, digestStr, opts)
 	require.NoError(t, err)
 	require.Len(t, sigLayers(t, ref, digestStr), 2, "the damaged layer must not have deduped the valid signing")
-	validSig, validCert := decodeBundleSignatureAndCert(t, valid.Bundle)
+	validSig, validCert := decodeBundleSignatureAndCert(t, valid.Bundle, digestStr)
 
 	// Re-sign once more with the same identity: this dedupes (the valid
 	// layer from above verifies), so SignOCI must return THAT layer's
@@ -990,7 +996,7 @@ func TestSignOCIKeylessDedupeSkipsUnverifiableExistingLayer(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, sigLayers(t, ref, digestStr), 2, "the third call must dedupe against the valid layer, not append again")
 
-	redundantSig, redundantCert := decodeBundleSignatureAndCert(t, redundant.Bundle)
+	redundantSig, redundantCert := decodeBundleSignatureAndCert(t, redundant.Bundle, digestStr)
 	assert.Equal(t, validSig, redundantSig,
 		"the dedupe path must select the layer that verifies against payload, not the damaged one")
 	assert.Equal(t, validCert, redundantCert)
