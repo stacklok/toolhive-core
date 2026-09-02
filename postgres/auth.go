@@ -70,7 +70,7 @@ func NewDynamicAuthFunc(ctx context.Context, cfg *Config, user string) (BeforeCo
 	case cfg.DynamicAuth.AzureAD != nil:
 		return azureADBeforeConnect()
 	case cfg.DynamicAuth.GCPCloudSQLIAM != nil:
-		return gcpCloudSQLIAMBeforeConnect(ctx)
+		return gcpCloudSQLIAMBeforeConnect()
 	default:
 		return nil, errors.New("unreachable: singleDynamicAuthBackend guarantees exactly one backend is set")
 	}

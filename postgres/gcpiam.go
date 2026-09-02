@@ -27,7 +27,7 @@ func gcpCloudSQLIAMToken(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", wrapAuthError("gcpCloudSqlIam", err)
 	}
-	token, err := ts.Token()
+	token, err := tokenWithContext(ctx, ts)
 	if err != nil {
 		return "", wrapAuthError("gcpCloudSqlIam", fmt.Errorf("failed to acquire GCP access token: %w", err))
 	}
@@ -36,21 +36,50 @@ func gcpCloudSQLIAMToken(ctx context.Context) (string, error) {
 
 // gcpCloudSQLIAMBeforeConnect returns a BeforeConnect hook that generates a
 // fresh GCP access token before each connection attempt. The token source is
-// constructed once, at hook-construction time; oauth2.TokenSource caches and
-// refreshes the underlying token internally.
-func gcpCloudSQLIAMBeforeConnect(ctx context.Context) (BeforeConnectFn, error) {
-	ts, err := newGCPTokenSource(ctx)
+// constructed once, at hook-construction time, using context.Background()
+// rather than the ctx passed in here: google.DefaultTokenSource captures
+// whatever context it's given for the lifetime of the returned TokenSource
+// (used to build its internal token-refresh HTTP client), and this
+// constructor's ctx is often request- or pool-construction-scoped and may be
+// canceled shortly after NewPool returns — which would poison every later
+// token refresh through this source. oauth2.TokenSource caches and refreshes
+// the underlying token internally.
+func gcpCloudSQLIAMBeforeConnect() (BeforeConnectFn, error) {
+	ts, err := newGCPTokenSource(context.Background())
 	if err != nil {
 		return nil, wrapAuthError("gcpCloudSqlIam", err)
 	}
-	return func(_ context.Context, conn *pgx.ConnConfig) error {
-		token, err := ts.Token()
+	return func(ctx context.Context, conn *pgx.ConnConfig) error {
+		token, err := tokenWithContext(ctx, ts)
 		if err != nil {
 			return wrapAuthError("gcpCloudSqlIam", fmt.Errorf("failed to acquire GCP access token: %w", err))
 		}
 		conn.Password = token.AccessToken
 		return nil
 	}, nil
+}
+
+// tokenWithContext calls ts.Token(), honoring ctx for cancellation even
+// though oauth2.TokenSource's Token method takes no context of its own.
+// This returns as soon as ctx is done, but — since the underlying call
+// cannot itself be aborted through this interface — the goroutine calling
+// Token() keeps running in the background until it completes on its own.
+func tokenWithContext(ctx context.Context, ts oauth2.TokenSource) (*oauth2.Token, error) {
+	type result struct {
+		token *oauth2.Token
+		err   error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		token, err := ts.Token()
+		ch <- result{token, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ch:
+		return r.token, r.err
+	}
 }
 
 // newGCPTokenSource builds the token source used to acquire GCP access
