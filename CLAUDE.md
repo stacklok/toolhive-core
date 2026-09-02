@@ -83,6 +83,7 @@ task license-fix   # Add missing license headers
 | `oci/skills` | OCI artifact types, media types, and registry operations for ToolHive skills (Alpha) |
 | `oci/plugins` | OCI artifact types, media types, and registry operations for ToolHive plugins (Alpha) |
 | `postgres` | PostgreSQL connection pool with optional AWS RDS IAM dynamic auth (Alpha) |
+| `redis` | Redis/Valkey client (standalone/cluster/sentinel) with optional AWS ElastiCache/MemoryDB IAM, Azure Entra ID, or GCP Memorystore IAM dynamic auth (Alpha) |
 | `recovery` | HTTP panic recovery middleware (Beta) |
 | `validation/http` | RFC 7230/8707 compliant HTTP header and URI validation |
 | `validation/group` | Group name validation (lowercase alphanumeric, underscore, dash, space) |

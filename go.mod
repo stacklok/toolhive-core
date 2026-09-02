@@ -1,11 +1,11 @@
 module github.com/stacklok/toolhive-core
 
-go 1.26
+go 1.26.0
 
 require (
 	cel.dev/cel-go v0.32.0
 	github.com/adrg/xdg v0.5.3
-	github.com/alicebob/miniredis/v2 v2.38.0
+	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.40
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.19.1
 	github.com/aws/aws-sdk-go-v2/feature/rds/auth v1.6.40
@@ -33,6 +33,7 @@ require (
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.1
+	github.com/aws/aws-sdk-go-v2 v1.45.1
 	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467
 	github.com/go-openapi/runtime v0.33.1
 	github.com/go-openapi/swag/conv v0.29.1
@@ -66,7 +67,6 @@ require (
 	github.com/ProtonMail/go-crypto v1.4.1 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
-	github.com/aws/aws-sdk-go-v2 v1.45.1 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.39 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.40 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.40 // indirect
@@ -161,7 +161,7 @@ require (
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
-	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/crypto v0.56.0 // indirect
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
 	golang.org/x/mod v0.40.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect

@@ -89,6 +89,46 @@ func TestNewClient_StandaloneMutualTLS(t *testing.T) {
 	assert.Equal(t, "mtls-value", value)
 }
 
+// TestCredentialsProviderContext_ResolvesBeforeHelloAndDBSelect is a
+// mechanism-level regression test for the bug fixed by switching
+// dynamicAuthOptions from an OnConnect hook to CredentialsProviderContext:
+// go-redis's initConn only resolves credentials via
+// resolveCredentials/CredentialsProviderContext before it sends HELLO and
+// SELECT, but it calls OnConnect only after those complete. With
+// Options.Password left empty (as dynamic auth does) and a non-zero DB, an
+// OnConnect-based hook would leave the initial HELLO/AUTH unauthenticated —
+// failing outright against a protected server — and, even where auth
+// succeeds via a fallback, would never re-select the intended DB in time.
+// This test exercises go-redis's actual handshake against a miniredis
+// server protected with RequireAuth and a non-zero selected DB, proving
+// CredentialsProviderContext resolves in time for both to succeed. It does
+// not exercise our specific cloud backends (those require real cloud
+// credentials, consistent with this package's other dynamic-auth tests),
+// only the underlying mechanism our wiring (client.go's dynamicAuthOptions)
+// depends on.
+func TestCredentialsProviderContext_ResolvesBeforeHelloAndDBSelect(t *testing.T) {
+	t.Parallel()
+
+	const testToken = "s3cr3t-token" //nolint:gosec // G101: fake test-only credential, not a real secret
+	srv := miniredis.RunT(t)
+	srv.RequireAuth(testToken)
+
+	client := goredis.NewClient(&goredis.Options{
+		Addr: srv.Addr(),
+		DB:   3,
+		CredentialsProviderContext: func(context.Context) (string, string, error) {
+			return "", testToken, nil
+		},
+	})
+	t.Cleanup(func() { _ = client.Close() })
+
+	require.NoError(t, client.Set(t.Context(), "k", "v", 0).Err(),
+		"protected auth + non-zero DB selection must both succeed when credentials resolve before HELLO/SELECT")
+	got, err := client.Get(t.Context(), "k").Result()
+	require.NoError(t, err)
+	assert.Equal(t, "v", got)
+}
+
 func TestNewClient_NilConfig(t *testing.T) {
 	t.Parallel()
 	_, err := NewClient(t.Context(), nil)
@@ -128,6 +168,68 @@ func TestNewClient_DoesNotMutateCallerConfig(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 
 	assert.Equal(t, original, *cfg, "NewClient must not modify the caller's Config")
+}
+
+func TestBuildClient_DynamicAuthInstallsCredentialsProviderContextAndConnMaxLifetime(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{
+		Addr:     testAddr,
+		Username: testDynamicAuthUser,
+		DynamicAuth: &DynamicAuthConfig{
+			AWSElastiCacheIAM: &DynamicAuthAWSElastiCacheIAM{Region: testRegion, ClusterName: testClusterName},
+		},
+	}
+	cfg.applyDefaults()
+	c, err := buildClient(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	standalone, ok := c.(*goredis.Client)
+	require.True(t, ok)
+	opts := standalone.Options()
+	assert.NotNil(t, opts.CredentialsProviderContext,
+		"dynamicAuth must install a CredentialsProviderContext hook, not OnConnect: "+
+			"OnConnect runs after go-redis's HELLO/AUTH handshake and DB selection have already completed")
+	assert.Nil(t, opts.OnConnect, "dynamicAuth must not use OnConnect")
+	assert.Equal(t, DefaultAWSElastiCacheIAMTokenTTL, opts.ConnMaxLifetime,
+		"dynamicAuth must default ConnMaxLifetime to the backend's token TTL")
+	assert.Empty(t, opts.Password, "dynamicAuth must not carry a static password")
+}
+
+func TestBuildClient_DynamicAuthRespectsExplicitConnMaxLifetime(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{
+		Addr:            testAddr,
+		Username:        testDynamicAuthUser,
+		ConnMaxLifetime: 3 * time.Minute,
+		DynamicAuth: &DynamicAuthConfig{
+			AzureAD: &DynamicAuthAzureAD{},
+		},
+	}
+	cfg.applyDefaults()
+	c, err := buildClient(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+
+	standalone, ok := c.(*goredis.Client)
+	require.True(t, ok)
+	assert.Equal(t, 3*time.Minute, standalone.Options().ConnMaxLifetime,
+		"an explicit Config.ConnMaxLifetime must override the backend default")
+}
+
+func TestBuildClient_DynamicAuthPropagatesBackendConstructionError(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{
+		Addr:     testAddr,
+		Username: testDynamicAuthUser,
+		DynamicAuth: &DynamicAuthConfig{
+			AWSElastiCacheIAM: &DynamicAuthAWSElastiCacheIAM{ClusterName: testClusterName}, // missing region
+		},
+	}
+	cfg.applyDefaults()
+	_, err := buildClient(t.Context(), cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), testErrRegionMissing)
 }
 
 func TestBuildTLSConfig(t *testing.T) {
@@ -237,7 +339,7 @@ func TestBuildClient_ClusterWithMutualTLSReturnsClusterClient(t *testing.T) {
 		},
 	}
 	cfg.applyDefaults()
-	c, err := buildClient(cfg)
+	c, err := buildClient(t.Context(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 	_, ok := c.(*goredis.ClusterClient)
@@ -253,7 +355,7 @@ func TestBuildClient_SentinelReturnsFailoverClient(t *testing.T) {
 		},
 	}
 	cfg.applyDefaults()
-	c, err := buildClient(cfg)
+	c, err := buildClient(t.Context(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 	// FailoverClient is returned as goredis.UniversalClient; verify it's a
@@ -282,7 +384,7 @@ func TestBuildClient_SentinelWithMutualTLSInstallsDialer(t *testing.T) {
 		},
 	}
 	cfg.applyDefaults()
-	c, err := buildClient(cfg)
+	c, err := buildClient(t.Context(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 }

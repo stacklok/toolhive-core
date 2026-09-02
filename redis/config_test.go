@@ -20,6 +20,11 @@ const (
 	testSecondSentinel = "sentinel-0:26379"
 )
 
+// testDynamicAuthTLS is a minimal verified TLSConfig (system CAs, no
+// InsecureSkipVerify) satisfying dynamicAuth's TLS requirement in test
+// cases that aren't themselves testing that requirement.
+var testDynamicAuthTLS = &TLSConfig{}
+
 func TestConfigValidate(t *testing.T) {
 	t.Parallel()
 
@@ -117,6 +122,138 @@ func TestConfigValidate(t *testing.T) {
 				SentinelTLS: &TLSConfig{ClientKey: []byte("key")},
 			},
 			wantErr: "sentinel TLS config: client certificate and key must be provided together",
+		},
+		{
+			name: "dynamicAuth with password is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser, Password: "secret", TLS: testDynamicAuthTLS,
+				DynamicAuth: &DynamicAuthConfig{AzureAD: &DynamicAuthAzureAD{}},
+			},
+			wantErr: "password must not be set when dynamicAuth is configured",
+		},
+		{
+			name: "dynamicAuth without TLS is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser,
+				DynamicAuth: &DynamicAuthConfig{AzureAD: &DynamicAuthAzureAD{}},
+			},
+			wantErr: "TLS is required when dynamicAuth is configured",
+		},
+		{
+			name: "dynamicAuth with InsecureSkipVerify TLS is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser, TLS: &TLSConfig{InsecureSkipVerify: true},
+				DynamicAuth: &DynamicAuthConfig{AzureAD: &DynamicAuthAzureAD{}},
+			},
+			wantErr: "TLS must verify the server certificate when dynamicAuth is configured",
+		},
+		{
+			name: "dynamicAuth with AllowInsecureTransport tolerates missing TLS",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser,
+				DynamicAuth: &DynamicAuthConfig{
+					AzureAD:                &DynamicAuthAzureAD{},
+					AllowInsecureTransport: true,
+				},
+			},
+		},
+		{
+			name: "dynamicAuth without username is rejected",
+			cfg: &Config{
+				Addr: testAddr, TLS: testDynamicAuthTLS,
+				DynamicAuth: &DynamicAuthConfig{AzureAD: &DynamicAuthAzureAD{}},
+			},
+			wantErr: "username is required when dynamicAuth.azureAd is configured",
+		},
+		{
+			name: "GCP Memorystore IAM with username is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser, TLS: testDynamicAuthTLS,
+				DynamicAuth: &DynamicAuthConfig{GCPMemorystoreIAM: &DynamicAuthGCPMemorystoreIAM{}},
+			},
+			wantErr: "username must not be set when dynamicAuth.gcpMemorystoreIam is configured",
+		},
+		{
+			name: "valid GCP Memorystore IAM dynamicAuth config",
+			cfg: &Config{
+				Addr: testAddr, TLS: testDynamicAuthTLS,
+				DynamicAuth: &DynamicAuthConfig{GCPMemorystoreIAM: &DynamicAuthGCPMemorystoreIAM{}},
+			},
+		},
+		{
+			name: "dynamicAuth without backend is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser, TLS: testDynamicAuthTLS,
+				DynamicAuth: &DynamicAuthConfig{},
+			},
+			wantErr: testErrNoSupportedAuth,
+		},
+		{
+			name: "dynamicAuth with more than one backend is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser, TLS: testDynamicAuthTLS,
+				DynamicAuth: &DynamicAuthConfig{
+					AzureAD:           &DynamicAuthAzureAD{},
+					GCPMemorystoreIAM: &DynamicAuthGCPMemorystoreIAM{},
+				},
+			},
+			wantErr: testErrMultipleBackend,
+		},
+		{
+			name: "AWS ElastiCache IAM without region is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser, TLS: testDynamicAuthTLS,
+				DynamicAuth: &DynamicAuthConfig{
+					AWSElastiCacheIAM: &DynamicAuthAWSElastiCacheIAM{ClusterName: testClusterName},
+				},
+			},
+			wantErr: "dynamicAuth.awsElastiCacheIam.region is required",
+		},
+		{
+			name: "AWS ElastiCache IAM without cluster name is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser, TLS: testDynamicAuthTLS,
+				DynamicAuth: &DynamicAuthConfig{
+					AWSElastiCacheIAM: &DynamicAuthAWSElastiCacheIAM{Region: testRegion},
+				},
+			},
+			wantErr: "dynamicAuth.awsElastiCacheIam.clusterName is required",
+		},
+		{
+			name: "AWS ElastiCache IAM with invalid service name is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser, TLS: testDynamicAuthTLS,
+				DynamicAuth: &DynamicAuthConfig{
+					AWSElastiCacheIAM: &DynamicAuthAWSElastiCacheIAM{
+						Region: testRegion, ClusterName: testClusterName, ServiceName: "not-a-real-service",
+					},
+				},
+			},
+			wantErr: "dynamicAuth.awsElastiCacheIam.serviceName must be empty",
+		},
+		{
+			name: "AWS ElastiCache IAM with invalid resource type is rejected",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser, TLS: testDynamicAuthTLS,
+				DynamicAuth: &DynamicAuthConfig{
+					AWSElastiCacheIAM: &DynamicAuthAWSElastiCacheIAM{
+						Region: testRegion, ClusterName: testClusterName, ResourceType: "NotAResourceType",
+					},
+				},
+			},
+			wantErr: "dynamicAuth.awsElastiCacheIam.resourceType must be empty",
+		},
+		{
+			name: "valid AWS ElastiCache IAM dynamicAuth config",
+			cfg: &Config{
+				Addr: testAddr, Username: testDynamicAuthUser, TLS: testDynamicAuthTLS,
+				DynamicAuth: &DynamicAuthConfig{
+					AWSElastiCacheIAM: &DynamicAuthAWSElastiCacheIAM{
+						Region: testRegion, ClusterName: testClusterName,
+						ServiceName: awsElastiCacheMemoryDBServiceName, ResourceType: awsElastiCacheServerlessResourceType,
+					},
+				},
+			},
 		},
 		{
 			name: "valid standalone config",
