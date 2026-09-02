@@ -5,7 +5,7 @@ go 1.26
 require (
 	cel.dev/cel-go v0.32.0
 	github.com/adrg/xdg v0.5.3
-	github.com/alicebob/miniredis/v2 v2.38.0
+	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.40
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.19.1
 	github.com/aws/aws-sdk-go-v2/feature/rds/auth v1.6.40
