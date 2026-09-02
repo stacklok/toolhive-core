@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -77,8 +76,9 @@ type cosignImage struct {
 // digest — is what gets signed, per the cosign convention: a verifier
 // recovers the payload from the signature manifest's layer, checks the
 // signature over it, and reads the bound manifest digest out of it.
-// Exported because offline re-verification of a stored key-signed bundle
-// must reconstruct exactly these bytes to check the signature's binding.
+// Exported so callers can reproduce and inspect the exact bytes a signature
+// covers; re-verifying a stored [Result.Bundle] does not need it, since the
+// stored form carries the payload itself.
 func SimpleSigningPayload(imageRef, digestStr string) ([]byte, error) {
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
@@ -92,7 +92,9 @@ func SimpleSigningPayload(imageRef, digestStr string) ([]byte, error) {
 		Critical: cosignCritical{
 			Identity: cosignIdentity{DockerReference: ref.Context().Name()},
 			Image:    cosignImage{DockerManifestDigest: d.String()},
-			Type:     "cosign container image signature",
+			// The verifier refuses a payload carrying any other type, so
+			// this must stay the value it checks for.
+			Type: verifier.CosignSignatureType,
 		},
 	}
 	return json.Marshal(payload)
@@ -384,15 +386,17 @@ func keylessAlreadySigned(
 // DefaultVerifierOptions — so only a genuinely Fulcio-issued, Rekor-logged
 // certificate can dedupe.
 //
-// The digest check runs before the (comparatively expensive) chain
+// The payload check runs before the (comparatively expensive) chain
 // verification: a chain-valid signature over some OTHER payload from this
 // same identity says nothing about whether THIS payload has already been
 // signed, and checking it first also avoids wasted verification work.
+// Comparing payload bytes — rather than the bundle's artifact digest, which
+// every signature on this artifact shares — is what makes it a check about
+// this signature at all.
 func keylessLayerTrusted(
 	b verifier.Bundle, tm root.TrustedMaterial, opts []verify.VerifierOption, payload []byte, summary fulciocert.Summary,
 ) bool {
-	sum := sha256.Sum256(payload)
-	if b.DigestAlgo != "sha256" || b.DigestHex != hex.EncodeToString(sum[:]) {
+	if !bytes.Equal(b.SimpleSigningPayload, payload) {
 		return false
 	}
 	vr, err := verifier.VerifyBundle(b, tm, nil, opts...)

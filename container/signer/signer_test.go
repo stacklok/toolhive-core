@@ -36,7 +36,6 @@ import (
 	protobundle "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v1"
 	protocommon "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
 	protorekor "github.com/sigstore/protobuf-specs/gen/pb-go/rekor/v1"
-	"github.com/sigstore/sigstore-go/pkg/bundle"
 	fulciocert "github.com/sigstore/sigstore-go/pkg/fulcio/certificate"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"github.com/stretchr/testify/assert"
@@ -92,14 +91,16 @@ func pushTestArtifact(t *testing.T, registryHost string) (ref string, digestStr 
 // verifyKeyBundle verifies a signing result against the public key, through
 // the sibling verifier package's real entry point.
 //
-// It uses res.PayloadDigest rather than recomputing a digest, which is the
-// point: a consumer holding only the Result must be able to verify it. When
-// this helper had to rebuild the simple-signing payload itself, the test
-// passed while the public API was unusable as documented.
-func verifyKeyBundle(t *testing.T, res *Result, pubPEM []byte) error {
+// It passes the ARTIFACT digest — the same value handed to SignOCI — which is
+// the point: a consumer holding the Result and the digest it asked to sign
+// must be able to verify it, without knowing that cosign signatures cover a
+// payload rather than the artifact. When this helper had to rebuild the
+// simple-signing payload itself, the test passed while the public API was
+// unusable as documented.
+func verifyKeyBundle(t *testing.T, res *Result, artifactDigest string, pubPEM []byte) error {
 	t.Helper()
 	require.NotEmpty(t, res.PayloadDigest, "a signing result must carry the digest it signed")
-	_, err := verifier.VerifyBundleOfflineWithKey(res.Bundle, res.PayloadDigest, pubPEM)
+	_, err := verifier.VerifyBundleOfflineWithKey(res.Bundle, artifactDigest, pubPEM)
 	return err
 }
 
@@ -116,12 +117,12 @@ func TestSignOCIRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, raw.Bundle)
 
-	// The returned bundle verifies against the signing key over the
-	// simple-signing payload digest.
+	// The returned bundle verifies against the signing key, bound to the
+	// artifact digest.
 	payload, err := SimpleSigningPayload(ref, digestStr)
 	require.NoError(t, err)
 	payloadDigest := sha256.Sum256(payload)
-	require.NoError(t, verifyKeyBundle(t, raw, pubPEM),
+	require.NoError(t, verifyKeyBundle(t, raw, digestStr, pubPEM),
 		"the returned bundle must verify against the signing key")
 
 	// The attached signature manifest reconstructs to the SAME signature:
@@ -151,9 +152,13 @@ func TestSignOCIRoundTrip(t *testing.T) {
 		"the signature manifest layer must be the exact signed payload")
 
 	// The annotation signature matches the bundle's message signature.
-	parsed := &bundle.Bundle{}
-	require.NoError(t, parsed.UnmarshalJSON(raw.Bundle))
-	bundleSig := parsed.Bundle.GetMessageSignature().GetSignature()
+	// Result.Bundle is the stored form (bundle + payload), so it is unwrapped
+	// through the verifier rather than parsed as a bare sigstore bundle.
+	stored, err := verifier.DecodeStoredBundle(raw.Bundle, digestStr)
+	require.NoError(t, err)
+	assert.Equal(t, payload, stored.SimpleSigningPayload,
+		"the stored bundle must carry the exact payload the signature covers")
+	bundleSig := stored.Parsed.GetMessageSignature().GetSignature()
 	annotationSig, err := base64.StdEncoding.DecodeString(layer.Annotations[annotationCosignSignature])
 	require.NoError(t, err)
 	assert.Equal(t, bundleSig, annotationSig,
@@ -173,7 +178,7 @@ func TestSignOCIRejectsWrongKeyVerification(t *testing.T) {
 	raw, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{Key: keyPath})
 	require.NoError(t, err)
 
-	require.Error(t, verifyKeyBundle(t, raw, otherPub),
+	require.Error(t, verifyKeyBundle(t, raw, digestStr, otherPub),
 		"a different key must not verify the bundle")
 }
 
@@ -398,7 +403,7 @@ func TestSignOCIAcceptsCosignCLIKeyFormat(t *testing.T) {
 			raw, err := NewDefault(nil).SignOCI(t.Context(), ref, digestStr, Options{Key: keyPath})
 			require.NoError(t, err, "a key from `cosign generate-key-pair` must be usable")
 
-			require.NoError(t, verifyKeyBundle(t, raw, pubPEM))
+			require.NoError(t, verifyKeyBundle(t, raw, digestStr, pubPEM))
 		})
 	}
 }
@@ -461,8 +466,8 @@ func TestSignOCIAppendsRatherThanReplacingSignatures(t *testing.T) {
 
 	// Both signatures must still verify — the manifest carries two distinct
 	// annotations, one per key.
-	require.NoError(t, verifyKeyBundle(t, rawA, pubA))
-	require.NoError(t, verifyKeyBundle(t, rawB, pubB))
+	require.NoError(t, verifyKeyBundle(t, rawA, digestStr, pubA))
+	require.NoError(t, verifyKeyBundle(t, rawB, digestStr, pubB))
 
 	sigs := map[string]bool{}
 	for _, l := range layers {
@@ -512,19 +517,26 @@ func TestResultCarriesTheDigestItSigned(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.NotEqual(t, digestStr, res.PayloadDigest,
-		"the signed digest is the payload's, not the artifact's — if these ever match, the contract changed")
+		"the signed blob is the payload, not the artifact — if these ever match, the contract changed")
 
-	// The artifact digest must NOT verify the bundle. This is the mistake
-	// the previous signature invited.
+	// The ARTIFACT digest verifies the stored bundle. This is the contract:
+	// a caller holds the digest it asked to have signed, and that is the
+	// value the verifier takes. Reaching it requires the stored bundle to
+	// carry the payload, so that the signature can be checked against what
+	// it actually covers AND the payload's claim about which artifact it
+	// covers can be checked against digestStr.
 	_, err = verifier.VerifyBundleOfflineWithKey(res.Bundle, digestStr, pubPEM)
-	require.Error(t, err, "the artifact digest must not verify a payload-bound bundle")
+	require.NoError(t, err, "the artifact digest must verify the stored bundle")
 
-	// The digest the Result reports must.
-	_, err = verifier.VerifyBundleOfflineWithKey(res.Bundle, res.PayloadDigest, pubPEM)
-	require.NoError(t, err)
+	// A different artifact's digest must not, even though the bundle's own
+	// signature is perfectly valid: the payload names this artifact.
+	otherArtifact := "sha256:" + strings.Repeat("ab", 32)
+	_, err = verifier.VerifyBundleOfflineWithKey(res.Bundle, otherArtifact, pubPEM)
+	require.ErrorIs(t, err, verifier.ErrSignatureArtifactMismatch,
+		"a bundle must not verify against an artifact its payload does not name")
 
-	// And PayloadDigest recomputes the same value from ref + digest alone,
-	// which is all a later consumer has.
+	// PayloadDigest stays available and still identifies the signed blob in
+	// the attached signature manifest, recomputable from ref + digest alone.
 	recomputed, err := PayloadDigest(ref, digestStr)
 	require.NoError(t, err)
 	assert.Equal(t, res.PayloadDigest, recomputed)
