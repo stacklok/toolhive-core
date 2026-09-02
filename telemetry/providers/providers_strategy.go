@@ -66,6 +66,7 @@ func (*OTLPTracerStrategy) CreateTracerProvider(
 		Insecure:     config.Insecure,
 		SamplingRate: config.SamplingRate,
 		CACertPath:   config.CACertPath,
+		Protocol:     config.effectiveTracesProtocol(),
 	}
 
 	provider, shutdown, err := otlp.NewTracerProviderWithShutdown(ctx, otlpConfig, res, config.ExtraSpanProcessors...)
@@ -115,6 +116,7 @@ func (*OTLPLoggerStrategy) CreateLoggerProvider(
 		Headers:    config.Headers,
 		Insecure:   config.Insecure,
 		CACertPath: config.CACertPath,
+		Protocol:   config.Protocol,
 	}
 
 	provider, shutdown, err := otlp.NewLoggerProviderWithShutdown(ctx, otlpConfig, res)
@@ -182,6 +184,7 @@ func (s *UnifiedMeterStrategy) CreateMeterProvider(
 			Insecure:     config.Insecure,
 			SamplingRate: config.SamplingRate,
 			CACertPath:   config.CACertPath,
+			Protocol:     config.Protocol,
 		}
 
 		reader, err := otlp.NewMetricReader(ctx, otlpConfig)

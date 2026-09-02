@@ -6,6 +6,7 @@ package otlp
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,6 +14,17 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 )
+
+// traceExporterClientTypeName returns the concrete type name of the unexported
+// otlptrace.Client embedded in an *otlptrace.Exporter (both otlptracehttp.New
+// and otlptracegrpc.New return the same *otlptrace.Exporter type, so this is
+// the only way to tell which transport was actually selected).
+func traceExporterClientTypeName(t *testing.T, exporter interface{}) string {
+	t.Helper()
+	v := reflect.ValueOf(exporter).Elem().FieldByName("client")
+	require.True(t, v.IsValid(), "exporter has no client field")
+	return v.Elem().Type().String()
+}
 
 func TestCreateTraceExporter(t *testing.T) {
 	t.Parallel()
@@ -100,6 +112,52 @@ func TestCreateTraceExporter(t *testing.T) {
 				// Clean up
 				_ = exporter.Shutdown(ctx)
 			}
+		})
+	}
+}
+
+func TestCreateTraceExporter_ProtocolSelection(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		protocol       string
+		wantClientType string
+	}{
+		{
+			name:           testNameProtocolUnsetDefaultsHTTP,
+			protocol:       "",
+			wantClientType: "*otlptracehttp.client",
+		},
+		{
+			name:           testNameProtocolExplicitHTTP,
+			protocol:       ProtocolHTTPProtobuf,
+			wantClientType: "*otlptracehttp.client",
+		},
+		{
+			name:           testNameProtocolGRPC,
+			protocol:       ProtocolGRPC,
+			wantClientType: "*otlptracegrpc.client",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			config := Config{
+				Endpoint: testEndpointLocal,
+				Insecure: true,
+				Protocol: tt.protocol,
+			}
+
+			exporter, err := createTraceExporter(ctx, config)
+			require.NoError(t, err)
+			require.NotNil(t, exporter)
+			defer func() { _ = exporter.Shutdown(ctx) }()
+
+			assert.Equal(t, tt.wantClientType, traceExporterClientTypeName(t, exporter))
 		})
 	}
 }
