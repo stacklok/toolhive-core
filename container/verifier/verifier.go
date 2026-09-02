@@ -120,9 +120,19 @@ func getVerifiedResults(
 
 	// Verify each bundle we've constructed
 	for _, b := range bundles {
+		// Bind the bundle to the artifact. For a cosign simple-signing
+		// bundle this also re-checks that the signed payload names this
+		// artifact — retrieval already refused any that didn't, but the
+		// binding belongs on the verification path too, so no future caller
+		// can reach Verify without it.
+		artifactOpt, err := artifactDigestPolicy(b.payload, b.digestAlgo, b.digestBytes)
+		if err != nil {
+			slog.Info("bundle rejected before verification", "error", err)
+			continue
+		}
 		// Create a new verification result. At this point, we managed to extract a bundle, so lets verify it.
 		verificationResult, err := sev.Verify(b.bundle, verify.NewPolicy(
-			verify.WithArtifactDigest(b.digestAlgo, b.digestBytes),
+			artifactOpt,
 			verify.WithoutIdentitiesUnsafe(),
 		))
 		if err != nil {
