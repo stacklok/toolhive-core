@@ -36,22 +36,33 @@ type Config struct {
 	// Username is the optional ACL username (Redis 6.0+). When empty, auth
 	// falls back to legacy AUTH using only Password.
 	//
-	// When DynamicAuth is set, Username is required: it is the IAM/ACL
-	// identity (AWS IAM user, Azure principal object ID, or GCP service
-	// account email) that dynamic-auth tokens authenticate as.
+	// When DynamicAuth is set, whether Username is required depends on the
+	// backend: AWS ElastiCache/MemoryDB IAM and Azure Entra ID require it (the
+	// IAM user / principal object ID that minted tokens authenticate as); GCP
+	// Memorystore IAM authentication is token-only and rejects a username, so
+	// Username must be left empty for that backend.
 	Username string
 
 	// Password is the AUTH/ACL password. May be empty when the server does
 	// not require authentication. Mutually exclusive with DynamicAuth.
 	Password string //nolint:gosec // G101: field name, not a hardcoded credential
 
-	// DynamicAuth, when non-nil, mints short-lived AUTH passwords from a
+	// DynamicAuth, when non-nil, mints short-lived AUTH credentials from a
 	// cloud IAM backend instead of using a static Password. NewClient
-	// installs an Options.OnConnect hook that authenticates each connection
-	// with a freshly minted token, and sets ConnMaxLifetime (when Config's
-	// own ConnMaxLifetime is zero) to a value inside the backend's token TTL
-	// so pooled connections are periodically retired and redialed with a
-	// current token.
+	// installs an Options.CredentialsProviderContext hook that resolves
+	// fresh credentials for each connection attempt — during go-redis's
+	// handshake, before RESP3 negotiation and DB selection — and sets
+	// ConnMaxLifetime (when Config's own ConnMaxLifetime is zero) to a value
+	// inside the backend's token TTL so pooled connections are periodically
+	// retired and redialed with current credentials.
+	//
+	// Dynamic authentication requires a verified TLS connection (Config.TLS
+	// set, with InsecureSkipVerify false): cloud IAM tokens are bearer
+	// credentials, and sending them over an unverified or plaintext
+	// connection lets a network attacker capture and replay them. Set
+	// DynamicAuthConfig.AllowInsecureTransport to opt out for trusted local
+	// tunneling (for example, a sidecar-terminated mTLS tunnel where this
+	// package's own TLS handshake would be redundant).
 	DynamicAuth *DynamicAuthConfig
 
 	// DB is the Redis database index. Applies to standalone and sentinel
@@ -101,6 +112,12 @@ type DynamicAuthConfig struct {
 	// GCPMemorystoreIAM enables GCP Memorystore for Redis Cluster IAM
 	// authentication tokens.
 	GCPMemorystoreIAM *DynamicAuthGCPMemorystoreIAM
+
+	// AllowInsecureTransport opts out of the requirement that Config.TLS be
+	// set (with verification enabled) when DynamicAuth is configured. Leave
+	// false unless a trusted local tunnel already provides transport
+	// security outside this package's own TLS handling.
+	AllowInsecureTransport bool
 }
 
 // DynamicAuthAWSElastiCacheIAM configures AWS ElastiCache/MemoryDB IAM
@@ -114,9 +131,15 @@ type DynamicAuthAWSElastiCacheIAM struct {
 	// the MemoryDB cluster name, that the presigned token is scoped to.
 	ClusterName string
 
-	// ServiceName is the SigV4 signing service name: "elasticache" (the
-	// default, used when empty) or "memorydb".
+	// ServiceName is the SigV4 signing service name. Must be empty (the
+	// default, treated as "elasticache") or "memorydb".
 	ServiceName string
+
+	// ResourceType selects the AWS-required resource-type query parameter
+	// for serverless caches. Must be empty (the default, for provisioned
+	// ElastiCache/MemoryDB clusters) or "ServerlessCache" (for ElastiCache
+	// Serverless / MemoryDB Serverless).
+	ResourceType string
 }
 
 // DynamicAuthAzureAD configures Azure Entra ID (formerly Azure AD)
@@ -130,6 +153,9 @@ type DynamicAuthAzureAD struct{}
 // DynamicAuthGCPMemorystoreIAM configures GCP Memorystore for Redis Cluster
 // IAM authentication. It has no fields: the token is minted from ambient
 // Application Default Credentials, scoped for Memorystore IAM auth.
+// Authentication is token-only (AUTH <token>) — Config.Username must be
+// empty for this backend; Memorystore does not accept a username alongside
+// the token.
 type DynamicAuthGCPMemorystoreIAM struct{}
 
 // countDynamicAuthBackends returns how many backend fields on da are set.
@@ -226,9 +252,10 @@ func (c *Config) Validate() error {
 	return validateDynamicAuth(c)
 }
 
-// validateDynamicAuth checks c.DynamicAuth for backend-selection and
-// required-field errors. Split out of Validate to keep both functions under
-// the project's cyclomatic-complexity budget.
+// validateDynamicAuth checks c.DynamicAuth for backend-selection,
+// transport-security, and required-field errors. Split into per-backend
+// helpers to keep every function under the project's cyclomatic-complexity
+// budget.
 func validateDynamicAuth(c *Config) error {
 	if c.DynamicAuth == nil {
 		return nil
@@ -239,16 +266,83 @@ func validateDynamicAuth(c *Config) error {
 	if c.Password != "" {
 		return errors.New("password must not be set when dynamicAuth is configured")
 	}
-	if c.Username == "" {
-		return errors.New("username is required when dynamicAuth is configured")
+	if err := validateDynamicAuthTLS(c.TLS, c.DynamicAuth); err != nil {
+		return err
 	}
-	if c.DynamicAuth.AWSElastiCacheIAM != nil {
-		if c.DynamicAuth.AWSElastiCacheIAM.Region == "" {
-			return errors.New("dynamicAuth.awsElastiCacheIam.region is required")
-		}
-		if c.DynamicAuth.AWSElastiCacheIAM.ClusterName == "" {
-			return errors.New("dynamicAuth.awsElastiCacheIam.clusterName is required")
-		}
+	switch {
+	case c.DynamicAuth.AWSElastiCacheIAM != nil:
+		return validateAWSElastiCacheIAM(c.Username, c.DynamicAuth.AWSElastiCacheIAM)
+	case c.DynamicAuth.AzureAD != nil:
+		return validateUsernameRequired(c.Username, "azureAd")
+	case c.DynamicAuth.GCPMemorystoreIAM != nil:
+		return validateUsernameForbidden(c.Username, "gcpMemorystoreIam", "GCP Memorystore IAM authentication is token-only")
+	default:
+		return nil
+	}
+}
+
+// validateDynamicAuthTLS requires a verified TLS connection for dynamic
+// authentication, unless the caller explicitly opted out via
+// AllowInsecureTransport. Cloud IAM tokens are bearer credentials; sending
+// them over an unverified or plaintext connection lets a network attacker
+// capture and replay them.
+func validateDynamicAuthTLS(tls *TLSConfig, da *DynamicAuthConfig) error {
+	if da.AllowInsecureTransport {
+		return nil
+	}
+	if tls == nil {
+		return errors.New("TLS is required when dynamicAuth is configured " +
+			"(set Config.TLS, or DynamicAuthConfig.AllowInsecureTransport to opt out for trusted local tunneling)")
+	}
+	if tls.InsecureSkipVerify {
+		return errors.New("TLS must verify the server certificate when dynamicAuth is configured " +
+			"(InsecureSkipVerify defeats the purpose of a signed token; " +
+			"set DynamicAuthConfig.AllowInsecureTransport to opt out)")
+	}
+	return nil
+}
+
+// validateUsernameRequired returns an error when username is empty, for
+// backends (AWS, Azure) whose AUTH command needs an explicit identity.
+func validateUsernameRequired(username, backend string) error {
+	if username == "" {
+		return fmt.Errorf("username is required when dynamicAuth.%s is configured", backend)
+	}
+	return nil
+}
+
+// validateUsernameForbidden returns an error when username is set, for
+// backends (GCP) whose AUTH command is token-only.
+func validateUsernameForbidden(username, backend, reason string) error {
+	if username != "" {
+		return fmt.Errorf("username must not be set when dynamicAuth.%s is configured (%s)", backend, reason)
+	}
+	return nil
+}
+
+// validateAWSElastiCacheIAM checks required fields and enum-constrained
+// fields on a DynamicAuthAWSElastiCacheIAM.
+func validateAWSElastiCacheIAM(username string, iam *DynamicAuthAWSElastiCacheIAM) error {
+	if err := validateUsernameRequired(username, "awsElastiCacheIam"); err != nil {
+		return err
+	}
+	if iam.Region == "" {
+		return errors.New("dynamicAuth.awsElastiCacheIam.region is required")
+	}
+	if iam.ClusterName == "" {
+		return errors.New("dynamicAuth.awsElastiCacheIam.clusterName is required")
+	}
+	switch iam.ServiceName {
+	case "", awsElastiCacheDefaultServiceName, awsElastiCacheMemoryDBServiceName:
+	default:
+		return fmt.Errorf("dynamicAuth.awsElastiCacheIam.serviceName must be empty, %q, or %q, got %q",
+			awsElastiCacheDefaultServiceName, awsElastiCacheMemoryDBServiceName, iam.ServiceName)
+	}
+	switch iam.ResourceType {
+	case "", awsElastiCacheServerlessResourceType:
+	default:
+		return fmt.Errorf("dynamicAuth.awsElastiCacheIam.resourceType must be empty or %q, got %q",
+			awsElastiCacheServerlessResourceType, iam.ResourceType)
 	}
 	return nil
 }

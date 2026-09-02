@@ -25,10 +25,11 @@ func TestNewAuthToken(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		cfg       *Config
-		wantToken string
-		wantErr   string
+		name         string
+		cfg          *Config
+		wantUsername string
+		wantPassword string
+		wantErr      string
 	}{
 		{
 			name:    "nil config",
@@ -36,9 +37,10 @@ func TestNewAuthToken(t *testing.T) {
 			wantErr: testErrConfigNil,
 		},
 		{
-			name:      "no dynamic auth returns empty token without error",
-			cfg:       &Config{Addr: testAddr},
-			wantToken: "",
+			name:         "no dynamic auth returns empty credentials without error",
+			cfg:          &Config{Addr: testAddr},
+			wantUsername: "",
+			wantPassword: "",
 		},
 		{
 			name: "dynamic auth without backend",
@@ -74,15 +76,17 @@ func TestNewAuthToken(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			token, err := NewAuthToken(t.Context(), tt.cfg)
+			username, password, err := NewAuthToken(t.Context(), tt.cfg)
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
-				assert.Empty(t, token)
+				assert.Empty(t, username)
+				assert.Empty(t, password)
 				return
 			}
 			require.NoError(t, err)
-			assert.Equal(t, tt.wantToken, token)
+			assert.Equal(t, tt.wantUsername, username)
+			assert.Equal(t, tt.wantPassword, password)
 		})
 	}
 }

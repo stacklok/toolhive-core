@@ -98,35 +98,29 @@ func buildClient(ctx context.Context, cfg *Config) (goredis.UniversalClient, err
 }
 
 // dynamicAuthOptions resolves cfg.DynamicAuth (when set) into the
-// goredis.Options fields that authenticate pooled connections with fresh
-// tokens: an OnConnect hook that mints a token and issues AUTH on every
-// newly dialed connection, and a ConnMaxLifetime that forces go-redis to
-// periodically retire and redial connections — re-running OnConnect — before
-// the previous token would be rejected. Returns zero values, unmodified from
-// cfg, when cfg.DynamicAuth is nil.
+// goredis.Options fields that authenticate connections with fresh
+// credentials: a CredentialsProviderContext hook that go-redis calls during
+// its HELLO/AUTH handshake (before RESP3 negotiation and DB selection — see
+// CredentialsFunc's doc comment for why this must not be an OnConnect hook),
+// and a ConnMaxLifetime that forces go-redis to periodically retire and
+// redial connections — re-running that hook — before the previous token
+// would be rejected. Returns zero values, unmodified from cfg, when
+// cfg.DynamicAuth is nil.
 func dynamicAuthOptions(
 	ctx context.Context, cfg *Config,
-) (onConnect func(context.Context, *goredis.Conn) error, connMaxLifetime time.Duration, err error) {
+) (credentialsProviderContext func(context.Context) (string, string, error), connMaxLifetime time.Duration, err error) {
 	if cfg.DynamicAuth == nil {
 		return nil, cfg.ConnMaxLifetime, nil
 	}
-	tokenFn, err := newDynamicAuthTokenFunc(ctx, cfg)
+	credFn, err := newDynamicAuthCredentialsFunc(ctx, cfg)
 	if err != nil {
 		return nil, 0, err
-	}
-	user := cfg.Username
-	onConnect = func(ctx context.Context, cn *goredis.Conn) error {
-		token, err := tokenFn(ctx)
-		if err != nil {
-			return err
-		}
-		return cn.AuthACL(ctx, user, token).Err()
 	}
 	connMaxLifetime = cfg.ConnMaxLifetime
 	if connMaxLifetime == 0 {
 		connMaxLifetime = dynamicAuthConnMaxLifetime(cfg.DynamicAuth)
 	}
-	return onConnect, connMaxLifetime, nil
+	return credFn, connMaxLifetime, nil
 }
 
 func buildStandaloneClient(ctx context.Context, cfg *Config) (goredis.UniversalClient, error) {
@@ -134,21 +128,21 @@ func buildStandaloneClient(ctx context.Context, cfg *Config) (goredis.UniversalC
 	if err != nil {
 		return nil, fmt.Errorf("redis: standalone TLS config: %w", err)
 	}
-	onConnect, connMaxLifetime, err := dynamicAuthOptions(ctx, cfg)
+	credFn, connMaxLifetime, err := dynamicAuthOptions(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	return goredis.NewClient(&goredis.Options{
-		Addr:            cfg.Addr,
-		Username:        cfg.Username,
-		Password:        cfg.Password,
-		DB:              cfg.DB,
-		DialTimeout:     cfg.DialTimeout,
-		ReadTimeout:     cfg.ReadTimeout,
-		WriteTimeout:    cfg.WriteTimeout,
-		TLSConfig:       tlsCfg,
-		OnConnect:       onConnect,
-		ConnMaxLifetime: connMaxLifetime,
+		Addr:                       cfg.Addr,
+		Username:                   cfg.Username,
+		Password:                   cfg.Password,
+		DB:                         cfg.DB,
+		DialTimeout:                cfg.DialTimeout,
+		ReadTimeout:                cfg.ReadTimeout,
+		WriteTimeout:               cfg.WriteTimeout,
+		TLSConfig:                  tlsCfg,
+		CredentialsProviderContext: credFn,
+		ConnMaxLifetime:            connMaxLifetime,
 	}), nil
 }
 
@@ -157,39 +151,49 @@ func buildClusterClient(ctx context.Context, cfg *Config) (goredis.UniversalClie
 	if err != nil {
 		return nil, fmt.Errorf("redis: cluster TLS config: %w", err)
 	}
-	onConnect, connMaxLifetime, err := dynamicAuthOptions(ctx, cfg)
+	credFn, connMaxLifetime, err := dynamicAuthOptions(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	return goredis.NewClusterClient(&goredis.ClusterOptions{
-		Addrs:           []string{cfg.Addr},
-		Username:        cfg.Username,
-		Password:        cfg.Password,
-		DialTimeout:     cfg.DialTimeout,
-		ReadTimeout:     cfg.ReadTimeout,
-		WriteTimeout:    cfg.WriteTimeout,
-		TLSConfig:       tlsCfg,
-		OnConnect:       onConnect,
-		ConnMaxLifetime: connMaxLifetime,
+		Addrs:                      []string{cfg.Addr},
+		Username:                   cfg.Username,
+		Password:                   cfg.Password,
+		DialTimeout:                cfg.DialTimeout,
+		ReadTimeout:                cfg.ReadTimeout,
+		WriteTimeout:               cfg.WriteTimeout,
+		TLSConfig:                  tlsCfg,
+		CredentialsProviderContext: credFn,
+		ConnMaxLifetime:            connMaxLifetime,
 	}), nil
 }
 
+// buildSentinelClient wires CredentialsProviderContext for the data-node
+// (master/replica) connections only. go-redis's FailoverOptions.sentinelOptions
+// deliberately does not propagate CredentialsProviderContext (or
+// CredentialsProvider/Password) to the internal sentinel-daemon connections
+// it builds — those use SentinelUsername/SentinelPassword instead — so
+// dynamic-auth credentials for the cloud data-node identity never reach the
+// Sentinel discovery connections. (This is unlike OnConnect, which
+// FailoverOptions.sentinelOptions does copy onto sentinel connections —
+// using it here would have leaked data-node IAM credentials to the Sentinel
+// daemons.)
 func buildSentinelClient(ctx context.Context, cfg *Config) (goredis.UniversalClient, error) {
-	onConnect, connMaxLifetime, err := dynamicAuthOptions(ctx, cfg)
+	credFn, connMaxLifetime, err := dynamicAuthOptions(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	opts := &goredis.FailoverOptions{
-		MasterName:      cfg.SentinelConfig.MasterName,
-		SentinelAddrs:   cfg.SentinelConfig.SentinelAddrs,
-		Username:        cfg.Username,
-		Password:        cfg.Password,
-		DB:              cfg.DB,
-		DialTimeout:     cfg.DialTimeout,
-		ReadTimeout:     cfg.ReadTimeout,
-		WriteTimeout:    cfg.WriteTimeout,
-		OnConnect:       onConnect,
-		ConnMaxLifetime: connMaxLifetime,
+		MasterName:                 cfg.SentinelConfig.MasterName,
+		SentinelAddrs:              cfg.SentinelConfig.SentinelAddrs,
+		Username:                   cfg.Username,
+		Password:                   cfg.Password,
+		DB:                         cfg.DB,
+		DialTimeout:                cfg.DialTimeout,
+		ReadTimeout:                cfg.ReadTimeout,
+		WriteTimeout:               cfg.WriteTimeout,
+		CredentialsProviderContext: credFn,
+		ConnMaxLifetime:            connMaxLifetime,
 	}
 
 	// When both master and sentinel TLS are nil, leave Dialer/TLSConfig
