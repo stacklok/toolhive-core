@@ -49,13 +49,36 @@ func gcpMemorystoreIAMCredentialsFunc() (CredentialsFunc, error) {
 	if err != nil {
 		return nil, wrapAuthError("gcpMemorystoreIam", err)
 	}
-	return func(context.Context) (string, string, error) {
-		token, err := ts.Token()
+	return func(ctx context.Context) (string, string, error) {
+		token, err := tokenWithContext(ctx, ts)
 		if err != nil {
 			return "", "", wrapAuthError("gcpMemorystoreIam", fmt.Errorf("failed to acquire GCP access token: %w", err))
 		}
 		return "", token.AccessToken, nil
 	}, nil
+}
+
+// tokenWithContext calls ts.Token(), honoring ctx for cancellation even
+// though oauth2.TokenSource's Token method takes no context of its own.
+// This returns as soon as ctx is done, but — since the underlying call
+// cannot itself be aborted through this interface — the goroutine calling
+// Token() keeps running in the background until it completes on its own.
+func tokenWithContext(ctx context.Context, ts oauth2.TokenSource) (*oauth2.Token, error) {
+	type result struct {
+		token *oauth2.Token
+		err   error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		token, err := ts.Token()
+		ch <- result{token, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case r := <-ch:
+		return r.token, r.err
+	}
 }
 
 // newGCPTokenSource builds the token source used to acquire GCP access

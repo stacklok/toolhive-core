@@ -96,6 +96,17 @@ func TestConfig_Validate(t *testing.T) {
 			wantErr: testErrRegionConfigured,
 		},
 		{
+			name: testCaseMultipleBackend,
+			cfg: &Config{
+				Host: "h", Port: 5432, User: "u", Database: "d",
+				DynamicAuth: &DynamicAuthConfig{
+					AWSRDSIAM: &DynamicAuthAWSRDSIAM{Region: testRegion},
+					AzureAD:   &DynamicAuthAzureAD{},
+				},
+			},
+			wantErr: testErrMultipleBackend,
+		},
+		{
 			name: "valid minimal config",
 			cfg:  validConfig(),
 		},
@@ -105,6 +116,24 @@ func TestConfig_Validate(t *testing.T) {
 				Host: "h", Port: 5432, User: "u", Database: "d",
 				DynamicAuth: &DynamicAuthConfig{
 					AWSRDSIAM: &DynamicAuthAWSRDSIAM{Region: testRegion},
+				},
+			},
+		},
+		{
+			name: "valid with Azure AD",
+			cfg: &Config{
+				Host: "h", Port: 5432, User: "u", Database: "d",
+				DynamicAuth: &DynamicAuthConfig{
+					AzureAD: &DynamicAuthAzureAD{},
+				},
+			},
+		},
+		{
+			name: "valid with GCP Cloud SQL IAM",
+			cfg: &Config{
+				Host: "h", Port: 5432, User: "u", Database: "d",
+				DynamicAuth: &DynamicAuthConfig{
+					GCPCloudSQLIAM: &DynamicAuthGCPCloudSQLIAM{},
 				},
 			},
 		},

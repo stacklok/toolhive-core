@@ -29,7 +29,8 @@ remains the caller's responsibility.
 # Dynamic Authentication
 
 Setting Config.DynamicAuth causes NewPool to install a BeforeConnect hook
-that resolves a fresh credential before every connection attempt.
+that resolves a fresh credential before every connection attempt. Exactly
+one backend must be configured.
 
 Currently supported backends:
 
@@ -37,10 +38,29 @@ Currently supported backends:
     AWS credentials (env vars, EC2 instance profile, EKS web identity, …).
     Region "detect" auto-discovers the region via IMDS.
 
-Example:
+  - Azure Entra ID (formerly Azure AD) — OAuth2 tokens for Azure Database
+    for PostgreSQL, acquired via DefaultAzureCredential's normal chain
+    (environment variables, workload identity, managed identity, Azure
+    CLI, …). AZURE_CLIENT_ID selects a user-assigned managed identity.
+
+  - GCP Cloud SQL IAM — OAuth2 tokens minted from ambient Application
+    Default Credentials, connecting over a direct TCP+TLS connection. This
+    is NOT the Cloud SQL Go connector (cloudsqlconn): it requires the
+    instance to have a reachable IP (public, or private with direct
+    network routing) and does not get Cloud SQL's automatic mTLS tunnel.
+
+Examples:
 
 	cfg.DynamicAuth = &postgres.DynamicAuthConfig{
 	    AWSRDSIAM: &postgres.DynamicAuthAWSRDSIAM{Region: "us-east-1"},
+	}
+
+	cfg.DynamicAuth = &postgres.DynamicAuthConfig{
+	    AzureAD: &postgres.DynamicAuthAzureAD{},
+	}
+
+	cfg.DynamicAuth = &postgres.DynamicAuthConfig{
+	    GCPCloudSQLIAM: &postgres.DynamicAuthGCPCloudSQLIAM{},
 	}
 
 For short-lived connections that cannot use a pool hook (for example

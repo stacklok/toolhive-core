@@ -48,6 +48,17 @@ func TestNewAuthToken(t *testing.T) {
 			},
 			wantErr: testErrRegionMissing,
 		},
+		{
+			name: testCaseMultipleBackend,
+			cfg: &Config{
+				Host: "h", Port: 5432, User: "u", Database: "d",
+				DynamicAuth: &DynamicAuthConfig{
+					AWSRDSIAM:      &DynamicAuthAWSRDSIAM{Region: testRegion},
+					GCPCloudSQLIAM: &DynamicAuthGCPCloudSQLIAM{},
+				},
+			},
+			wantErr: testErrMultipleBackend,
+		},
 	}
 
 	for _, tt := range tests {
@@ -101,6 +112,17 @@ func TestNewDynamicAuthFunc(t *testing.T) {
 				},
 			},
 			wantErr: testErrRegionMissing,
+		},
+		{
+			name: testCaseMultipleBackend,
+			cfg: &Config{
+				Host: "h", Port: 5432, User: "u", Database: "d",
+				DynamicAuth: &DynamicAuthConfig{
+					AzureAD:        &DynamicAuthAzureAD{},
+					GCPCloudSQLIAM: &DynamicAuthGCPCloudSQLIAM{},
+				},
+			},
+			wantErr: testErrMultipleBackend,
 		},
 	}
 
