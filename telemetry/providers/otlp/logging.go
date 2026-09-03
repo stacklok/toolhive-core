@@ -7,14 +7,23 @@ import (
 	"context"
 	"fmt"
 
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	"go.opentelemetry.io/otel/log"
 	lognoop "go.opentelemetry.io/otel/log/noop"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
+	"google.golang.org/grpc/credentials"
 )
 
 func createLogExporter(ctx context.Context, config Config) (sdklog.Exporter, error) {
+	if config.isGRPC() {
+		return createGRPCLogExporter(ctx, config)
+	}
+	return createHTTPLogExporter(ctx, config)
+}
+
+func createHTTPLogExporter(ctx context.Context, config Config) (sdklog.Exporter, error) {
 	host, basePath := splitEndpointPath(config.Endpoint)
 	opts := []otlploghttp.Option{
 		otlploghttp.WithEndpoint(host),
@@ -41,6 +50,38 @@ func createLogExporter(ctx context.Context, config Config) (sdklog.Exporter, err
 	}
 
 	exporter, err := otlploghttp.New(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create log exporter: %w", err)
+	}
+	return exporter, nil
+}
+
+// createGRPCLogExporter builds an OTLP/gRPC log exporter. See the comment on
+// createGRPCTraceExporter for why a base path in config.Endpoint is silently
+// ignored under gRPC.
+func createGRPCLogExporter(ctx context.Context, config Config) (sdklog.Exporter, error) {
+	host, _ := splitEndpointPath(config.Endpoint)
+	opts := []otlploggrpc.Option{
+		otlploggrpc.WithEndpoint(host),
+	}
+
+	if len(config.Headers) > 0 {
+		opts = append(opts, otlploggrpc.WithHeaders(config.Headers))
+	}
+
+	if config.Insecure {
+		opts = append(opts, otlploggrpc.WithInsecure())
+	}
+
+	if config.CACertPath != "" {
+		tlsCfg, err := newTLSConfigFromCA(config.CACertPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to configure TLS for log exporter: %w", err)
+		}
+		opts = append(opts, otlploggrpc.WithTLSCredentials(credentials.NewTLS(tlsCfg)))
+	}
+
+	exporter, err := otlploggrpc.New(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create log exporter: %w", err)
 	}

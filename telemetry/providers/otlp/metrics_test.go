@@ -5,9 +5,11 @@ package otlp
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCreateMetricExporter(t *testing.T) {
@@ -81,6 +83,52 @@ func TestCreateMetricExporter(t *testing.T) {
 				// Clean up
 				_ = exporter.Shutdown(ctx)
 			}
+		})
+	}
+}
+
+func TestCreateMetricExporter_ProtocolSelection(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		protocol string
+		wantType string
+	}{
+		{
+			name:     testNameProtocolUnsetDefaultsHTTP,
+			protocol: "",
+			wantType: "*otlpmetrichttp.Exporter",
+		},
+		{
+			name:     testNameProtocolExplicitHTTP,
+			protocol: ProtocolHTTPProtobuf,
+			wantType: "*otlpmetrichttp.Exporter",
+		},
+		{
+			name:     testNameProtocolGRPC,
+			protocol: ProtocolGRPC,
+			wantType: "*otlpmetricgrpc.Exporter",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			config := Config{
+				Endpoint: testEndpointLocal,
+				Insecure: true,
+				Protocol: tt.protocol,
+			}
+
+			exporter, err := createMetricExporter(ctx, config)
+			require.NoError(t, err)
+			require.NotNil(t, exporter)
+			defer func() { _ = exporter.Shutdown(ctx) }()
+
+			assert.Equal(t, tt.wantType, fmt.Sprintf("%T", exporter))
 		})
 	}
 }
