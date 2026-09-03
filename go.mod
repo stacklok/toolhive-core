@@ -44,7 +44,7 @@ require (
 	github.com/lestrrat-go/jwx/v3 v3.2.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/secure-systems-lab/go-securesystemslib v0.11.1
-	github.com/shirou/gopsutil/v4 v4.26.7
+	github.com/shirou/gopsutil/v4 v4.26.8
 	github.com/sigstore/rekor v1.5.4
 	github.com/sigstore/sigstore v1.10.9
 	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp v0.22.0
