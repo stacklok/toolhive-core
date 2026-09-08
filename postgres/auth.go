@@ -31,10 +31,19 @@ func NewAuthToken(ctx context.Context, cfg *Config, user string) (string, error)
 	if cfg.DynamicAuth == nil {
 		return "", nil
 	}
-	if cfg.DynamicAuth.AWSRDSIAM != nil {
-		return awsRDSIAMToken(ctx, cfg, user)
+	if err := singleDynamicAuthBackend(cfg.DynamicAuth); err != nil {
+		return "", err
 	}
-	return "", errors.New("dynamicAuth is set but no supported auth method (e.g., awsRdsIam) is configured")
+	switch {
+	case cfg.DynamicAuth.AWSRDSIAM != nil:
+		return awsRDSIAMToken(ctx, cfg, user)
+	case cfg.DynamicAuth.AzureAD != nil:
+		return azureADToken(ctx)
+	case cfg.DynamicAuth.GCPCloudSQLIAM != nil:
+		return gcpCloudSQLIAMToken(ctx)
+	default:
+		return "", errors.New("unreachable: singleDynamicAuthBackend guarantees exactly one backend is set")
+	}
 }
 
 // NewDynamicAuthFunc returns a BeforeConnect hook that resolves a fresh
@@ -52,10 +61,19 @@ func NewDynamicAuthFunc(ctx context.Context, cfg *Config, user string) (BeforeCo
 	if cfg.DynamicAuth == nil {
 		return nil, errors.New("dynamic authentication is not configured")
 	}
-	if cfg.DynamicAuth.AWSRDSIAM != nil {
-		return awsRDSIAMBeforeConnect(ctx, cfg, user)
+	if err := singleDynamicAuthBackend(cfg.DynamicAuth); err != nil {
+		return nil, err
 	}
-	return nil, errors.New("dynamicAuth is set but no supported auth method (e.g., awsRdsIam) is configured")
+	switch {
+	case cfg.DynamicAuth.AWSRDSIAM != nil:
+		return awsRDSIAMBeforeConnect(ctx, cfg, user)
+	case cfg.DynamicAuth.AzureAD != nil:
+		return azureADBeforeConnect()
+	case cfg.DynamicAuth.GCPCloudSQLIAM != nil:
+		return gcpCloudSQLIAMBeforeConnect()
+	default:
+		return nil, errors.New("unreachable: singleDynamicAuthBackend guarantees exactly one backend is set")
+	}
 }
 
 // wrapAuthError prefixes dynamic-auth errors with a consistent label so they

@@ -95,6 +95,19 @@ type Config struct {
 type DynamicAuthConfig struct {
 	// AWSRDSIAM enables AWS RDS IAM authentication tokens.
 	AWSRDSIAM *DynamicAuthAWSRDSIAM
+
+	// AzureAD enables Azure Entra ID (formerly Azure AD) authentication
+	// tokens for Azure Database for PostgreSQL.
+	AzureAD *DynamicAuthAzureAD
+
+	// GCPCloudSQLIAM enables GCP Cloud SQL IAM database authentication
+	// tokens over a direct TCP+TLS connection. This is NOT the Cloud SQL Go
+	// connector (cloudsqlconn): it requires the instance to have a reachable
+	// IP (public, or private with direct network routing) and does not get
+	// Cloud SQL's automatic mTLS tunnel. Instances reachable only through
+	// the connector need a different integration this package does not
+	// provide.
+	GCPCloudSQLIAM *DynamicAuthGCPCloudSQLIAM
 }
 
 // DynamicAuthAWSRDSIAM configures AWS RDS IAM dynamic authentication.
@@ -102,6 +115,51 @@ type DynamicAuthAWSRDSIAM struct {
 	// Region is the AWS region used to sign IAM tokens. Use "detect" to
 	// auto-discover the region from the EC2 instance metadata service (IMDS).
 	Region string
+}
+
+// DynamicAuthAzureAD configures Azure Entra ID (formerly Azure AD)
+// authentication for Azure Database for PostgreSQL. It has no fields: the
+// token is minted from DefaultAzureCredential's normal resolution order
+// (environment variables — including AZURE_CLIENT_ID to select a
+// user-assigned managed identity — workload identity, system-assigned
+// managed identity, Azure CLI, ...).
+type DynamicAuthAzureAD struct{}
+
+// DynamicAuthGCPCloudSQLIAM configures GCP Cloud SQL IAM database
+// authentication. It has no fields: the token is minted from ambient
+// Application Default Credentials, scoped for Cloud SQL login.
+type DynamicAuthGCPCloudSQLIAM struct{}
+
+// countDynamicAuthBackends returns how many backend fields on da are set.
+func countDynamicAuthBackends(da *DynamicAuthConfig) int {
+	n := 0
+	if da.AWSRDSIAM != nil {
+		n++
+	}
+	if da.AzureAD != nil {
+		n++
+	}
+	if da.GCPCloudSQLIAM != nil {
+		n++
+	}
+	return n
+}
+
+// singleDynamicAuthBackend rejects a DynamicAuthConfig with zero or more than
+// one backend configured. Config.Validate calls this, and so do NewAuthToken
+// and NewDynamicAuthFunc: a caller may build a Config and mint a one-shot
+// token (for example, a migration tool) without going through Validate
+// first, so the dispatchers re-check rather than assuming an ambiguous
+// configuration was already caught upstream.
+func singleDynamicAuthBackend(da *DynamicAuthConfig) error {
+	switch n := countDynamicAuthBackends(da); {
+	case n == 0:
+		return errors.New("dynamicAuth is set but no supported auth method (e.g., awsRdsIam, azureAd, gcpCloudSqlIam) is configured")
+	case n > 1:
+		return errors.New("dynamicAuth must configure exactly one auth method, but more than one is set")
+	default:
+		return nil
+	}
 }
 
 // Validate checks Config for required-field and consistency errors and
@@ -129,10 +187,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("database must not contain any of %q or whitespace", databaseForbiddenChars)
 	}
 	if c.DynamicAuth != nil {
-		if c.DynamicAuth.AWSRDSIAM == nil {
-			return errors.New("dynamicAuth is set but no supported auth method (e.g., awsRdsIam) is configured")
+		if err := singleDynamicAuthBackend(c.DynamicAuth); err != nil {
+			return err
 		}
-		if c.DynamicAuth.AWSRDSIAM.Region == "" {
+		if c.DynamicAuth.AWSRDSIAM != nil && c.DynamicAuth.AWSRDSIAM.Region == "" {
 			return errors.New("dynamicAuth.awsRdsIam.region is required")
 		}
 	}
