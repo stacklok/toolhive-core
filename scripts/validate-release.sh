@@ -33,9 +33,20 @@ if [ "$actual" != "$expected" ]; then
 	exit 1
 fi
 
-if grep -Eq '^[[:space:]]*github\.com/stacklok/toolhive-core/redisconn(/(aws|azure|gcp))?[[:space:]]+v0\.0\.0([[:space:]]|$)' "$manifest"; then
-	echo "$manifest retains a development-only v0.0.0 Redis sibling requirement; prepare and pin released sibling versions before tagging $tag" >&2
-	exit 1
-fi
+requirements=$(awk '
+	$1 == "require" && $2 == "(" { in_require = 1; next }
+	in_require && $1 == ")" { in_require = 0; next }
+	in_require && $1 ~ /^github\.com\/stacklok\/toolhive-core\/redisconn(\/(aws|azure|gcp))?$/ { print $1, $2; next }
+	$1 == "require" && $2 ~ /^github\.com\/stacklok\/toolhive-core\/redisconn(\/(aws|azure|gcp))?$/ { print $2, $3 }
+' "$manifest")
+
+printf '%s\n' "$requirements" | while read -r module required_version; do
+	[ -n "$module" ] || continue
+	required_tag=${module#github.com/stacklok/toolhive-core/}/$required_version
+	if ! git rev-parse --verify --quiet "refs/tags/$required_tag^{commit}" >/dev/null; then
+		echo "$manifest requires $module $required_version, but released tag $required_tag is not available locally; fetch required previous tags before tagging $tag" >&2
+		exit 1
+	fi
+done
 
 echo "release manifest validation passed for $tag ($manifest)"

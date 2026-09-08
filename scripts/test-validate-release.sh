@@ -6,6 +6,21 @@ set -eu
 
 ./scripts/validate-release.sh redisconn/v1.2.3 >/dev/null
 
+if (
+	cd scripts/testdata/release-nonzero
+	../../../scripts/validate-release.sh redisconn/aws/v1.2.3 >/dev/null 2>&1
+); then
+	echo "provider release unexpectedly accepted a nonexistent non-zero core version" >&2
+	exit 1
+fi
+if (
+	cd scripts/testdata/release-nonzero
+	../../../scripts/validate-release.sh v1.2.3 >/dev/null 2>&1
+); then
+	echo "root release unexpectedly accepted nonexistent non-zero child versions" >&2
+	exit 1
+fi
+
 if ./scripts/validate-release.sh v1.2.3 >/dev/null 2>&1; then
 	echo "root release unexpectedly accepted development sibling versions" >&2
 	exit 1

@@ -120,7 +120,9 @@ Before creating or pushing a release tag, check out the exact commit to be tagge
 ./scripts/validate-release.sh <intended-tag>
 ```
 
-The intended tag must use the module's tag prefix (for example, `v1.2.3`, `redisconn/v1.2.3`, or `redisconn/aws/v1.2.3`). Release operators can obtain an auditable preflight result by manually dispatching the **Release** workflow with the same intended tag and the commit SHA or ref that will receive it. Create and push the tag only after the local check and, when used, the manual preflight pass against that intended commit.
+The intended tag must use the module's tag prefix (for example, `v1.2.3`, `redisconn/v1.2.3`, or `redisconn/aws/v1.2.3`). Every required sibling module version must already have an exact module-prefixed release tag available in the local clone; fetch the required previous tags before running the check. The script only inspects local Git state and makes no network calls.
+
+For an auditable preflight result, manually dispatch the **Release** workflow with the same intended tag and the full 40-character lowercase commit SHA that will receive it. The workflow rejects branch names, tag names, abbreviated SHAs, and uppercase SHAs, verifies that the input resolves to a commit, and checks out that exact commit. Create and push the tag only after the local check and, when used, the manual preflight pass against that SHA.
 
 The tag-triggered Release workflow repeats validation after a tag is pushed. This post-tag check is defense in depth; it detects an invalid release but is not the pre-tag control.
 
