@@ -170,8 +170,13 @@ func TestBuildTLSConfig(t *testing.T) {
 				if got != nil {
 					t.Fatal("nil config enabled TLS")
 				}
-			} else if got.MinVersion != tls.VersionTLS12 {
-				t.Fatalf("MinVersion = %d", got.MinVersion)
+			} else {
+				if got.MinVersion != tls.VersionTLS12 {
+					t.Fatalf("MinVersion = %d", got.MinVersion)
+				}
+				if tt.name == "system roots" && got.RootCAs != nil {
+					t.Fatal("RootCAs is non-nil; nil is required for standard-library system root discovery")
+				}
 			}
 		})
 	}
@@ -286,19 +291,30 @@ func TestBuildClusterAndSentinelTLSOptions(t *testing.T) {
 	sentinelMaterial := newTestTLSMaterial(t)
 	masterAddr, masterDone := startTLSServer(t, masterMaterial.serverCertificate)
 	sentinelAddr, sentinelDone := startTLSServer(t, sentinelMaterial.serverCertificate)
-	masterTLS, err := BuildTLSConfig(&TLSConfig{CACert: masterMaterial.caPEM})
+	sentinelCfg := &Config{
+		SentinelConfig: &SentinelConfig{MasterName: "main", SentinelAddrs: []string{sentinelAddr}},
+		TLS:            &TLSConfig{CACert: masterMaterial.caPEM}, SentinelTLS: &TLSConfig{CACert: sentinelMaterial.caPEM},
+	}
+	sentinelCfg.applyDefaults()
+	sentinelOpts, err := buildSentinelOptions(sentinelCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sentinelTLS, err := BuildTLSConfig(&TLSConfig{CACert: sentinelMaterial.caPEM})
-	if err != nil {
-		t.Fatal(err)
+	dial := sentinelOpts.Dialer
+	if dial == nil {
+		t.Fatal("sentinel FailoverOptions did not install the separately scoped TLS dialer")
 	}
-	dial := newTLSDialer(masterTLS, sentinelTLS, []string{sentinelAddr}, time.Second)
-	for _, addr := range []string{masterAddr, sentinelAddr} {
-		conn, dialErr := dial(t.Context(), "tcp", addr)
+	addresses := []struct {
+		name string
+		addr string
+	}{
+		{name: "data node", addr: masterAddr},
+		{name: "sentinel", addr: sentinelAddr},
+	}
+	for _, endpoint := range addresses {
+		conn, dialErr := dial(t.Context(), "tcp", endpoint.addr)
 		if dialErr != nil {
-			t.Fatalf("dial %s: %v", addr, dialErr)
+			t.Fatalf("dial %s with configured FailoverOptions dialer: %v", endpoint.name, dialErr)
 		}
 		_ = conn.Close()
 	}
@@ -307,20 +323,6 @@ func TestBuildClusterAndSentinelTLSOptions(t *testing.T) {
 	}
 	if err := <-sentinelDone; err != nil {
 		t.Fatalf("sentinel TLS handshake: %v", err)
-	}
-
-	sentinelCfg := &Config{
-		SentinelConfig: &SentinelConfig{MasterName: "main", SentinelAddrs: []string{sentinelAddr}},
-		TLS:            &TLSConfig{CACert: masterMaterial.caPEM}, SentinelTLS: &TLSConfig{CACert: sentinelMaterial.caPEM},
-	}
-	sentinelCfg.applyDefaults()
-	sentinel, err := buildSentinelClient(sentinelCfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = sentinel.Close() })
-	if sentinel.(*goredis.Client).Options().Dialer == nil {
-		t.Fatal("sentinel client did not install the separately scoped TLS dialer")
 	}
 }
 

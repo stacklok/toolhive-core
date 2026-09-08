@@ -120,6 +120,14 @@ func buildClusterClient(cfg *Config) (goredis.UniversalClient, error) {
 // connections. go-redis does not copy CredentialsProviderContext into its
 // internal Sentinel options, unlike OnConnect.
 func buildSentinelClient(cfg *Config) (goredis.UniversalClient, error) {
+	opts, err := buildSentinelOptions(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return goredis.NewFailoverClient(opts), nil
+}
+
+func buildSentinelOptions(cfg *Config) (*goredis.FailoverOptions, error) {
 	provider, lifetime := dynamicAuthOptions(cfg)
 	opts := &goredis.FailoverOptions{
 		MasterName: cfg.SentinelConfig.MasterName, SentinelAddrs: cfg.SentinelConfig.SentinelAddrs,
@@ -132,7 +140,7 @@ func buildSentinelClient(cfg *Config) (goredis.UniversalClient, error) {
 			return nil, err
 		}
 	}
-	return goredis.NewFailoverClient(opts), nil
+	return opts, nil
 }
 
 func configureTLSDialer(opts *goredis.FailoverOptions, masterCfg, sentinelCfg *TLSConfig) error {

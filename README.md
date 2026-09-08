@@ -112,6 +112,22 @@ For packages with external dependencies, multiple types, or broader API surface:
 - **Minor (v0.X.0)**: New features, backward-compatible
 - **Patch (v0.0.X)**: Bug fixes, backward-compatible
 
+### Release preflight
+
+Before creating or pushing a release tag, check out the exact commit to be tagged and run:
+
+```bash
+./scripts/validate-release.sh <intended-tag>
+```
+
+The intended tag must use the module's tag prefix (for example, `v1.2.3`, `redisconn/v1.2.3`, or `redisconn/aws/v1.2.3`). Release operators can obtain an auditable preflight result by manually dispatching the **Release** workflow with the same intended tag and the commit SHA or ref that will receive it. Create and push the tag only after the local check and, when used, the manual preflight pass against that intended commit.
+
+The tag-triggered Release workflow repeats validation after a tag is pushed. This post-tag check is defense in depth; it detects an invalid release but is not the pre-tag control.
+
+### Unresolved release risks
+
+Repository workflows cannot prevent an authorized user from directly pushing a tag without performing the preflight. Access controls and release-operator procedure must enforce the required pre-tag check; the post-tag workflow can only report failure after the tag exists.
+
 ## License
 
 Apache-2.0 - See [LICENSE](LICENSE) for details.
