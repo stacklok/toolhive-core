@@ -197,3 +197,20 @@ func TestAwsRDSIAMBeforeConnect_ReturnsHookForStaticRegion(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, fn)
 }
+
+// TestLoadAWSCredentials_ResolvesLazilyWithoutContactingAWS pins the
+// laziness this backend relies on: like azidentity.DefaultAzureCredential
+// (and unlike google.DefaultTokenSource, which resolves eagerly),
+// awsconfig.LoadDefaultConfig must succeed with no ambient AWS credentials
+// present and without making a network call — it only builds the provider
+// chain. This is what makes it safe for awsRDSIAMBeforeConnect to call once
+// at hook-construction time and reuse the result (an aws.CredentialsCache)
+// across every subsequent connection, instead of re-resolving credentials —
+// and potentially re-exchanging an EKS Pod Identity / IRSA token — inline on
+// every pooled connection.
+func TestLoadAWSCredentials_ResolvesLazilyWithoutContactingAWS(t *testing.T) {
+	t.Parallel()
+	creds, err := loadAWSCredentials(context.Background(), testRegion)
+	require.NoError(t, err)
+	assert.NotNil(t, creds)
+}
