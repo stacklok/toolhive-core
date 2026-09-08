@@ -20,6 +20,7 @@ const (
 )
 
 func TestConfigValidate(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		cfg  Config
@@ -35,6 +36,7 @@ func TestConfigValidate(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := tt.cfg.Validate()
 			if tt.want == "" && err != nil {
 				t.Fatalf("Validate() error = %v", err)
@@ -47,6 +49,7 @@ func TestConfigValidate(t *testing.T) {
 }
 
 func TestResolveRegion(t *testing.T) {
+	t.Parallel()
 	region, err := resolveRegion(t.Context(), testRegion)
 	if err != nil || region != testRegion {
 		t.Fatalf("resolveRegion() = %q, %v", region, err)
@@ -66,6 +69,7 @@ var fakeCredentials = awssdk.CredentialsProviderFunc(func(context.Context) (awss
 })
 
 func TestBuildToken(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name, service, resource string
 	}{
@@ -75,6 +79,7 @@ func TestBuildToken(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			token, err := buildToken(t.Context(), fakeCredentials, testRegion, tt.service, testCluster, tt.resource, testUser)
 			if err != nil {
 				t.Fatal(err)
@@ -101,6 +106,7 @@ func TestBuildToken(t *testing.T) {
 }
 
 func TestDynamicAuthLifetimeAndCredentials(t *testing.T) {
+	t.Parallel()
 	cfg := Config{Username: testUser, Region: testRegion, ClusterName: testCluster}
 	auth := dynamicAuth(cfg, fakeCredentials, testRegion, ServiceElastiCache)
 	if auth.ConnMaxLifetime != DefaultConnMaxLifetime {
@@ -113,6 +119,7 @@ func TestDynamicAuthLifetimeAndCredentials(t *testing.T) {
 }
 
 func TestCredentialErrorIsRedacted(t *testing.T) {
+	t.Parallel()
 	const secret = "private-credential-value"
 	provider := awssdk.CredentialsProviderFunc(func(context.Context) (awssdk.Credentials, error) {
 		return awssdk.Credentials{}, errors.New("credential retrieval failed")

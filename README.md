@@ -32,7 +32,12 @@ The ToolHive ecosystem spans multiple Go repositories, and several of these proj
 | `oci/plugins` | Alpha | OCI artifact types, media types, and registry operations for plugins |
 | `authn` | Alpha | Inbound OIDC/JWT bearer-token validation for resource servers |
 | `networking` | Alpha | Outbound HTTP client construction with SSRF egress policy: private-IP/link-local dial blocking, redirect policy, body-capped JSON fetch, endpoint/issuer URL + private-IP validation helpers, and port allocation/validation utilities |
-| `postgres` | Alpha | PostgreSQL connection pool with optional AWS RDS IAM dynamic auth |
+| `postgres` | Alpha | PostgreSQL connection pool with optional cloud IAM dynamic auth |
+| `redisconn` | Alpha | Lean Redis/Valkey client construction for standalone, cluster, and Sentinel deployments |
+| `redisconn/aws` | Alpha | AWS ElastiCache/MemoryDB IAM credentials for `redisconn` |
+| `redisconn/azure` | Alpha | Azure Entra ID credentials for `redisconn` |
+| `redisconn/gcp` | Alpha | GCP Memorystore IAM credentials for `redisconn` |
+| `redis` | Deprecated | Source-compatible facade; migrate to `redisconn` and a provider child module |
 | `recovery` | Beta | HTTP panic recovery middleware |
 | `validation/http` | Stable | RFC 7230/8707 compliant HTTP header and URI validation |
 | `validation/group` | Stable | Group name validation |

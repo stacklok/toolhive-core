@@ -10,6 +10,7 @@ import (
 	"time"
 )
 
+// Default client timeouts applied when the corresponding Config field is zero.
 const (
 	DefaultDialTimeout  = 5 * time.Second
 	DefaultReadTimeout  = 3 * time.Second
@@ -46,11 +47,13 @@ type Config struct {
 	ConnMaxLifetime time.Duration
 }
 
+// SentinelConfig identifies a Sentinel-managed Redis master.
 type SentinelConfig struct {
 	MasterName    string
 	SentinelAddrs []string
 }
 
+// TLSConfig configures server verification, custom roots, and mutual TLS.
 type TLSConfig struct {
 	InsecureSkipVerify bool
 	CACert             []byte
@@ -106,10 +109,13 @@ func validateDynamicAuth(c *Config) error {
 		return nil
 	}
 	if c.TLS == nil {
-		return errors.New("TLS is required when dynamicAuth is configured (set Config.TLS, or DynamicAuth.AllowInsecureTransport to opt out for trusted local tunneling)")
+		return errors.New("TLS is required when dynamicAuth is configured " +
+			"(set Config.TLS, or DynamicAuth.AllowInsecureTransport to opt out for trusted local tunneling)")
 	}
 	if c.TLS.InsecureSkipVerify {
-		return errors.New("TLS must verify the server certificate when dynamicAuth is configured (InsecureSkipVerify defeats the purpose of a signed token; set DynamicAuth.AllowInsecureTransport to opt out)")
+		return errors.New("TLS must verify the server certificate when dynamicAuth is configured " +
+			"(InsecureSkipVerify defeats the purpose of a signed token; " +
+			"set DynamicAuth.AllowInsecureTransport to opt out)")
 	}
 	return nil
 }

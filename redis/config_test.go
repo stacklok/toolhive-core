@@ -5,10 +5,11 @@ package redis
 
 import (
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/stacklok/toolhive-core/redisconn"
 )
 
 const (
@@ -295,27 +296,7 @@ func TestConfigValidate(t *testing.T) {
 
 func TestConfigApplyDefaults(t *testing.T) {
 	t.Parallel()
-
-	t.Run("zero timeouts get defaults", func(t *testing.T) {
-		t.Parallel()
-		cfg := &Config{Addr: testAddr}
-		cfg.applyDefaults()
-		assert.Equal(t, DefaultDialTimeout, cfg.DialTimeout)
-		assert.Equal(t, DefaultReadTimeout, cfg.ReadTimeout)
-		assert.Equal(t, DefaultWriteTimeout, cfg.WriteTimeout)
-	})
-
-	t.Run("non-zero timeouts are preserved", func(t *testing.T) {
-		t.Parallel()
-		cfg := &Config{
-			Addr:         testAddr,
-			DialTimeout:  10 * time.Second,
-			ReadTimeout:  7 * time.Second,
-			WriteTimeout: 8 * time.Second,
-		}
-		cfg.applyDefaults()
-		assert.Equal(t, 10*time.Second, cfg.DialTimeout)
-		assert.Equal(t, 7*time.Second, cfg.ReadTimeout)
-		assert.Equal(t, 8*time.Second, cfg.WriteTimeout)
-	})
+	assert.Equal(t, redisconn.DefaultDialTimeout, DefaultDialTimeout)
+	assert.Equal(t, redisconn.DefaultReadTimeout, DefaultReadTimeout)
+	assert.Equal(t, redisconn.DefaultWriteTimeout, DefaultWriteTimeout)
 }

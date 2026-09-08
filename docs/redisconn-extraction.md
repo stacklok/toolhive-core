@@ -74,14 +74,18 @@ only where an untagged sibling module is required. These checked-in replacements
 are development-only: Go ignores a dependency module's `replace` directives in
 downstream builds.
 
-Do not fabricate versions. For a coordinated release, tag in dependency order:
+Do not fabricate versions. For a coordinated release, tag in dependency order,
+updating each dependent module's `require` before its tag:
 
-1. `redisconn/vX.Y.Z`
-2. `redisconn/aws/vX.Y.Z`
-3. `redisconn/azure/vX.Y.Z`
-4. `redisconn/gcp/vX.Y.Z`
-5. update or remove the root module's local replacements in favor of the
-   released child versions, then publish a subsequent root tag.
+1. tag `redisconn/vX.Y.Z`;
+2. update the three provider modules from the development-only `redisconn
+   v0.0.0` requirement to that released core version, then tag
+   `redisconn/aws/vX.Y.Z`;
+3. tag `redisconn/azure/vX.Y.Z`;
+4. tag `redisconn/gcp/vX.Y.Z`;
+5. update or remove the root module's local replacements and replace its
+   `v0.0.0` requirements with the released child versions, then publish a
+   subsequent root tag.
 
 Release automation and maintainers must use module-prefixed tags for nested
 modules. No external release is part of this change.

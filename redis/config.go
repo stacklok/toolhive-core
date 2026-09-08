@@ -15,9 +15,9 @@ import (
 // Default timeouts applied by NewClient when the corresponding Config field
 // is zero.
 const (
-	DefaultDialTimeout  = 5 * time.Second
-	DefaultReadTimeout  = 3 * time.Second
-	DefaultWriteTimeout = 3 * time.Second
+	DefaultDialTimeout  = redisconn.DefaultDialTimeout
+	DefaultReadTimeout  = redisconn.DefaultReadTimeout
+	DefaultWriteTimeout = redisconn.DefaultWriteTimeout
 )
 
 // Config configures a Redis client. Exactly one of Addr or SentinelConfig
@@ -56,8 +56,9 @@ type Config struct {
 	// fresh credentials for each connection attempt — during go-redis's
 	// handshake, before RESP3 negotiation and DB selection — and sets
 	// ConnMaxLifetime (when Config's own ConnMaxLifetime is zero) to a value
-	// inside the backend's token TTL so pooled connections are periodically
-	// retired and redialed with current credentials.
+	// inside the backend's token TTL. go-redis retires an over-age pooled
+	// connection lazily when it is reused; this does not proactively refresh
+	// or reauthenticate an open connection.
 	//
 	// Dynamic authentication requires a verified TLS connection (Config.TLS
 	// set, with InsecureSkipVerify false): cloud IAM tokens are bearer
@@ -284,25 +285,4 @@ func validateAWSElastiCacheIAM(username string, iam *DynamicAuthAWSElastiCacheIA
 			awsElastiCacheServerlessResourceType, iam.ResourceType)
 	}
 	return nil
-}
-
-func validateTLSConfig(cfg *TLSConfig) error {
-	if cfg != nil && (len(cfg.ClientCert) == 0) != (len(cfg.ClientKey) == 0) {
-		return errors.New("client certificate and key must be provided together")
-	}
-	return nil
-}
-
-// applyDefaults writes DefaultDialTimeout/ReadTimeout/WriteTimeout into c
-// for any zero-valued timeout field.
-func (c *Config) applyDefaults() {
-	if c.DialTimeout == 0 {
-		c.DialTimeout = DefaultDialTimeout
-	}
-	if c.ReadTimeout == 0 {
-		c.ReadTimeout = DefaultReadTimeout
-	}
-	if c.WriteTimeout == 0 {
-		c.WriteTimeout = DefaultWriteTimeout
-	}
 }

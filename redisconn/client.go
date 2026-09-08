@@ -148,7 +148,11 @@ func configureTLSDialer(opts *goredis.FailoverOptions, masterCfg, sentinelCfg *T
 	return nil
 }
 
-func newTLSDialer(masterTLS, sentinelTLS *tls.Config, sentinelAddrs []string, timeout time.Duration) func(context.Context, string, string) (net.Conn, error) {
+func newTLSDialer(
+	masterTLS, sentinelTLS *tls.Config,
+	sentinelAddrs []string,
+	timeout time.Duration,
+) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		tlsCfg := masterTLS
 		if slices.Contains(sentinelAddrs, addr) {

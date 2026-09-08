@@ -14,7 +14,9 @@ const (
 	awsElastiCacheDefaultServiceName     = redisconnaws.ServiceElastiCache
 	awsElastiCacheMemoryDBServiceName    = redisconnaws.ServiceMemoryDB
 	awsElastiCacheServerlessResourceType = redisconnaws.ResourceTypeServerlessCache
-	DefaultAWSElastiCacheIAMTokenTTL     = redisconnaws.DefaultConnMaxLifetime
+	// DefaultAWSElastiCacheIAMTokenTTL is retained for source compatibility.
+	// Deprecated: use redisconnaws.DefaultConnMaxLifetime.
+	DefaultAWSElastiCacheIAMTokenTTL = redisconnaws.DefaultConnMaxLifetime
 )
 
 func awsElastiCacheIAMCredentialsFunc(ctx context.Context, cfg *Config) (CredentialsFunc, error) {

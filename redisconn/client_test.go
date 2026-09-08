@@ -21,7 +21,10 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
+const testAddr = "redis:6379"
+
 func TestConfigValidate(t *testing.T) {
+	t.Parallel()
 	provider := func(context.Context) (string, string, error) { return "user", "token", nil }
 	tests := []struct {
 		name string
@@ -30,21 +33,22 @@ func TestConfigValidate(t *testing.T) {
 	}{
 		{"nil", nil, "config is nil"},
 		{"missing topology", &Config{}, "one of addr"},
-		{"conflicting topology", &Config{Addr: "redis:6379", SentinelConfig: &SentinelConfig{}}, "mutually exclusive"},
+		{"conflicting topology", &Config{Addr: testAddr, SentinelConfig: &SentinelConfig{}}, "mutually exclusive"},
 		{"sentinel master", &Config{SentinelConfig: &SentinelConfig{SentinelAddrs: []string{"s:26379"}}}, "master name"},
 		{"sentinel addresses", &Config{SentinelConfig: &SentinelConfig{MasterName: "main"}}, "sentinel address"},
-		{"mTLS pair", &Config{Addr: "redis:6379", TLS: &TLSConfig{ClientCert: []byte("cert")}}, "provided together"},
-		{"dynamic provider", &Config{Addr: "redis:6379", DynamicAuth: &DynamicAuth{AllowInsecureTransport: true}}, "credentials provider"},
-		{"dynamic static password", &Config{Addr: "redis:6379", Password: "secret", DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider, AllowInsecureTransport: true}}, "password must not"},
-		{"dynamic plaintext", &Config{Addr: "redis:6379", DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider}}, "TLS is required"},
-		{"dynamic unverified TLS", &Config{Addr: "redis:6379", TLS: &TLSConfig{InsecureSkipVerify: true}, DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider}}, "TLS must verify"},
-		{"dynamic verified TLS", &Config{Addr: "redis:6379", TLS: &TLSConfig{}, DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider}}, ""},
-		{"dynamic insecure opt-out", &Config{Addr: "redis:6379", DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider, AllowInsecureTransport: true}}, ""},
-		{"standalone", &Config{Addr: "redis:6379"}, ""},
-		{"cluster", &Config{Addr: "redis:6379", ClusterMode: true}, ""},
+		{"mTLS pair", &Config{Addr: testAddr, TLS: &TLSConfig{ClientCert: []byte("cert")}}, "provided together"},
+		{"dynamic provider", &Config{Addr: testAddr, DynamicAuth: &DynamicAuth{AllowInsecureTransport: true}}, "credentials provider"},
+		{"dynamic static password", &Config{Addr: testAddr, Password: "secret", DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider, AllowInsecureTransport: true}}, "password must not"},
+		{"dynamic plaintext", &Config{Addr: testAddr, DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider}}, "TLS is required"},
+		{"dynamic unverified TLS", &Config{Addr: testAddr, TLS: &TLSConfig{InsecureSkipVerify: true}, DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider}}, "TLS must verify"},
+		{"dynamic verified TLS", &Config{Addr: testAddr, TLS: &TLSConfig{}, DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider}}, ""},
+		{"dynamic insecure opt-out", &Config{Addr: testAddr, DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider, AllowInsecureTransport: true}}, ""},
+		{"standalone", &Config{Addr: testAddr}, ""},
+		{"cluster", &Config{Addr: testAddr, ClusterMode: true}, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			err := tt.cfg.Validate()
 			if tt.want == "" {
 				if err != nil {
@@ -58,6 +62,7 @@ func TestConfigValidate(t *testing.T) {
 }
 
 func TestNewClientStaticAuthAndDatabase(t *testing.T) {
+	t.Parallel()
 	const password = "test-token"
 	srv := miniredis.RunT(t)
 	srv.RequireAuth(password)
@@ -75,6 +80,7 @@ func TestNewClientStaticAuthAndDatabase(t *testing.T) {
 }
 
 func TestNewClientDynamicAuthReceivesConnectionContext(t *testing.T) {
+	t.Parallel()
 	const password = "dynamic-token"
 	type key struct{}
 	srv := miniredis.RunT(t)
@@ -105,6 +111,7 @@ func TestNewClientDynamicAuthReceivesConnectionContext(t *testing.T) {
 }
 
 func TestNewClientDoesNotMutateAndDefaultsTimeouts(t *testing.T) {
+	t.Parallel()
 	srv := miniredis.RunT(t)
 	cfg := &Config{Addr: srv.Addr()}
 	client, err := NewClient(t.Context(), cfg)
@@ -122,6 +129,7 @@ func TestNewClientDoesNotMutateAndDefaultsTimeouts(t *testing.T) {
 }
 
 func TestNewClientPingFailure(t *testing.T) {
+	t.Parallel()
 	_, err := NewClient(t.Context(), &Config{Addr: "127.0.0.1:1", DialTimeout: 20 * time.Millisecond})
 	if err == nil || !contains(err.Error(), "failed to connect") {
 		t.Fatalf("NewClient() error = %v", err)
@@ -129,6 +137,7 @@ func TestNewClientPingFailure(t *testing.T) {
 }
 
 func TestBuildTLSConfig(t *testing.T) {
+	t.Parallel()
 	caPEM, certPEM, keyPEM := testCertificate(t)
 	tests := []struct {
 		name string
@@ -144,6 +153,7 @@ func TestBuildTLSConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			got, err := BuildTLSConfig(tt.cfg)
 			if tt.want != "" {
 				if err == nil || !contains(err.Error(), tt.want) {
@@ -166,6 +176,7 @@ func TestBuildTLSConfig(t *testing.T) {
 }
 
 func TestSentinelDynamicProviderStaysOnDataNodeOptions(t *testing.T) {
+	t.Parallel()
 	provider := func(context.Context) (string, string, error) { return "user", "token", nil }
 	cfg := &Config{SentinelConfig: &SentinelConfig{MasterName: "main", SentinelAddrs: []string{"s:26379"}}, DynamicAuth: &DynamicAuth{
 		CredentialsProviderContext: provider, AllowInsecureTransport: true,

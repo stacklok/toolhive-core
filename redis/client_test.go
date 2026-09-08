@@ -10,12 +10,14 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/stacklok/toolhive-core/redisconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/stacklok/toolhive-core/redisconn"
 )
 
 func TestNewClientCompatibility(t *testing.T) {
+	t.Parallel()
 	srv := miniredis.RunT(t)
 	client, err := NewClient(t.Context(), &Config{Addr: srv.Addr(), DB: 2})
 	require.NoError(t, err)
@@ -27,6 +29,7 @@ func TestNewClientCompatibility(t *testing.T) {
 }
 
 func TestNewClientCompatibilityErrors(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		cfg  *Config
@@ -38,6 +41,7 @@ func TestNewClientCompatibilityErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			_, err := NewClient(t.Context(), tt.cfg)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tt.want)
@@ -46,15 +50,14 @@ func TestNewClientCompatibilityErrors(t *testing.T) {
 }
 
 func TestBuildTLSConfigCompatibility(t *testing.T) {
+	t.Parallel()
 	got, err := BuildTLSConfig(&TLSConfig{})
 	require.NoError(t, err)
 	assert.Equal(t, uint16(tls.VersionTLS12), got.MinVersion)
-
-	var legacy *TLSConfig = &redisconn.TLSConfig{}
-	assert.NotNil(t, legacy, "TLSConfig remains an exact alias")
 }
 
 func TestLegacyConfigTranslation(t *testing.T) {
+	t.Parallel()
 	provider := CredentialsFunc(func(context.Context) (string, string, error) { return "user", "token", nil })
 	cfg := &Config{
 		Addr: "redis:6379", Username: "user", TLS: &TLSConfig{}, ConnMaxLifetime: time.Minute,

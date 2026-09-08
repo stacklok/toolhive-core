@@ -6,7 +6,6 @@ package redis
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 )
 
@@ -81,10 +80,4 @@ func dynamicAuthConnMaxLifetime(da *DynamicAuthConfig) time.Duration {
 	default:
 		return 0
 	}
-}
-
-// wrapAuthError prefixes dynamic-auth errors with a consistent label so they
-// are easy to spot in client-construction logs.
-func wrapAuthError(backend string, err error) error {
-	return fmt.Errorf("dynamic auth (%s): %w", backend, err)
 }

@@ -15,9 +15,11 @@ import (
 	awssigner "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+
 	"github.com/stacklok/toolhive-core/redisconn"
 )
 
+// AWS IAM signing constants and default connection lifetime.
 const (
 	RegionDetect                = "detect"
 	ServiceElastiCache          = "elasticache"
@@ -111,7 +113,11 @@ func resolveRegion(ctx context.Context, region string) (string, error) {
 	return out.Region, nil
 }
 
-func buildToken(ctx context.Context, credentials awssdk.CredentialsProvider, region, service, cluster, resourceType, username string) (string, error) {
+func buildToken(
+	ctx context.Context,
+	credentials awssdk.CredentialsProvider,
+	region, service, cluster, resourceType, username string,
+) (string, error) {
 	creds, err := credentials.Retrieve(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to retrieve AWS credentials: %w", err)
