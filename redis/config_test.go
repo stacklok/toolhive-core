@@ -294,6 +294,18 @@ func TestConfigValidate(t *testing.T) {
 	}
 }
 
+func TestConfigValidateLegacyDynamicTransportMessage(t *testing.T) {
+	t.Parallel()
+
+	err := (&Config{
+		Addr: testAddr, Username: testDynamicAuthUser,
+		DynamicAuth: &DynamicAuthConfig{AzureAD: &DynamicAuthAzureAD{}},
+	}).Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "DynamicAuthConfig.AllowInsecureTransport")
+	assert.NotContains(t, err.Error(), "or DynamicAuth.AllowInsecureTransport")
+}
+
 func TestConfigApplyDefaults(t *testing.T) {
 	t.Parallel()
 	assert.Equal(t, redisconn.DefaultDialTimeout, DefaultDialTimeout)

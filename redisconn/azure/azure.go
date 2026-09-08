@@ -24,6 +24,7 @@ const (
 
 // Config configures Azure Cache for Redis Entra ID authentication.
 type Config struct {
+	// Username is the Entra principal object ID used as the Redis ACL username.
 	Username string
 }
 

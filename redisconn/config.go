@@ -24,41 +24,61 @@ type CredentialsProvider func(context.Context) (username, password string, err e
 // connection is initialized. ConnMaxLifetime retires over-age connections
 // lazily on reuse; it does not proactively refresh or reauthenticate them.
 type DynamicAuth struct {
+	// CredentialsProviderContext returns credentials for each new connection.
 	CredentialsProviderContext CredentialsProvider
-	ConnMaxLifetime            time.Duration
-	AllowInsecureTransport     bool
+	// ConnMaxLifetime is the provider-recommended maximum connection age. A
+	// non-zero Config.ConnMaxLifetime overrides it.
+	ConnMaxLifetime time.Duration
+	// AllowInsecureTransport permits dynamic credentials without verified TLS.
+	// Use only when a trusted local tunnel supplies transport security.
+	AllowInsecureTransport bool
 }
 
 // Config configures a Redis client. Exactly one of Addr or SentinelConfig must
 // be set. ClusterMode upgrades an Addr-based config to Redis Cluster.
 type Config struct {
-	Addr            string
-	ClusterMode     bool
-	SentinelConfig  *SentinelConfig
-	Username        string
-	Password        string //nolint:gosec // field name, not a hardcoded credential
-	DynamicAuth     *DynamicAuth
-	DB              int
-	DialTimeout     time.Duration
-	ReadTimeout     time.Duration
-	WriteTimeout    time.Duration
-	TLS             *TLSConfig
-	SentinelTLS     *TLSConfig
+	// Addr is the host:port for standalone or cluster mode.
+	Addr string
+	// ClusterMode enables Redis Cluster and requires Addr.
+	ClusterMode bool
+	// SentinelConfig selects Sentinel mode and is mutually exclusive with Addr.
+	SentinelConfig *SentinelConfig
+	// Username and Password are static Redis credentials. Password is mutually
+	// exclusive with DynamicAuth.
+	Username    string
+	Password    string //nolint:gosec // field name, not a hardcoded credential
+	DynamicAuth *DynamicAuth
+	// DB is ignored in cluster mode.
+	DB int
+	// Zero timeouts use the package defaults.
+	DialTimeout  time.Duration
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	// TLS secures Redis data-node connections; SentinelTLS independently secures
+	// Sentinel discovery connections.
+	TLS         *TLSConfig
+	SentinelTLS *TLSConfig
+	// ConnMaxLifetime overrides DynamicAuth.ConnMaxLifetime when non-zero.
 	ConnMaxLifetime time.Duration
 }
 
 // SentinelConfig identifies a Sentinel-managed Redis master.
 type SentinelConfig struct {
-	MasterName    string
+	// MasterName is the monitored Redis master name.
+	MasterName string
+	// SentinelAddrs lists Sentinel host:port endpoints.
 	SentinelAddrs []string
 }
 
 // TLSConfig configures server verification, custom roots, and mutual TLS.
 type TLSConfig struct {
+	// InsecureSkipVerify disables server certificate verification.
 	InsecureSkipVerify bool
-	CACert             []byte
-	ClientCert         []byte
-	ClientKey          []byte
+	// CACert is an optional PEM CA bundle; empty uses system roots.
+	CACert []byte
+	// ClientCert and ClientKey are a PEM mTLS certificate pair.
+	ClientCert []byte
+	ClientKey  []byte
 }
 
 // Validate checks connection topology, TLS, and dynamic-auth safety.

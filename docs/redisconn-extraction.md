@@ -74,18 +74,25 @@ only where an untagged sibling module is required. These checked-in replacements
 are development-only: Go ignores a dependency module's `replace` directives in
 downstream builds.
 
-Do not fabricate versions. For a coordinated release, tag in dependency order,
-updating each dependent module's `require` before its tag:
+The manifests in this extraction commit intentionally use local replacements and
+`v0.0.0` sibling requirements for development. **This commit is not release
+ready and must not be tagged.** The release workflow rejects a tag whose selected
+manifest still has one of those `v0.0.0` Redis sibling requirements.
 
-1. tag `redisconn/vX.Y.Z`;
-2. update the three provider modules from the development-only `redisconn
-   v0.0.0` requirement to that released core version, then tag
-   `redisconn/aws/vX.Y.Z`;
-3. tag `redisconn/azure/vX.Y.Z`;
-4. tag `redisconn/gcp/vX.Y.Z`;
-5. update or remove the root module's local replacements and replace its
-   `v0.0.0` requirements with the released child versions, then publish a
-   subsequent root tag.
+Do not fabricate versions. A coordinated release requires separate preparation
+commits in dependency order:
+
+1. tag the provider-neutral module first as `redisconn/vX.Y.Z` (its manifest has
+   no sibling requirement);
+2. create a follow-up provider-module release-preparation commit that pins each
+   provider's `redisconn v0.0.0` requirement to that released core version (and
+   removes its development-only local replacement), then tag that commit as
+   `redisconn/aws/vX.Y.Z`, `redisconn/azure/vX.Y.Z`, and
+   `redisconn/gcp/vX.Y.Z`;
+3. after all provider tags exist, create a root compatibility-release preparation
+   commit that pins `redisconn` and all provider requirements to their released
+   versions (and removes the development-only local replacements), then apply
+   the root `vX.Y.Z` tag to that later commit.
 
 Release automation and maintainers must use module-prefixed tags for nested
 modules. No external release is part of this change.

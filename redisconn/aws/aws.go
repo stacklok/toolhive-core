@@ -33,10 +33,15 @@ const (
 
 // Config configures AWS IAM token signing.
 type Config struct {
-	Username     string
-	Region       string
-	ClusterName  string
-	ServiceName  string
+	// Username is the Redis IAM user included in AUTH and the signed token.
+	Username string
+	// Region signs the token; RegionDetect resolves it from EC2 IMDS.
+	Region string
+	// ClusterName is the ElastiCache cache or MemoryDB cluster name.
+	ClusterName string
+	// ServiceName is empty/ServiceElastiCache or ServiceMemoryDB.
+	ServiceName string
+	// ResourceType is empty, or ResourceTypeServerlessCache for serverless caches.
 	ResourceType string
 }
 

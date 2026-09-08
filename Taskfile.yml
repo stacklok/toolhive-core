@@ -11,6 +11,7 @@ tasks:
   redisconn-modules:
     desc: Verify and test independently versioned Redis modules
     cmds:
+      - ./scripts/test-validate-release.sh
       - ./scripts/check-redisconn-modules.sh
       - cd redisconn && GOWORK=off go mod tidy && GOWORK=off go mod verify && GOWORK=off go test -race ./... && GOWORK=off go vet ./...
       - cd redisconn/aws && GOWORK=off go mod tidy && GOWORK=off go mod verify && GOWORK=off go test -race ./... && GOWORK=off go vet ./...

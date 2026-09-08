@@ -22,6 +22,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Validate tagged module manifest
+        run: ./scripts/validate-release.sh "${{ github.ref_name }}"
+
       # toolhive-core is a shared library: a pre-release go-sdk require
       # propagates to every downstream consumer via MVS. Warn on release so
       # it's obvious a go-sdk pre-release is pinned (see the inline comment

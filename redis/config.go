@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/stacklok/toolhive-core/redisconn"
@@ -219,7 +220,9 @@ func (c *Config) Validate() error {
 		AllowInsecureTransport:     c.DynamicAuth.AllowInsecureTransport,
 	}
 	if err := base.Validate(); err != nil {
-		return err
+		// Keep the legacy facade's public configuration name in compatibility errors.
+		return errors.New(strings.ReplaceAll(err.Error(),
+			"DynamicAuth.AllowInsecureTransport", "DynamicAuthConfig.AllowInsecureTransport"))
 	}
 	switch {
 	case c.DynamicAuth.AWSElastiCacheIAM != nil:

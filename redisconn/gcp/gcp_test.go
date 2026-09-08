@@ -16,12 +16,16 @@ import (
 const testAccessToken = "access-token"
 
 type tokenSource struct {
-	unblock chan struct{}
-	token   *oauth2.Token
-	err     error
+	unblock  chan struct{}
+	returned chan struct{}
+	token    *oauth2.Token
+	err      error
 }
 
 func (s *tokenSource) Token() (*oauth2.Token, error) {
+	if s.returned != nil {
+		defer close(s.returned)
+	}
 	if s.unblock != nil {
 		<-s.unblock
 	}
@@ -68,6 +72,11 @@ func TestTokenWithContext(t *testing.T) {
 			ctx := t.Context()
 			if tt.cancel {
 				source.unblock = make(chan struct{})
+				source.returned = make(chan struct{})
+				t.Cleanup(func() {
+					close(source.unblock)
+					<-source.returned
+				})
 				canceled, cancel := context.WithCancel(ctx)
 				cancel()
 				ctx = canceled
@@ -100,7 +109,11 @@ func TestDynamicAuthTokenOnlyAndLifetime(t *testing.T) {
 
 func TestDynamicAuthHonorsCancellation(t *testing.T) {
 	t.Parallel()
-	source := &tokenSource{unblock: make(chan struct{})}
+	source := &tokenSource{unblock: make(chan struct{}), returned: make(chan struct{})}
+	t.Cleanup(func() {
+		close(source.unblock)
+		<-source.returned
+	})
 	auth := dynamicAuth(source)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()

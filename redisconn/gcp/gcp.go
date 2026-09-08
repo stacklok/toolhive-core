@@ -23,6 +23,7 @@ const (
 
 // Config explicitly selects token-only Memorystore IAM authentication.
 type Config struct {
+	// MemorystoreIAM must be true to explicitly select token-only IAM auth.
 	MemorystoreIAM bool
 }
 
@@ -34,9 +35,10 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// NewDynamicAuth resolves Application Default Credentials eagerly, preserving
-// the token source with a client-lifetime context. Per-connection cancellation
-// is still honored while obtaining a token.
+// NewDynamicAuth resolves Application Default Credentials eagerly and retains
+// their token source for the client lifetime. A canceled connection context
+// makes the callback return promptly, but oauth2.TokenSource has no context-aware
+// Token method, so cancellation cannot interrupt an in-progress Token call.
 func NewDynamicAuth(cfg Config) (*redisconn.DynamicAuth, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, wrapError(err)

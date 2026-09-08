@@ -13,11 +13,13 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"net"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	miniredisserver "github.com/alicebob/miniredis/v2/server"
 	goredis "github.com/redis/go-redis/v9"
 )
 
@@ -194,6 +196,213 @@ func TestSentinelDynamicProviderStaysOnDataNodeOptions(t *testing.T) {
 	if opts.OnConnect != nil {
 		t.Fatal("OnConnect would propagate to Sentinel connections")
 	}
+}
+
+func TestNewClientTLSCustomCAAndMutualTLS(t *testing.T) {
+	t.Parallel()
+	material := newTestTLSMaterial(t)
+	srv, err := miniredis.RunTLS(&tls.Config{
+		MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{material.serverCertificate},
+		ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: material.caPool,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+
+	client, err := NewClient(t.Context(), &Config{Addr: srv.Addr(), TLS: &TLSConfig{
+		CACert: material.caPEM, ClientCert: material.clientCertPEM, ClientKey: material.clientKeyPEM,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	if err := client.Set(t.Context(), "tls-key", "tls-value", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNewClientConfiguredLifetimeOverridesDynamicDefault(t *testing.T) {
+	t.Parallel()
+	srv := miniredis.RunT(t)
+	client, err := NewClient(t.Context(), &Config{
+		Addr: srv.Addr(), ConnMaxLifetime: 3 * time.Minute,
+		DynamicAuth: &DynamicAuth{
+			CredentialsProviderContext: func(context.Context) (string, string, error) { return "", "", nil },
+			ConnMaxLifetime:            12 * time.Minute, AllowInsecureTransport: true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	if got := client.(*goredis.Client).Options().ConnMaxLifetime; got != 3*time.Minute {
+		t.Fatalf("ConnMaxLifetime = %v, want 3m", got)
+	}
+}
+
+func TestNewClientPingFailureClosesCandidate(t *testing.T) {
+	t.Parallel()
+	srv := miniredis.RunT(t)
+	disconnected := make(chan struct{}, 1)
+	srv.Server().SetPreHook(func(peer *miniredisserver.Peer, command string, _ ...string) bool {
+		if !strings.EqualFold(command, "ping") {
+			return false
+		}
+		peer.OnDisconnect(func() { disconnected <- struct{}{} })
+		peer.WriteError("ping rejected")
+		return true
+	})
+
+	_, err := NewClient(t.Context(), &Config{Addr: srv.Addr()})
+	if err == nil || !contains(err.Error(), "failed to connect") {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	select {
+	case <-disconnected:
+	case <-time.After(time.Second):
+		t.Fatal("candidate connection was not closed after failed PING")
+	}
+}
+
+func TestBuildClusterAndSentinelTLSOptions(t *testing.T) {
+	t.Parallel()
+	clusterMaterial := newTestTLSMaterial(t)
+	clusterCfg := &Config{Addr: testAddr, ClusterMode: true, TLS: &TLSConfig{
+		CACert: clusterMaterial.caPEM, ClientCert: clusterMaterial.clientCertPEM, ClientKey: clusterMaterial.clientKeyPEM,
+	}}
+	clusterCfg.applyDefaults()
+	cluster, err := buildClusterClient(clusterCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cluster.Close() })
+	clusterOpts := cluster.(*goredis.ClusterClient).Options()
+	if clusterOpts.TLSConfig == nil || len(clusterOpts.TLSConfig.Certificates) != 1 || clusterOpts.TLSConfig.RootCAs == nil {
+		t.Fatal("cluster TLS CA and client certificate were not installed")
+	}
+
+	masterMaterial := newTestTLSMaterial(t)
+	sentinelMaterial := newTestTLSMaterial(t)
+	masterAddr, masterDone := startTLSServer(t, masterMaterial.serverCertificate)
+	sentinelAddr, sentinelDone := startTLSServer(t, sentinelMaterial.serverCertificate)
+	masterTLS, err := BuildTLSConfig(&TLSConfig{CACert: masterMaterial.caPEM})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentinelTLS, err := BuildTLSConfig(&TLSConfig{CACert: sentinelMaterial.caPEM})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dial := newTLSDialer(masterTLS, sentinelTLS, []string{sentinelAddr}, time.Second)
+	for _, addr := range []string{masterAddr, sentinelAddr} {
+		conn, dialErr := dial(t.Context(), "tcp", addr)
+		if dialErr != nil {
+			t.Fatalf("dial %s: %v", addr, dialErr)
+		}
+		_ = conn.Close()
+	}
+	if err := <-masterDone; err != nil {
+		t.Fatalf("master TLS handshake: %v", err)
+	}
+	if err := <-sentinelDone; err != nil {
+		t.Fatalf("sentinel TLS handshake: %v", err)
+	}
+
+	sentinelCfg := &Config{
+		SentinelConfig: &SentinelConfig{MasterName: "main", SentinelAddrs: []string{sentinelAddr}},
+		TLS:            &TLSConfig{CACert: masterMaterial.caPEM}, SentinelTLS: &TLSConfig{CACert: sentinelMaterial.caPEM},
+	}
+	sentinelCfg.applyDefaults()
+	sentinel, err := buildSentinelClient(sentinelCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sentinel.Close() })
+	if sentinel.(*goredis.Client).Options().Dialer == nil {
+		t.Fatal("sentinel client did not install the separately scoped TLS dialer")
+	}
+}
+
+func startTLSServer(t *testing.T, certificate tls.Certificate) (string, <-chan error) {
+	t.Helper()
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{certificate},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	done := make(chan error, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			done <- acceptErr
+			return
+		}
+		defer conn.Close()
+		done <- conn.(*tls.Conn).Handshake()
+	}()
+	return listener.Addr().String(), done
+}
+
+type testTLSMaterial struct {
+	caPEM             []byte
+	caPool            *x509.CertPool
+	serverCertificate tls.Certificate
+	clientCertPEM     []byte
+	clientKeyPEM      []byte
+}
+
+func newTestTLSMaterial(t *testing.T) testTLSMaterial {
+	t.Helper()
+	now := time.Now()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca := &x509.Certificate{
+		SerialNumber: big.NewInt(10), Subject: pkix.Name{CommonName: "test CA"},
+		NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour), IsCA: true,
+		BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, ca, ca, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caPEM) {
+		t.Fatal("failed to build test CA pool")
+	}
+	makeCertificate := func(serial int64, usages []x509.ExtKeyUsage, ips []net.IP) (tls.Certificate, []byte, []byte) {
+		key, keyErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if keyErr != nil {
+			t.Fatal(keyErr)
+		}
+		der, certErr := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+			SerialNumber: big.NewInt(serial), Subject: pkix.Name{CommonName: "test endpoint"},
+			NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature,
+			ExtKeyUsage: usages, IPAddresses: ips,
+		}, ca, &key.PublicKey, caKey)
+		if certErr != nil {
+			t.Fatal(certErr)
+		}
+		keyDER, marshalErr := x509.MarshalECPrivateKey(key)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+		pair, pairErr := tls.X509KeyPair(certPEM, keyPEM)
+		if pairErr != nil {
+			t.Fatal(pairErr)
+		}
+		return pair, certPEM, keyPEM
+	}
+	server, _, _ := makeCertificate(11, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, []net.IP{net.ParseIP("127.0.0.1")})
+	_, clientPEM, clientKeyPEM := makeCertificate(12, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, nil)
+	return testTLSMaterial{caPEM: caPEM, caPool: caPool, serverCertificate: server, clientCertPEM: clientPEM, clientKeyPEM: clientKeyPEM}
 }
 
 func testCertificate(t *testing.T) ([]byte, []byte, []byte) {
