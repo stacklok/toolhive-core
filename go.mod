@@ -2,6 +2,10 @@ module github.com/stacklok/toolhive-core
 
 go 1.26.0
 
+// Development-only replacement for the untagged nested module. Dependency
+// module replacements are ignored by downstream consumers.
+replace github.com/stacklok/toolhive-core/redisconn => ./redisconn
+
 require (
 	cel.dev/cel-go v0.32.0
 	github.com/adrg/xdg v0.5.3
@@ -17,6 +21,7 @@ require (
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/redis/go-redis/v9 v9.22.0
+	github.com/stacklok/toolhive-core/redisconn v0.0.0
 	github.com/sigstore/protobuf-specs v0.5.2
 	github.com/sigstore/sigstore-go v1.3.0
 	github.com/stretchr/testify v1.12.1
