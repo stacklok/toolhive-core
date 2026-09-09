@@ -4,17 +4,21 @@
 package redis
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/stacklok/toolhive-core/redisconn"
 )
 
 // Default timeouts applied by NewClient when the corresponding Config field
 // is zero.
 const (
-	DefaultDialTimeout  = 5 * time.Second
-	DefaultReadTimeout  = 3 * time.Second
-	DefaultWriteTimeout = 3 * time.Second
+	DefaultDialTimeout  = redisconn.DefaultDialTimeout
+	DefaultReadTimeout  = redisconn.DefaultReadTimeout
+	DefaultWriteTimeout = redisconn.DefaultWriteTimeout
 )
 
 // Config configures a Redis client. Exactly one of Addr or SentinelConfig
@@ -53,8 +57,9 @@ type Config struct {
 	// fresh credentials for each connection attempt — during go-redis's
 	// handshake, before RESP3 negotiation and DB selection — and sets
 	// ConnMaxLifetime (when Config's own ConnMaxLifetime is zero) to a value
-	// inside the backend's token TTL so pooled connections are periodically
-	// retired and redialed with current credentials.
+	// inside the backend's token TTL. go-redis retires an over-age pooled
+	// connection lazily when it is reused; this does not proactively refresh
+	// or reauthenticate an open connection.
 	//
 	// Dynamic authentication requires a verified TLS connection (Config.TLS
 	// set, with InsecureSkipVerify false): cloud IAM tokens are bearer
@@ -187,87 +192,37 @@ func singleDynamicAuthBackend(da *DynamicAuthConfig) error {
 	}
 }
 
-// SentinelConfig describes a Redis Sentinel deployment used to discover the
-// current master.
-type SentinelConfig struct {
-	// MasterName is the logical name of the monitored master, as configured
-	// on the sentinel daemons.
-	MasterName string
+// SentinelConfig is kept for source compatibility.
+// Deprecated: use redisconn.SentinelConfig.
+type SentinelConfig = redisconn.SentinelConfig
 
-	// SentinelAddrs is the list of sentinel daemon addresses (host:port).
-	SentinelAddrs []string
-}
+// TLSConfig is kept for source compatibility.
+// Deprecated: use redisconn.TLSConfig.
+type TLSConfig = redisconn.TLSConfig
 
-// TLSConfig describes how to verify a TLS-enabled Redis (or sentinel)
-// endpoint. The mere presence of a TLSConfig enables TLS; the zero value
-// means "verify against system CAs with hostname verification".
-type TLSConfig struct {
-	// InsecureSkipVerify disables certificate verification. Intended for
-	// self-signed development setups; never use in production.
-	InsecureSkipVerify bool
-
-	// CACert is the PEM-encoded CA bundle used to verify the server. When
-	// nil, system root CAs are used.
-	CACert []byte
-
-	// ClientCert and ClientKey are a PEM-encoded client certificate/key pair
-	// presented to the server for mutual TLS. Both fields must be set together.
-	ClientCert []byte
-	ClientKey  []byte
-}
-
-// Validate checks Config for connection-mode topology errors and returns
-// the first violation encountered. It does not verify caller-specific
-// invariants such as key-prefix conventions or ACL requirements.
+// Validate checks Config for connection and provider configuration errors.
 func (c *Config) Validate() error {
 	if c == nil {
 		return errors.New("config is nil")
 	}
-	if c.ClusterMode && c.SentinelConfig != nil {
-		return errors.New("cluster mode cannot be used with sentinel configuration")
+	base := c.redisconnConfig(nil)
+	if err := base.Validate(); err != nil {
+		return err
 	}
-	if c.Addr != "" && c.SentinelConfig != nil {
-		return errors.New("addr and sentinel configuration are mutually exclusive; set exactly one")
-	}
-	if c.Addr == "" && c.SentinelConfig == nil {
-		return errors.New("one of addr (standalone or cluster) or sentinel configuration is required")
-	}
-	if c.ClusterMode && c.Addr == "" {
-		return errors.New("cluster mode requires addr to be set")
-	}
-	if c.SentinelConfig != nil {
-		if c.SentinelConfig.MasterName == "" {
-			return errors.New("sentinel master name is required")
-		}
-		if len(c.SentinelConfig.SentinelAddrs) == 0 {
-			return errors.New("at least one sentinel address is required")
-		}
-	}
-	if err := validateTLSConfig(c.TLS); err != nil {
-		return fmt.Errorf("TLS config: %w", err)
-	}
-	if err := validateTLSConfig(c.SentinelTLS); err != nil {
-		return fmt.Errorf("sentinel TLS config: %w", err)
-	}
-	return validateDynamicAuth(c)
-}
-
-// validateDynamicAuth checks c.DynamicAuth for backend-selection,
-// transport-security, and required-field errors. Split into per-backend
-// helpers to keep every function under the project's cyclomatic-complexity
-// budget.
-func validateDynamicAuth(c *Config) error {
 	if c.DynamicAuth == nil {
 		return nil
 	}
 	if err := singleDynamicAuthBackend(c.DynamicAuth); err != nil {
 		return err
 	}
-	if c.Password != "" {
-		return errors.New("password must not be set when dynamicAuth is configured")
+	base.DynamicAuth = &redisconn.DynamicAuth{
+		CredentialsProviderContext: func(context.Context) (string, string, error) { return "", "", nil },
+		AllowInsecureTransport:     c.DynamicAuth.AllowInsecureTransport,
 	}
-	if err := validateDynamicAuthTLS(c.TLS, c.DynamicAuth); err != nil {
-		return err
+	if err := base.Validate(); err != nil {
+		// Keep the legacy facade's public configuration name in compatibility errors.
+		return errors.New(strings.ReplaceAll(err.Error(),
+			"DynamicAuth.AllowInsecureTransport", "DynamicAuthConfig.AllowInsecureTransport"))
 	}
 	switch {
 	case c.DynamicAuth.AWSElastiCacheIAM != nil:
@@ -281,25 +236,13 @@ func validateDynamicAuth(c *Config) error {
 	}
 }
 
-// validateDynamicAuthTLS requires a verified TLS connection for dynamic
-// authentication, unless the caller explicitly opted out via
-// AllowInsecureTransport. Cloud IAM tokens are bearer credentials; sending
-// them over an unverified or plaintext connection lets a network attacker
-// capture and replay them.
-func validateDynamicAuthTLS(tls *TLSConfig, da *DynamicAuthConfig) error {
-	if da.AllowInsecureTransport {
-		return nil
+func (c *Config) redisconnConfig(dynamicAuth *redisconn.DynamicAuth) *redisconn.Config {
+	return &redisconn.Config{
+		Addr: c.Addr, ClusterMode: c.ClusterMode, SentinelConfig: c.SentinelConfig,
+		Username: c.Username, Password: c.Password, DynamicAuth: dynamicAuth, DB: c.DB,
+		DialTimeout: c.DialTimeout, ReadTimeout: c.ReadTimeout, WriteTimeout: c.WriteTimeout,
+		TLS: c.TLS, SentinelTLS: c.SentinelTLS, ConnMaxLifetime: c.ConnMaxLifetime,
 	}
-	if tls == nil {
-		return errors.New("TLS is required when dynamicAuth is configured " +
-			"(set Config.TLS, or DynamicAuthConfig.AllowInsecureTransport to opt out for trusted local tunneling)")
-	}
-	if tls.InsecureSkipVerify {
-		return errors.New("TLS must verify the server certificate when dynamicAuth is configured " +
-			"(InsecureSkipVerify defeats the purpose of a signed token; " +
-			"set DynamicAuthConfig.AllowInsecureTransport to opt out)")
-	}
-	return nil
 }
 
 // validateUsernameRequired returns an error when username is empty, for
@@ -345,25 +288,4 @@ func validateAWSElastiCacheIAM(username string, iam *DynamicAuthAWSElastiCacheIA
 			awsElastiCacheServerlessResourceType, iam.ResourceType)
 	}
 	return nil
-}
-
-func validateTLSConfig(cfg *TLSConfig) error {
-	if cfg != nil && (len(cfg.ClientCert) == 0) != (len(cfg.ClientKey) == 0) {
-		return errors.New("client certificate and key must be provided together")
-	}
-	return nil
-}
-
-// applyDefaults writes DefaultDialTimeout/ReadTimeout/WriteTimeout into c
-// for any zero-valued timeout field.
-func (c *Config) applyDefaults() {
-	if c.DialTimeout == 0 {
-		c.DialTimeout = DefaultDialTimeout
-	}
-	if c.ReadTimeout == 0 {
-		c.ReadTimeout = DefaultReadTimeout
-	}
-	if c.WriteTimeout == 0 {
-		c.WriteTimeout = DefaultWriteTimeout
-	}
 }

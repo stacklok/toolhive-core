@@ -21,7 +21,12 @@ jobs:
         with:
           go-version: 'stable'
           cache: true
-          cache-dependency-path: go.sum
+          cache-dependency-path: |
+            go.sum
+            redisconn/go.sum
+            redisconn/aws/go.sum
+            redisconn/azure/go.sum
+            redisconn/gcp/go.sum
 
       - name: Download Go dependencies
         run: |
@@ -38,6 +43,14 @@ jobs:
 
       - name: Run tests with coverage
         run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Check standalone Redis modules
+        run: |
+          ./scripts/check-redisconn-modules.sh
+          for module in redisconn redisconn/aws redisconn/azure redisconn/gcp; do
+            (cd "$module" && GOWORK=off go mod tidy && GOWORK=off go mod verify && GOWORK=off go test -race ./... && GOWORK=off go vet ./...)
+          done
+          git diff --exit-code -- redisconn/go.mod redisconn/go.sum redisconn/aws/go.mod redisconn/aws/go.sum redisconn/azure/go.mod redisconn/azure/go.sum redisconn/gcp/go.mod redisconn/gcp/go.sum
 
       # TODO: Enable after provisioning Codecov
       # - name: Upload coverage to Codecov

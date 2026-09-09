@@ -3,55 +3,16 @@
 
 package redis
 
-import (
-	"context"
-	"fmt"
-	"time"
+import redisconnazure "github.com/stacklok/toolhive-core/redisconn/azure"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-)
+// DefaultAzureADTokenTTL is retained for source compatibility.
+// Deprecated: use redisconnazure.DefaultConnMaxLifetime.
+const DefaultAzureADTokenTTL = redisconnazure.DefaultConnMaxLifetime
 
-// azureADScope is the OAuth2 scope Azure Cache for Redis requires for
-// Entra ID (formerly Azure AD) token-based authentication.
-const azureADScope = "acca5fbb-b7e4-4009-81f1-37e38fd66d78/.default"
-
-// DefaultAzureADTokenTTL bounds go-redis's ConnMaxLifetime for Azure Entra
-// ID auth. Entra ID access tokens are typically valid ~60-90 minutes;
-// pooled connections are retired well inside that window.
-const DefaultAzureADTokenTTL = 45 * time.Minute
-
-// azureADCredentialsFunc returns a CredentialsFunc that acquires a fresh
-// Entra ID access token on every call, paired with cfg.Username (the Azure
-// principal object ID) as the AUTH username. The credential is constructed
-// once, at hook-construction time; azidentity caches and refreshes the
-// underlying token internally, so per-call cost is usually a cache hit
-// rather than a network round trip.
 func azureADCredentialsFunc(cfg *Config) (CredentialsFunc, error) {
-	cred, err := newAzureCredential()
+	auth, err := redisconnazure.NewDynamicAuth(redisconnazure.Config{Username: cfg.Username})
 	if err != nil {
-		return nil, wrapAuthError("azureAd", err)
+		return nil, err
 	}
-	user := cfg.Username
-	return func(ctx context.Context) (string, string, error) {
-		token, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{azureADScope}})
-		if err != nil {
-			return "", "", wrapAuthError("azureAd", fmt.Errorf("failed to acquire Entra ID token: %w", err))
-		}
-		return user, token.Token, nil
-	}, nil
-}
-
-// newAzureCredential builds the credential used to acquire Entra ID tokens.
-// Construction never contacts Azure — DefaultAzureCredential resolves
-// lazily, on the first GetToken call, following its normal chain
-// (environment variables — including AZURE_CLIENT_ID to select a
-// user-assigned managed identity — workload identity, managed identity,
-// Azure CLI, ...).
-func newAzureCredential() (*azidentity.DefaultAzureCredential, error) {
-	cred, err := azidentity.NewDefaultAzureCredential(nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to construct Azure credential: %w", err)
-	}
-	return cred, nil
+	return CredentialsFunc(auth.CredentialsProviderContext), nil
 }
