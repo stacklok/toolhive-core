@@ -32,7 +32,12 @@ The ToolHive ecosystem spans multiple Go repositories, and several of these proj
 | `oci/plugins` | Alpha | OCI artifact types, media types, and registry operations for plugins |
 | `authn` | Alpha | Inbound OIDC/JWT bearer-token validation for resource servers |
 | `networking` | Alpha | Outbound HTTP client construction with SSRF egress policy: private-IP/link-local dial blocking, redirect policy, body-capped JSON fetch, endpoint/issuer URL + private-IP validation helpers, and port allocation/validation utilities |
-| `postgres` | Alpha | PostgreSQL connection pool with optional AWS RDS IAM dynamic auth |
+| `postgres` | Alpha | PostgreSQL connection pool with optional cloud IAM dynamic auth |
+| `redisconn` | Alpha | Lean Redis/Valkey client construction for standalone, cluster, and Sentinel deployments |
+| `redisconn/aws` | Alpha | AWS ElastiCache/MemoryDB IAM credentials for `redisconn` |
+| `redisconn/azure` | Alpha | Azure Entra ID credentials for `redisconn` |
+| `redisconn/gcp` | Alpha | GCP Memorystore IAM credentials for `redisconn` |
+| `redis` | Deprecated | Source-compatible facade; migrate to `redisconn` and a provider child module |
 | `recovery` | Beta | HTTP panic recovery middleware |
 | `validation/http` | Stable | RFC 7230/8707 compliant HTTP header and URI validation |
 | `validation/group` | Stable | Group name validation |
@@ -106,6 +111,24 @@ For packages with external dependencies, multiple types, or broader API surface:
 - **Major (vX.0.0)**: Breaking API changes
 - **Minor (v0.X.0)**: New features, backward-compatible
 - **Patch (v0.0.X)**: Bug fixes, backward-compatible
+
+### Release preflight
+
+Before creating or pushing a release tag, check out the exact commit to be tagged and run:
+
+```bash
+./scripts/validate-release.sh <intended-tag>
+```
+
+The intended tag must use the module's tag prefix (for example, `v1.2.3`, `redisconn/v1.2.3`, or `redisconn/aws/v1.2.3`). Every required sibling module version must already have an exact module-prefixed release tag available in the local clone; fetch the required previous tags before running the check. The script only inspects local Git state and makes no network calls.
+
+For an auditable preflight result, manually dispatch the **Release** workflow with the same intended tag and the full 40-character lowercase commit SHA that will receive it. The workflow rejects branch names, tag names, abbreviated SHAs, and uppercase SHAs, verifies that the input resolves to a commit, and checks out that exact commit. Create and push the tag only after the local check and, when used, the manual preflight pass against that SHA.
+
+The tag-triggered Release workflow repeats validation after a tag is pushed. This post-tag check is defense in depth; it detects an invalid release but is not the pre-tag control.
+
+### Unresolved release risks
+
+Repository workflows cannot prevent an authorized user from directly pushing a tag without performing the preflight. Access controls and release-operator procedure must enforce the required pre-tag check; the post-tag workflow can only report failure after the tag exists.
 
 ## License
 
