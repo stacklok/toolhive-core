@@ -9,7 +9,7 @@ replace github.com/stacklok/toolhive-core/redisconn => ..
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.1
-	github.com/stacklok/toolhive-core/redisconn v0.0.0
+	github.com/stacklok/toolhive-core/redisconn v0.0.1
 )
 
 require (
