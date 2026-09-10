@@ -8,7 +8,7 @@ replace github.com/stacklok/toolhive-core/redisconn => ..
 
 require (
 	github.com/stacklok/toolhive-core/redisconn v0.0.0
-	golang.org/x/oauth2 v0.36.0
+	golang.org/x/oauth2 v0.37.0
 )
 
 require (
