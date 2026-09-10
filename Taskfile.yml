@@ -5,8 +5,18 @@ version: '3'
 
 tasks:
   default:
-    desc: Run all checks (lint + test)
-    deps: [lint, test]
+    desc: Run all checks (lint + test + nested Redis modules)
+    deps: [lint, test, redisconn-modules]
+
+  redisconn-modules:
+    desc: Verify and test independently versioned Redis modules
+    cmds:
+      - ./scripts/test-validate-release.sh
+      - ./scripts/check-redisconn-modules.sh
+      - cd redisconn && GOWORK=off go mod tidy && GOWORK=off go mod verify && GOWORK=off go test -race ./... && GOWORK=off go vet ./...
+      - cd redisconn/aws && GOWORK=off go mod tidy && GOWORK=off go mod verify && GOWORK=off go test -race ./... && GOWORK=off go vet ./...
+      - cd redisconn/azure && GOWORK=off go mod tidy && GOWORK=off go mod verify && GOWORK=off go test -race ./... && GOWORK=off go vet ./...
+      - cd redisconn/gcp && GOWORK=off go mod tidy && GOWORK=off go mod verify && GOWORK=off go test -race ./... && GOWORK=off go vet ./...
 
   lint:
     desc: Run linting tools

@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /*
-Package redis provides a shared Redis client connection layer used by
-toolhive components and stacklok-llm-gateway services.
+Package redis provides a deprecated compatibility facade for the extracted
+redisconn modules. New code should import github.com/stacklok/toolhive-core/redisconn
+and the selected cloud provider child module directly.
+
+Deprecated: use redisconn.
 
 The package wraps github.com/redis/go-redis/v9 with a single Config type and
 NewClient factory that supports three connection modes:
@@ -94,9 +97,9 @@ resolves during that handshake — before RESP3 negotiation and DB selection
 selection and silently downgrading otherwise RESP3-capable connections to
 RESP2). It works around the second by setting ConnMaxLifetime (defaulted
 per backend, inside the token's TTL, when Config.ConnMaxLifetime is zero)
-so go-redis periodically retires and redials pooled connections — re-running
-CredentialsProviderContext and picking up current credentials before the
-previous token would be rejected.
+so go-redis retires an over-age connection lazily when that connection is
+reused, then redials it — re-running CredentialsProviderContext and picking up
+current credentials. This is not proactive refresh or active reauthentication.
 
 For Sentinel, CredentialsProviderContext is wired only onto the data-node
 (master/replica) connections: go-redis's FailoverOptions deliberately does
