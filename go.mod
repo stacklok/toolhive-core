@@ -29,10 +29,10 @@ require (
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/sigstore/protobuf-specs v0.5.2
 	github.com/sigstore/sigstore-go v1.3.0
-	github.com/stacklok/toolhive-core/redisconn v0.0.0
-	github.com/stacklok/toolhive-core/redisconn/aws v0.0.0
-	github.com/stacklok/toolhive-core/redisconn/azure v0.0.0
-	github.com/stacklok/toolhive-core/redisconn/gcp v0.0.0
+	github.com/stacklok/toolhive-core/redisconn v0.0.1
+	github.com/stacklok/toolhive-core/redisconn/aws v0.0.1
+	github.com/stacklok/toolhive-core/redisconn/azure v0.0.1
+	github.com/stacklok/toolhive-core/redisconn/gcp v0.0.1
 	github.com/stretchr/testify v1.12.1
 	github.com/xeipuuv/gojsonschema v1.2.0
 	go.opentelemetry.io/otel v1.46.0
@@ -47,6 +47,7 @@ require (
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.1
+	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467
 	github.com/go-openapi/runtime v0.33.2
 	github.com/go-openapi/swag/conv v0.29.2
@@ -80,7 +81,6 @@ require (
 	github.com/ProtonMail/go-crypto v1.4.1 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
-	github.com/aws/aws-sdk-go-v2 v1.47.0 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.4 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.3 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.3 // indirect
