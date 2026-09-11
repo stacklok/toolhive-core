@@ -31,6 +31,9 @@ type Plugin struct {
 	Icons []SkillIcon `json:"icons,omitempty"`
 	// Packages is the list of packages for the plugin.
 	Packages []SkillPackage `json:"packages,omitempty"`
+	// Provenance contains the expected certificate identity and attestation
+	// constraints for the plugin artifact.
+	Provenance *Provenance `json:"provenance,omitempty" yaml:"provenance,omitempty"`
 	// Metadata is the official metadata of the plugin as reported in the
 	// plugin manifest file.
 	Metadata map[string]any `json:"metadata,omitempty"`
