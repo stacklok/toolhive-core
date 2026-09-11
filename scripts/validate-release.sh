@@ -40,11 +40,18 @@ requirements=$(awk '
 	$1 == "require" && $2 ~ /^github\.com\/stacklok\/toolhive-core\/redisconn(\/(aws|azure|gcp))?$/ { print $2, $3 }
 ' "$manifest")
 
+repo_root=$(git rev-parse --show-toplevel)
+
 printf '%s\n' "$requirements" | while read -r module required_version; do
 	[ -n "$module" ] || continue
-	required_tag=${module#github.com/stacklok/toolhive-core/}/$required_version
+	child_dir=${module#github.com/stacklok/toolhive-core/}
+	required_tag=$child_dir/$required_version
 	if ! git rev-parse --verify --quiet "refs/tags/$required_tag^{commit}" >/dev/null; then
 		echo "$manifest requires $module $required_version, but released tag $required_tag is not available locally; fetch required previous tags before tagging $tag" >&2
+		exit 1
+	fi
+	if ! git -C "$repo_root" diff --quiet "$required_tag" -- "$child_dir"; then
+		echo "$manifest requires $module $required_version, but $child_dir has changed since $required_tag was tagged; publish a new $child_dir tag and update this manifest's requirement before tagging $tag" >&2
 		exit 1
 	fi
 done
