@@ -10,7 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.4
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.0
-	github.com/stacklok/toolhive-core/redisconn v0.0.1
+	github.com/stacklok/toolhive-core/redisconn v0.0.2
 )
 
 require (
