@@ -2,10 +2,6 @@ module github.com/stacklok/toolhive-core/redisconn/aws
 
 go 1.27
 
-// Development-only replacement for the untagged sibling module. Dependency
-// module replacements are ignored by downstream consumers.
-replace github.com/stacklok/toolhive-core/redisconn => ..
-
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.4
