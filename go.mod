@@ -45,7 +45,7 @@ require (
 	github.com/sigstore/rekor v1.5.4
 	github.com/sigstore/sigstore v1.10.10
 	github.com/sigstore/sigstore-go v1.3.0
-	github.com/stacklok/toolhive-core/redisconn v0.0.1
+	github.com/stacklok/toolhive-core/redisconn v0.0.2
 	github.com/stacklok/toolhive-core/redisconn/aws v0.0.1
 	github.com/stacklok/toolhive-core/redisconn/azure v0.0.1
 	github.com/stacklok/toolhive-core/redisconn/gcp v0.0.1

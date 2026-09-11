@@ -7,7 +7,7 @@ go 1.27
 replace github.com/stacklok/toolhive-core/redisconn => ..
 
 require (
-	github.com/stacklok/toolhive-core/redisconn v0.0.1
+	github.com/stacklok/toolhive-core/redisconn v0.0.2
 	golang.org/x/oauth2 v0.37.0
 )
 
