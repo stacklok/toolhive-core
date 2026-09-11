@@ -35,6 +35,14 @@ if (
 	echo "provider release unexpectedly accepted development core version" >&2
 	exit 1
 fi
+if (
+	cd scripts/testdata/release-stale-pin
+	../../../scripts/validate-release.sh v1.2.3 >/dev/null 2>&1
+); then
+	echo "root release unexpectedly accepted a real but stale (drifted) redisconn pin" >&2
+	exit 1
+fi
+
 if ./scripts/validate-release.sh redisconn/not-a-version >/dev/null 2>&1; then
 	echo "malformed release tag unexpectedly accepted" >&2
 	exit 1

@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -46,6 +48,7 @@ jobs:
 
       - name: Check standalone Redis modules
         run: |
+          ./scripts/test-validate-release.sh
           ./scripts/check-redisconn-modules.sh
           for module in redisconn redisconn/aws redisconn/azure redisconn/gcp; do
             (cd "$module" && GOWORK=off go mod tidy && GOWORK=off go mod verify && GOWORK=off go test -race ./... && GOWORK=off go vet ./...)
