@@ -2,12 +2,8 @@ module github.com/stacklok/toolhive-core/redisconn/gcp
 
 go 1.27
 
-// Development-only replacement for the untagged sibling module. Dependency
-// module replacements are ignored by downstream consumers.
-replace github.com/stacklok/toolhive-core/redisconn => ..
-
 require (
-	github.com/stacklok/toolhive-core/redisconn v0.0.1
+	github.com/stacklok/toolhive-core/redisconn v0.0.2
 	golang.org/x/oauth2 v0.37.0
 )
 
