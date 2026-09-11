@@ -1,6 +1,6 @@
 module github.com/stacklok/toolhive-core/redisconn/gcp
 
-go 1.26.0
+go 1.27
 
 // Development-only replacement for the untagged sibling module. Dependency
 // module replacements are ignored by downstream consumers.
