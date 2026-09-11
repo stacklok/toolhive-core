@@ -46,6 +46,7 @@ func TestPlugin_MarshalRoundTrip(t *testing.T) {
 					MediaType:    "application/vnd.stacklok.plugin.v1",
 				},
 			},
+			Provenance: fullProvenance(),
 			Metadata: map[string]any{
 				"author": "Stacklok",
 			},
@@ -79,6 +80,7 @@ func TestPlugin_MarshalRoundTrip(t *testing.T) {
 		assert.Equal(t, plugin.Packages[0].Identifier, decoded.Packages[0].Identifier)
 		assert.Equal(t, plugin.Packages[0].Digest, decoded.Packages[0].Digest)
 		assert.Equal(t, plugin.Packages[0].MediaType, decoded.Packages[0].MediaType)
+		assert.Equal(t, plugin.Provenance, decoded.Provenance)
 		assert.Equal(t, plugin.Metadata["author"], decoded.Metadata["author"])
 		assert.Contains(t, decoded.Meta, testNamespace)
 	})
@@ -101,6 +103,7 @@ func TestPlugin_MarshalRoundTrip(t *testing.T) {
 		assert.NotContains(t, str, "repository")
 		assert.NotContains(t, str, "icons")
 		assert.NotContains(t, str, "packages")
+		assert.NotContains(t, str, "provenance")
 		assert.NotContains(t, str, "metadata")
 		assert.NotContains(t, str, "_meta")
 	})
@@ -386,6 +389,40 @@ func TestValidatePluginBytes(t *testing.T) {
 				]
 			}`,
 			wantErr: false,
+		},
+		{
+			name: "valid plugin provenance",
+			data: `{
+				"namespace": "io.github.stacklok",
+				"name": "pdf-processor",
+				"description": "Extract text and tables from PDF files",
+				"version": "1.0.0",
+				"provenance": {
+					"sigstore_url": "tuf-repo.github.com",
+					"repository_uri": "https://github.com/stacklok/plugins",
+					"repository_ref": "refs/heads/main",
+					"signer_identity": "/.github/workflows/build-plugin.yml",
+					"runner_environment": "github-hosted",
+					"cert_issuer": "https://token.actions.githubusercontent.com",
+					"attestation": {
+						"predicate_type": "https://slsa.dev/provenance/v1",
+						"predicate": {"buildType": "workflow"}
+					}
+				}
+			}`,
+			wantErr: false,
+		},
+		{
+			name: "invalid plugin provenance field",
+			data: `{
+				"namespace": "io.github.stacklok",
+				"name": "pdf-processor",
+				"description": "Extract text and tables from PDF files",
+				"version": "1.0.0",
+				"provenance": {"signer_identityy": "typo"}
+			}`,
+			wantErr:       true,
+			errorContains: "signer_identityy",
 		},
 		{
 			name: "missing namespace",

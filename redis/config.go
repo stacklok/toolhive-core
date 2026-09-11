@@ -86,6 +86,15 @@ type Config struct {
 	// DefaultWriteTimeout is used.
 	WriteTimeout time.Duration
 
+	// PoolSize is the base number of socket connections in each pool. In
+	// cluster mode, it applies per node. When zero, go-redis uses its default.
+	PoolSize int
+
+	// MaxActiveConns is the maximum number of connections allocated by each
+	// pool. In cluster mode, it applies per node. When zero, the pool can
+	// allocate connections without a hard limit.
+	MaxActiveConns int
+
 	// TLS configures TLS for master/cluster connections. When nil, those
 	// connections are plaintext.
 	TLS *TLSConfig
@@ -241,6 +250,7 @@ func (c *Config) redisconnConfig(dynamicAuth *redisconn.DynamicAuth) *redisconn.
 		Addr: c.Addr, ClusterMode: c.ClusterMode, SentinelConfig: c.SentinelConfig,
 		Username: c.Username, Password: c.Password, DynamicAuth: dynamicAuth, DB: c.DB,
 		DialTimeout: c.DialTimeout, ReadTimeout: c.ReadTimeout, WriteTimeout: c.WriteTimeout,
+		PoolSize: c.PoolSize, MaxActiveConns: c.MaxActiveConns,
 		TLS: c.TLS, SentinelTLS: c.SentinelTLS, ConnMaxLifetime: c.ConnMaxLifetime,
 	}
 }
