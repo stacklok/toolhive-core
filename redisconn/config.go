@@ -54,6 +54,13 @@ type Config struct {
 	DialTimeout  time.Duration
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
+	// PoolSize is the base number of socket connections in each pool. In
+	// cluster mode, it applies per node. Zero uses the go-redis default.
+	PoolSize int
+	// MaxActiveConns is the maximum number of connections allocated by each
+	// pool. In cluster mode, it applies per node. Zero allows the pool to
+	// allocate connections without a hard limit.
+	MaxActiveConns int
 	// TLS secures Redis data-node connections; SentinelTLS independently secures
 	// Sentinel discovery connections.
 	TLS         *TLSConfig
@@ -85,6 +92,12 @@ type TLSConfig struct {
 func (c *Config) Validate() error {
 	if c == nil {
 		return errors.New("config is nil")
+	}
+	if c.PoolSize < 0 {
+		return errors.New("pool size must not be negative")
+	}
+	if c.MaxActiveConns < 0 {
+		return errors.New("max active connections must not be negative")
 	}
 	if c.ClusterMode && c.SentinelConfig != nil {
 		return errors.New("cluster mode cannot be used with sentinel configuration")

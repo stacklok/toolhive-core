@@ -21,3 +21,16 @@ func ExampleNewClient_staticCredentials() {
 	}
 	defer client.Close()
 }
+
+func ExampleNewClient_boundedPool() {
+	client, err := redisconn.NewClient(context.Background(), &redisconn.Config{
+		Addr:           "redis.example.com:6379",
+		PoolSize:       8,
+		MaxActiveConns: 12,
+		TLS:            &redisconn.TLSConfig{},
+	})
+	if err != nil {
+		return
+	}
+	defer client.Close()
+}
