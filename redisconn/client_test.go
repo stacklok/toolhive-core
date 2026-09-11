@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"math/big"
 	"net"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,8 @@ func TestConfigValidate(t *testing.T) {
 		want string
 	}{
 		{"nil", nil, "config is nil"},
+		{"negative pool size", &Config{Addr: testAddr, PoolSize: -1}, "pool size must not be negative"},
+		{"negative max active connections", &Config{Addr: testAddr, MaxActiveConns: -1}, "max active connections must not be negative"},
 		{"missing topology", &Config{}, "one of addr"},
 		{"conflicting topology", &Config{Addr: testAddr, SentinelConfig: &SentinelConfig{}}, "mutually exclusive"},
 		{"sentinel master", &Config{SentinelConfig: &SentinelConfig{SentinelAddrs: []string{"s:26379"}}}, "master name"},
@@ -47,6 +50,8 @@ func TestConfigValidate(t *testing.T) {
 		{"dynamic insecure opt-out", &Config{Addr: testAddr, DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider, AllowInsecureTransport: true}}, ""},
 		{"standalone", &Config{Addr: testAddr}, ""},
 		{"cluster", &Config{Addr: testAddr, ClusterMode: true}, ""},
+		{"pool size larger than max active connections", &Config{Addr: testAddr, PoolSize: 8, MaxActiveConns: 4}, ""},
+		{"max active connections larger than pool size", &Config{Addr: testAddr, PoolSize: 4, MaxActiveConns: 8}, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -61,6 +66,113 @@ func TestConfigValidate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildClientsPropagatePoolOptions(t *testing.T) {
+	t.Parallel()
+
+	const (
+		poolSize       = 3
+		maxActiveConns = 7
+	)
+
+	t.Run("standalone options", func(t *testing.T) {
+		cfg := &Config{Addr: testAddr, PoolSize: poolSize, MaxActiveConns: maxActiveConns}
+		cfg.applyDefaults()
+		client, err := buildStandaloneClient(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+
+		opts := client.(*goredis.Client).Options()
+		if opts.PoolSize != poolSize || opts.MaxActiveConns != maxActiveConns {
+			t.Fatalf("pool options = (%d, %d), want (%d, %d)",
+				opts.PoolSize, opts.MaxActiveConns, poolSize, maxActiveConns)
+		}
+	})
+
+	t.Run("cluster options", func(t *testing.T) {
+		cfg := &Config{Addr: testAddr, ClusterMode: true, PoolSize: poolSize, MaxActiveConns: maxActiveConns}
+		cfg.applyDefaults()
+		client, err := buildClusterClient(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+
+		opts := client.(*goredis.ClusterClient).Options()
+		if opts.PoolSize != poolSize || opts.MaxActiveConns != maxActiveConns {
+			t.Fatalf("pool options = (%d, %d), want (%d, %d)",
+				opts.PoolSize, opts.MaxActiveConns, poolSize, maxActiveConns)
+		}
+	})
+
+	t.Run("failover options", func(t *testing.T) {
+		cfg := &Config{
+			SentinelConfig: &SentinelConfig{MasterName: "main", SentinelAddrs: []string{"s:26379"}},
+			PoolSize:       poolSize,
+			MaxActiveConns: maxActiveConns,
+		}
+		cfg.applyDefaults()
+		opts, err := buildSentinelOptions(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if opts.PoolSize != poolSize || opts.MaxActiveConns != maxActiveConns {
+			t.Fatalf("pool options = (%d, %d), want (%d, %d)",
+				opts.PoolSize, opts.MaxActiveConns, poolSize, maxActiveConns)
+		}
+	})
+}
+
+func TestBuildClientsPreserveGoRedisPoolDefaults(t *testing.T) {
+	t.Parallel()
+
+	t.Run("standalone", func(t *testing.T) {
+		cfg := &Config{Addr: testAddr}
+		cfg.applyDefaults()
+		client, err := buildStandaloneClient(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+
+		opts := client.(*goredis.Client).Options()
+		if opts.PoolSize != 10*runtime.GOMAXPROCS(0) || opts.MaxActiveConns != 0 {
+			t.Fatalf("pool defaults = (%d, %d)", opts.PoolSize, opts.MaxActiveConns)
+		}
+	})
+
+	t.Run("cluster", func(t *testing.T) {
+		cfg := &Config{Addr: testAddr, ClusterMode: true}
+		cfg.applyDefaults()
+		client, err := buildClusterClient(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+
+		opts := client.(*goredis.ClusterClient).Options()
+		if opts.PoolSize != 5*runtime.GOMAXPROCS(0) || opts.MaxActiveConns != 0 {
+			t.Fatalf("pool defaults = (%d, %d)", opts.PoolSize, opts.MaxActiveConns)
+		}
+	})
+
+	t.Run("sentinel", func(t *testing.T) {
+		cfg := &Config{SentinelConfig: &SentinelConfig{MasterName: "main", SentinelAddrs: []string{"s:26379"}}}
+		cfg.applyDefaults()
+		client, err := buildSentinelClient(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+
+		opts := client.(*goredis.Client).Options()
+		if opts.PoolSize != 10*runtime.GOMAXPROCS(0) || opts.MaxActiveConns != 0 {
+			t.Fatalf("pool defaults = (%d, %d)", opts.PoolSize, opts.MaxActiveConns)
+		}
+	})
 }
 
 func TestNewClientStaticAuthAndDatabase(t *testing.T) {
