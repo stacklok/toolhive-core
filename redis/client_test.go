@@ -61,12 +61,15 @@ func TestLegacyConfigTranslation(t *testing.T) {
 	provider := CredentialsFunc(func(context.Context) (string, string, error) { return "user", "token", nil })
 	cfg := &Config{
 		Addr: "redis:6379", Username: "user", TLS: &TLSConfig{}, ConnMaxLifetime: time.Minute,
+		PoolSize: 8, MaxActiveConns: 12,
 		DynamicAuth: &DynamicAuthConfig{AzureAD: &DynamicAuthAzureAD{}},
 	}
 	translated := cfg.redisconnConfig(&redisconn.DynamicAuth{CredentialsProviderContext: redisconn.CredentialsProvider(provider)})
 	assert.Equal(t, cfg.Addr, translated.Addr)
 	assert.Equal(t, cfg.Username, translated.Username)
 	assert.Equal(t, cfg.ConnMaxLifetime, translated.ConnMaxLifetime)
+	assert.Equal(t, cfg.PoolSize, translated.PoolSize)
+	assert.Equal(t, cfg.MaxActiveConns, translated.MaxActiveConns)
 	assert.Same(t, cfg.TLS, translated.TLS)
 	assert.NotNil(t, translated.DynamicAuth)
 }

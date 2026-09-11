@@ -1,6 +1,6 @@
 module github.com/stacklok/toolhive-core/redisconn/azure
 
-go 1.26.0
+go 1.27
 
 // Development-only replacement for the untagged sibling module. Dependency
 // module replacements are ignored by downstream consumers.
@@ -9,7 +9,7 @@ replace github.com/stacklok/toolhive-core/redisconn => ..
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.1
-	github.com/stacklok/toolhive-core/redisconn v0.0.1
+	github.com/stacklok/toolhive-core/redisconn v0.0.2
 )
 
 require (

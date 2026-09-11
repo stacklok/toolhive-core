@@ -99,6 +99,7 @@ func buildStandaloneClient(cfg *Config) (goredis.UniversalClient, error) {
 	return goredis.NewClient(&goredis.Options{
 		Addr: cfg.Addr, Username: cfg.Username, Password: cfg.Password, DB: cfg.DB,
 		DialTimeout: cfg.DialTimeout, ReadTimeout: cfg.ReadTimeout, WriteTimeout: cfg.WriteTimeout,
+		PoolSize: cfg.PoolSize, MaxActiveConns: cfg.MaxActiveConns,
 		TLSConfig: tlsCfg, CredentialsProviderContext: provider, ConnMaxLifetime: lifetime,
 	}), nil
 }
@@ -112,6 +113,7 @@ func buildClusterClient(cfg *Config) (goredis.UniversalClient, error) {
 	return goredis.NewClusterClient(&goredis.ClusterOptions{
 		Addrs: []string{cfg.Addr}, Username: cfg.Username, Password: cfg.Password,
 		DialTimeout: cfg.DialTimeout, ReadTimeout: cfg.ReadTimeout, WriteTimeout: cfg.WriteTimeout,
+		PoolSize: cfg.PoolSize, MaxActiveConns: cfg.MaxActiveConns,
 		TLSConfig: tlsCfg, CredentialsProviderContext: provider, ConnMaxLifetime: lifetime,
 	}), nil
 }
@@ -133,6 +135,7 @@ func buildSentinelOptions(cfg *Config) (*goredis.FailoverOptions, error) {
 		MasterName: cfg.SentinelConfig.MasterName, SentinelAddrs: cfg.SentinelConfig.SentinelAddrs,
 		Username: cfg.Username, Password: cfg.Password, DB: cfg.DB,
 		DialTimeout: cfg.DialTimeout, ReadTimeout: cfg.ReadTimeout, WriteTimeout: cfg.WriteTimeout,
+		PoolSize: cfg.PoolSize, MaxActiveConns: cfg.MaxActiveConns,
 		CredentialsProviderContext: provider, ConnMaxLifetime: lifetime,
 	}
 	if cfg.TLS != nil || cfg.SentinelTLS != nil {

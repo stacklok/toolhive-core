@@ -6,5 +6,6 @@
     ":semanticCommitsDisabled"
   ],
   "labels": ["dependencies"],
-  "postUpdateOptions": ["gomodTidy"]
+  "postUpdateOptions": ["gomodTidy"],
+  "ignorePaths": ["scripts/testdata/**"]
 }

@@ -40,6 +40,16 @@ func TestConfigValidate(t *testing.T) {
 			wantErr: "config is nil",
 		},
 		{
+			name:    "negative pool size is rejected",
+			cfg:     &Config{Addr: testAddr, PoolSize: -1},
+			wantErr: "pool size must not be negative",
+		},
+		{
+			name:    "negative max active connections is rejected",
+			cfg:     &Config{Addr: testAddr, MaxActiveConns: -1},
+			wantErr: "max active connections must not be negative",
+		},
+		{
 			name:    "no addr and no sentinel",
 			cfg:     &Config{},
 			wantErr: "one of addr",
@@ -277,6 +287,14 @@ func TestConfigValidate(t *testing.T) {
 					SentinelAddrs: []string{testSecondSentinel, testSentinelAddrB},
 				},
 			},
+		},
+		{
+			name: "pool size larger than max active connections is valid",
+			cfg:  &Config{Addr: testAddr, PoolSize: 8, MaxActiveConns: 4},
+		},
+		{
+			name: "max active connections larger than pool size is valid",
+			cfg:  &Config{Addr: testAddr, PoolSize: 4, MaxActiveConns: 8},
 		},
 	}
 
