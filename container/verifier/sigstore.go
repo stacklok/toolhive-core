@@ -159,9 +159,17 @@ func getSimpleSigningLayers(
 	keychain authn.Keychain,
 	strict bool,
 ) ([]v1.Descriptor, error) {
-	layers, err := getSimpleSigningLayersFromSignatureManifest(ctx, target.sigTag.Name(), keychain)
+	var (
+		layers []v1.Descriptor
+		err    error
+	)
+	if strict {
+		layers, err = getSimpleSigningLayersFromSignatureTargetStrict(ctx, target, keychain)
+	} else {
+		layers, err = getSimpleSigningLayersFromSignatureManifest(ctx, target.sigTag.Name(), keychain)
+	}
 	if err != nil {
-		if strict && isManifestNotFound(err) {
+		if strict && isManifestNotFound(err, target.sigTag) {
 			return nil, ErrProvenanceNotFoundOrIncomplete
 		}
 		if strict {
@@ -197,6 +205,11 @@ func (c *simpleSigningPayloadCache) get(
 	digest := layer.Digest.String()
 	if payload, ok := c.values[digest]; ok {
 		return payload, true, nil
+	}
+	if strict && layer.Digest.Algorithm != DigestAlgorithmSHA256 {
+		return nil, false, bundleSetIncompletef(
+			"simple-signing payload %s uses unsupported digest algorithm %s",
+			digest, layer.Digest.Algorithm)
 	}
 	readLimit := min(c.budget, MaxAttestationsBytesLimit)
 	if strict && (readLimit <= 0 || layer.Size > readLimit) {
@@ -321,12 +334,21 @@ func fetchSimpleSigningPayload(
 	return payload, nil
 }
 
-// isManifestNotFound reports the registry's ordinary "this tag does not
-// exist" answer. Strict retrieval treats that as absence, not an incomplete
-// read of a layout.
-func isManifestNotFound(err error) bool {
+// isManifestNotFound reports the registry's ordinary "this signature tag does
+// not exist" answer. Authentication services can also return transport-level
+// 404s; only the exact registry manifest request is layout absence.
+func isManifestNotFound(err error, signatureTag name.Tag) bool {
 	var transportErr *transport.Error
-	return errors.As(err, &transportErr) && transportErr.StatusCode == http.StatusNotFound
+	if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusNotFound ||
+		transportErr.Request == nil || !manifestRequestTarget(signatureTag).matchesExactGET(transportErr.Request) {
+		return false
+	}
+	for _, diagnostic := range transportErr.Errors {
+		if diagnostic.Code != transport.ManifestUnknownErrorCode {
+			return false
+		}
+	}
+	return true
 }
 
 // getSignatureReferenceFromOCIImage resolves imageRef and returns where its
@@ -335,6 +357,18 @@ func isManifestNotFound(err error) bool {
 func getSignatureReferenceFromOCIImage(
 	ctx context.Context, imageRef string, keychain authn.Keychain,
 ) (signatureTarget, error) {
+	return getSignatureReferenceFromOCIImageMode(ctx, imageRef, keychain, false)
+}
+
+func getSignatureReferenceFromOCIImageStrict(
+	ctx context.Context, imageRef string, keychain authn.Keychain,
+) (signatureTarget, error) {
+	return getSignatureReferenceFromOCIImageMode(ctx, imageRef, keychain, true)
+}
+
+func getSignatureReferenceFromOCIImageMode(
+	ctx context.Context, imageRef string, keychain authn.Keychain, strict bool,
+) (signatureTarget, error) {
 	// 0. Get the auth options
 	opts := []remote.Option{remote.WithAuthFromKeychain(keychain), remote.WithContext(ctx)}
 
@@ -342,6 +376,11 @@ func getSignatureReferenceFromOCIImage(
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
 		return signatureTarget{}, fmt.Errorf("error parsing image reference: %w", err)
+	}
+	if strict {
+		budget := newResponseBodyBudget(MaxAttestationsBytesLimit, "artifact manifest response")
+		opts = append(opts, remote.WithTransport(newStrictResponseTransport(
+			budget, manifestRequestTarget(ref))))
 	}
 
 	// 2. Get the image descriptor
@@ -388,6 +427,36 @@ func getSimpleSigningLayersFromSignatureManifest(
 	}
 
 	// Return the results - we may not have found any simple signing layers, but we still return the results
+	return results, nil
+}
+
+func getSimpleSigningLayersFromSignatureTargetStrict(
+	ctx context.Context,
+	target signatureTarget,
+	keychain authn.Keychain,
+) ([]v1.Descriptor, error) {
+	budget := newResponseBodyBudget(MaxAttestationsBytesLimit, "cosign signature manifest response")
+	desc, err := remote.Get(
+		target.sigTag,
+		remote.WithAuthFromKeychain(keychain),
+		remote.WithContext(ctx),
+		remote.WithTransport(newStrictResponseTransport(
+			budget, manifestRequestTarget(target.sigTag))),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error getting signature manifest: %w", err)
+	}
+
+	manifest, err := v1.ParseManifest(bytes.NewReader(desc.Manifest))
+	if err != nil {
+		return nil, fmt.Errorf("error parsing signature manifest: %w", err)
+	}
+	var results []v1.Descriptor
+	for _, layer := range manifest.Layers {
+		if layer.MediaType == MediaTypeCosignSimpleSigningV1JSON {
+			results = append(results, layer)
+		}
+	}
 	return results, nil
 }
 

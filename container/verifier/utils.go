@@ -8,13 +8,20 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"path"
+	"strings"
+	"sync"
 
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/sigstore/sigstore-go/pkg/tuf"
 	"github.com/sigstore/sigstore-go/pkg/verify"
 )
@@ -67,7 +74,8 @@ func isBundleMaterialFetchError(err error) bool {
 // retrieval must report the former as an incomplete bundle set, while the
 // latter is simply rejected verification material.
 func isOperationalFetchError(err error) bool {
-	if isBundleMaterialFetchError(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, ErrBundleSetIncomplete) || isBundleMaterialFetchError(err) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
 	var transportErr *transport.Error
@@ -84,6 +92,149 @@ func bundleSetIncompletef(format string, args ...any) error {
 
 func bundleSetIncompleteBecause(cause error, format string, args ...any) error {
 	return fmt.Errorf("%w: %s: %w", ErrBundleSetIncomplete, fmt.Sprintf(format, args...), cause)
+}
+
+// registryRequestTarget identifies one registry endpoint whose successful
+// response body is security-relevant discovery metadata. Host matching keeps
+// an authentication service with a similar path outside the absence and
+// response-budget rules.
+type registryRequestTarget struct {
+	host            string
+	path            string
+	acceptMediaType string
+}
+
+func manifestRequestTarget(ref name.Reference) registryRequestTarget {
+	return registryRequestTarget{
+		host:            ref.Context().RegistryStr(),
+		path:            fmt.Sprintf("/v2/%s/manifests/%s", ref.Context().RepositoryStr(), ref.Identifier()),
+		acceptMediaType: string(types.OCIManifestSchema1),
+	}
+}
+
+func indexManifestRequestTarget(ref name.Reference) registryRequestTarget {
+	return registryRequestTarget{
+		host:            ref.Context().RegistryStr(),
+		path:            fmt.Sprintf("/v2/%s/manifests/%s", ref.Context().RepositoryStr(), ref.Identifier()),
+		acceptMediaType: string(types.OCIImageIndex),
+	}
+}
+
+func referrersRequestTarget(digest name.Digest) registryRequestTarget {
+	return registryRequestTarget{
+		host:            digest.Context().RegistryStr(),
+		path:            fmt.Sprintf("/v2/%s/referrers/%s", digest.Context().RepositoryStr(), digest.DigestStr()),
+		acceptMediaType: string(types.OCIImageIndex),
+	}
+}
+
+func (t registryRequestTarget) matchesGET(req *http.Request) bool {
+	return req.Method == http.MethodGet && strings.Contains(req.Header.Get("Accept"), t.acceptMediaType) &&
+		t.matches(req)
+}
+
+func (t registryRequestTarget) matchesExactGET(req *http.Request) bool {
+	return req.Method == http.MethodGet && req.URL != nil && req.URL.Host == t.host && req.URL.Path == t.path &&
+		strings.Contains(req.Header.Get("Accept"), t.acceptMediaType)
+}
+
+func (t registryRequestTarget) matches(req *http.Request) bool {
+	// A manifest response may follow a redirect. net/http links each
+	// redirected request to its predecessor through Request.Response, so walk
+	// that chain and retain the original registry endpoint's classification.
+	for current := req; current != nil; {
+		if current.URL != nil && current.URL.Host == t.host && current.URL.Path == t.path {
+			return true
+		}
+		if current.Response == nil {
+			break
+		}
+		current = current.Response.Request
+	}
+	return false
+}
+
+// responseBodyBudget is a shared byte allowance for one strict discovery
+// class. It is consumed while response bodies are read, before
+// go-containerregistry can buffer them using its larger internal limit.
+type responseBodyBudget struct {
+	mu        sync.Mutex
+	remaining int64
+	detail    string
+}
+
+func newResponseBodyBudget(limit int64, detail string) *responseBodyBudget {
+	return &responseBodyBudget{remaining: limit, detail: detail}
+}
+
+// strictResponseTransport applies a responseBodyBudget only to successful
+// GETs for the listed registry endpoints. Authentication and registry error
+// responses retain go-containerregistry's own bounded handling.
+type strictResponseTransport struct {
+	inner   http.RoundTripper
+	targets []registryRequestTarget
+	budget  *responseBodyBudget
+}
+
+func newStrictResponseTransport(
+	budget *responseBodyBudget,
+	targets ...registryRequestTarget,
+) *strictResponseTransport {
+	return &strictResponseTransport{
+		inner:   remote.DefaultTransport,
+		targets: targets,
+		budget:  budget,
+	}
+}
+
+func (t *strictResponseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.inner.RoundTrip(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return resp, err
+	}
+	for _, target := range t.targets {
+		if target.matchesGET(req) {
+			resp.Body = &budgetedReadCloser{ReadCloser: resp.Body, budget: t.budget}
+			break
+		}
+	}
+	return resp, nil
+}
+
+type budgetedReadCloser struct {
+	io.ReadCloser
+	budget *responseBodyBudget
+}
+
+func (r *budgetedReadCloser) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	r.budget.mu.Lock()
+	defer r.budget.mu.Unlock()
+	if r.budget.remaining <= 0 {
+		// Probe one bounded byte beyond the allowance. EOF means the complete
+		// body fit exactly; any byte means accepting the response would exceed
+		// the strict budget. Never expose the probe byte to the caller.
+		var probe [1]byte
+		n, err := r.ReadCloser.Read(probe[:])
+		if n > 0 {
+			overflow := bundleSetIncompletef("%s exceeds the strict retrieval byte limit", r.budget.detail)
+			if err != nil {
+				return 0, errors.Join(overflow, err)
+			}
+			return 0, overflow
+		}
+		return 0, err
+	}
+
+	if int64(len(p)) > r.budget.remaining {
+		p = p[:r.budget.remaining]
+	}
+	n, err := r.ReadCloser.Read(p)
+	r.budget.remaining -= int64(n)
+	return n, err
 }
 
 // OCI and Sigstore media type constants used when inspecting referrer manifests.
@@ -240,7 +391,7 @@ func getSigstoreBundlesStrict(
 	imageRef string,
 	keychain authn.Keychain,
 ) ([]sigstoreBundle, error) {
-	target, err := getSignatureReferenceFromOCIImage(ctx, imageRef, keychain)
+	target, err := getSignatureReferenceFromOCIImageStrict(ctx, imageRef, keychain)
 	if err != nil {
 		if isOperationalFetchError(err) {
 			return nil, bundleSetIncompleteBecause(err, "resolving artifact reference")

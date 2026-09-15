@@ -4,12 +4,16 @@
 package verifier
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,12 +26,15 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/google/go-containerregistry/pkg/v1/static"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+const registryPingPath = "/v2/"
 
 // countingRegistry starts an in-process OCI registry that tallies blob GETs
 // per digest, so a test can assert how much work a verification actually
@@ -293,6 +300,348 @@ func TestRetrieveBundlesStrictRejectsPartialLayerFetch(t *testing.T) {
 	strictBundles, err := RetrieveBundlesStrict(t.Context(), parsed.Name(), nil)
 	require.ErrorIs(t, err, ErrBundleSetIncomplete)
 	assert.Empty(t, strictBundles, "strict retrieval must not expose the usable but incomplete subset")
+}
+
+// TestRetrieveBundlesStrictRejectsUnsupportedPayloadDigest ensures a valid
+// but unsupported OCI digest algorithm cannot disappear from the strict
+// result beside a usable signature. Legacy retrieval keeps its established
+// best-effort behavior.
+func TestRetrieveBundlesStrictRejectsUnsupportedPayloadDigest(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu           sync.RWMutex
+		overridePath string
+		overrideBody []byte
+	)
+	inner := registry.New()
+	reg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.RLock()
+		pathMatches := overridePath != "" && r.URL.Path == overridePath
+		body := append([]byte(nil), overrideBody...)
+		mu.RUnlock()
+		if r.Method == http.MethodGet && pathMatches {
+			w.Header().Set("Content-Type", string(types.OCIManifestSchema1))
+			_, _ = w.Write(body)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(reg.Close)
+
+	host := strings.TrimPrefix(reg.URL, "http://")
+	parsed, digest := pushArtifact(t, host, "test/strict-sha512")
+	payload := simpleSigningPayloadFor(parsed.Context().Name(), digest)
+	pubPEM := attachKeySignature(t, sigTag(parsed, digest), payload)
+
+	signatureTag := sigTag(parsed, digest)
+	desc, err := remote.Get(signatureTag)
+	require.NoError(t, err)
+	var manifest v1.Manifest
+	require.NoError(t, json.Unmarshal(desc.Manifest, &manifest))
+	manifest.Layers = append(manifest.Layers, v1.Descriptor{
+		MediaType: types.MediaType(MediaTypeCosignSimpleSigningV1JSON),
+		Digest: v1.Hash{
+			Algorithm: "sha512",
+			Hex:       strings.Repeat("ab", 64),
+		},
+		Size: 1,
+		Annotations: map[string]string{
+			annotationCosignSignature: base64.StdEncoding.EncodeToString([]byte("unread signature")),
+		},
+	})
+	modified, err := json.Marshal(manifest)
+	require.NoError(t, err)
+	mu.Lock()
+	overridePath = manifestRequestTarget(signatureTag).path
+	overrideBody = modified
+	mu.Unlock()
+
+	strictBundles, err := RetrieveBundlesStrict(t.Context(), parsed.Name(), nil)
+	require.ErrorIs(t, err, ErrBundleSetIncomplete)
+	assert.Empty(t, strictBundles, "strict retrieval must not expose the usable subset")
+
+	legacyBundles, err := RetrieveBundles(t.Context(), parsed.Name(), nil)
+	require.NoError(t, err)
+	require.Len(t, legacyBundles, 1)
+	_, err = VerifyBundleWithKey(legacyBundles[0], pubPEM)
+	require.NoError(t, err)
+}
+
+// TestStrictSignatureManifest404Classification separates an absent .sig tag
+// from a 404 returned while acquiring registry credentials. Both errors are
+// transport-level 404s, but only the exact manifest request means absence.
+func TestStrictSignatureManifest404Classification(t *testing.T) {
+	t.Parallel()
+
+	t.Run("missing signature manifest", func(t *testing.T) {
+		t.Parallel()
+
+		host := newTestRegistry(t)
+		parsed, digest := pushArtifact(t, host, "test/missing-signature")
+		tag := sigTag(parsed, digest)
+		target := signatureTarget{sigTag: tag, artifactDigest: digest, repo: tag.Context()}
+
+		_, err := getSimpleSigningLayers(t.Context(), target, nil, true)
+		require.ErrorIs(t, err, ErrProvenanceNotFoundOrIncomplete)
+		require.NotErrorIs(t, err, ErrBundleSetIncomplete)
+	})
+
+	t.Run("token endpoint not found", func(t *testing.T) {
+		t.Parallel()
+
+		var serverURL string
+		reg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case registryPingPath:
+				w.Header().Set("WWW-Authenticate", `Bearer realm="`+serverURL+`/token",service="test"`)
+				http.Error(w, "authentication required", http.StatusUnauthorized)
+			case "/token":
+				http.NotFound(w, r)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		serverURL = reg.URL
+		t.Cleanup(reg.Close)
+
+		host := strings.TrimPrefix(reg.URL, "http://")
+		tag, err := name.NewTag(host+"/test:missing.sig", name.Insecure)
+		require.NoError(t, err)
+		target := signatureTarget{sigTag: tag, repo: tag.Context()}
+
+		_, err = getSimpleSigningLayers(t.Context(), target, nil, true)
+		require.ErrorIs(t, err, ErrBundleSetIncomplete)
+		var transportErr *transport.Error
+		require.ErrorAs(t, err, &transportErr)
+		require.NotNil(t, transportErr.Request)
+		assert.Equal(t, "/token", transportErr.Request.URL.Path)
+	})
+
+	t.Run("redirect target not found", func(t *testing.T) {
+		t.Parallel()
+
+		var signaturePath string
+		reg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == registryPingPath:
+				w.WriteHeader(http.StatusOK)
+			case signaturePath != "" && r.URL.Path == signaturePath:
+				http.Redirect(w, r, "/login", http.StatusFound)
+			case r.URL.Path == "/login":
+				http.NotFound(w, r)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		t.Cleanup(reg.Close)
+
+		host := strings.TrimPrefix(reg.URL, "http://")
+		tag, err := name.NewTag(host+"/test:missing.sig", name.Insecure)
+		require.NoError(t, err)
+		signaturePath = manifestRequestTarget(tag).path
+		target := signatureTarget{sigTag: tag, repo: tag.Context()}
+
+		_, err = getSimpleSigningLayers(t.Context(), target, nil, true)
+		require.ErrorIs(t, err, ErrBundleSetIncomplete)
+		var transportErr *transport.Error
+		require.ErrorAs(t, err, &transportErr)
+		require.NotNil(t, transportErr.Request)
+		assert.Equal(t, "/login", transportErr.Request.URL.Path)
+	})
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+type countingReadCloser struct {
+	reader io.Reader
+	read   int64
+}
+
+func (r *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.read += int64(n)
+	return n, err
+}
+
+func (*countingReadCloser) Close() error { return nil }
+
+type oneByteErrorReadCloser struct {
+	err error
+}
+
+func (r *oneByteErrorReadCloser) Read(p []byte) (int, error) {
+	p[0] = 'x'
+	return 1, r.err
+}
+
+func (*oneByteErrorReadCloser) Close() error { return nil }
+
+// TestStrictResponseTransportEnforcesReadBudget proves the package limit is
+// applied while the body is read rather than after remote.Get has buffered
+// it. Only one probe byte beyond the accepted allowance reaches the source.
+func TestStrictResponseTransportEnforcesReadBudget(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		sourceSize int
+		wantErr    bool
+		wantRead   int64
+	}{
+		{name: "exact limit", sourceSize: 8, wantRead: 8},
+		{name: "over limit", sourceSize: 64, wantErr: true, wantRead: 9},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			target := registryRequestTarget{
+				host:            "registry.example",
+				path:            "/v2/test/manifests/signature",
+				acceptMediaType: string(types.OCIManifestSchema1),
+			}
+			source := &countingReadCloser{reader: bytes.NewReader(bytes.Repeat([]byte{'x'}, tc.sourceSize))}
+			limiter := newStrictResponseTransport(newResponseBodyBudget(8, "test manifest"), target)
+			limiter.inner = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       source,
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			})
+			req, err := http.NewRequest(
+				http.MethodGet, "https://registry.example/v2/test/manifests/signature", nil)
+			require.NoError(t, err)
+			req.Header.Set("Accept", string(types.OCIManifestSchema1))
+			resp, err := limiter.RoundTrip(req)
+			require.NoError(t, err)
+
+			body, err := io.ReadAll(resp.Body)
+			if tc.wantErr {
+				require.ErrorIs(t, err, ErrBundleSetIncomplete)
+				assert.Len(t, body, 8)
+			} else {
+				require.NoError(t, err)
+				assert.Len(t, body, tc.sourceSize)
+			}
+			assert.Equal(t, tc.wantRead, source.read)
+		})
+	}
+}
+
+// TestStrictResponseTransportSharesAggregateBudget covers separate referrer
+// manifest responses consuming one allowance. The second response cannot be
+// accepted merely because each response is individually small.
+func TestStrictResponseTransportSharesAggregateBudget(t *testing.T) {
+	t.Parallel()
+
+	target := registryRequestTarget{
+		host:            "registry.example",
+		path:            "/v2/test/manifests/referrer",
+		acceptMediaType: string(types.OCIManifestSchema1),
+	}
+	budget := newResponseBodyBudget(8, "aggregate test manifests")
+	sources := []*countingReadCloser{
+		{reader: bytes.NewReader([]byte("first"))},
+		{reader: bytes.NewReader([]byte("later"))},
+	}
+	call := 0
+	limiter := newStrictResponseTransport(budget, target)
+	limiter.inner = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := sources[call]
+		call++
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       body,
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})
+	req, err := http.NewRequest(http.MethodGet, "https://registry.example/v2/test/manifests/referrer", nil)
+	require.NoError(t, err)
+	req.Header.Set("Accept", string(types.OCIManifestSchema1))
+
+	first, err := limiter.RoundTrip(req)
+	require.NoError(t, err)
+	firstBody, err := io.ReadAll(first.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "first", string(firstBody))
+
+	second, err := limiter.RoundTrip(req)
+	require.NoError(t, err)
+	secondBody, err := io.ReadAll(second.Body)
+	require.ErrorIs(t, err, ErrBundleSetIncomplete)
+	assert.Equal(t, "lat", string(secondBody))
+	assert.Equal(t, int64(4), sources[1].read, "the second source is capped at the remainder plus one probe byte")
+}
+
+func TestBudgetedReadCloserPreservesProbeError(t *testing.T) {
+	t.Parallel()
+
+	cause := errors.New("injected terminal read error")
+	reader := &budgetedReadCloser{
+		ReadCloser: &oneByteErrorReadCloser{err: cause},
+		budget:     newResponseBodyBudget(0, "test manifest"),
+	}
+	_, err := reader.Read(make([]byte, 1))
+	require.ErrorIs(t, err, ErrBundleSetIncomplete)
+	require.ErrorIs(t, err, cause)
+}
+
+// TestStrictReferrersFallbackIndexIsReadBounded exercises the real
+// remote.Referrers fallback path with an injected transport. Its index-only
+// Accept header must still select the streaming limiter before the dependency
+// can apply its larger internal manifest allowance.
+func TestStrictReferrersFallbackIndexIsReadBounded(t *testing.T) {
+	t.Parallel()
+
+	digest, err := name.NewDigest("registry.example/test@sha256:" + strings.Repeat("a", 64))
+	require.NoError(t, err)
+	opts, detector := referrerDiscoveryOptions(
+		digest,
+		[]remote.Option{remote.WithContext(t.Context())},
+		true,
+	)
+	limiter, ok := detector.inner.(*strictResponseTransport)
+	require.True(t, ok)
+	source := &countingReadCloser{
+		reader: bytes.NewReader(bytes.Repeat([]byte{'x'}, int(MaxAttestationsBytesLimit+64))),
+	}
+	referrersTarget := referrersRequestTarget(digest)
+	fallbackTarget := indexManifestRequestTarget(
+		digest.Context().Tag(strings.Replace(digest.DigestStr(), ":", "-", 1)))
+	limiter.inner = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		status := http.StatusOK
+		body := io.NopCloser(bytes.NewReader(nil))
+		header := make(http.Header)
+		switch {
+		case req.URL.Path == registryPingPath:
+		case referrersTarget.matchesExactGET(req):
+			status = http.StatusNotFound
+		case fallbackTarget.matchesExactGET(req):
+			body = source
+			header.Set("Content-Type", string(types.OCIImageIndex))
+		default:
+			status = http.StatusNotFound
+		}
+		return &http.Response{
+			StatusCode: status,
+			Body:       body,
+			Header:     header,
+			Request:    req,
+		}, nil
+	})
+
+	_, err = remote.Referrers(digest, opts...)
+	require.ErrorIs(t, err, ErrBundleSetIncomplete)
+	assert.Equal(t, MaxAttestationsBytesLimit+1, source.read,
+		"the fallback index source must be read only through limit plus one probe byte")
 }
 
 // TestPoCRetrieveBundlesCapHidesValidPinnedKeySignature demonstrates that a

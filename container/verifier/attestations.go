@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/types"
@@ -71,8 +72,9 @@ func bundleFromAttestationTarget(
 	var budget *referrerRetrievalBudget
 	if strict {
 		budget = &referrerRetrievalBudget{
-			manifestBytes: MaxAttestationsBytesLimit,
-			bundleBytes:   MaxAttestationsBytesLimit,
+			manifestResponses: newResponseBodyBudget(
+				MaxAttestationsBytesLimit, "aggregate referrer manifest responses"),
+			bundleBytes: MaxAttestationsBytesLimit,
 		}
 	}
 	for _, refDesc := range refManifest.Manifests {
@@ -96,8 +98,8 @@ func bundleFromAttestationTarget(
 }
 
 type referrerRetrievalBudget struct {
-	manifestBytes int64
-	bundleBytes   int64
+	manifestResponses *responseBodyBudget
+	bundleBytes       int64
 }
 
 func getReferrersManifest(
@@ -106,7 +108,7 @@ func getReferrersManifest(
 	strict bool,
 ) (*v1.IndexManifest, error) {
 	digest := target.repo.Digest(target.artifactDigest.String())
-	referrerOpts, pagination := referrerDiscoveryOptions(opts, strict)
+	referrerOpts, pagination := referrerDiscoveryOptions(digest, opts, strict)
 	referrers, err := remote.Referrers(digest, referrerOpts...)
 	if err != nil {
 		if strict {
@@ -128,26 +130,39 @@ func getReferrersManifest(
 }
 
 type referrerPaginationDetector struct {
-	detected atomic.Bool
+	detected        atomic.Bool
+	inner           http.RoundTripper
+	referrersTarget registryRequestTarget
 }
 
 func (d *referrerPaginationDetector) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := remote.DefaultTransport.RoundTrip(req)
+	resp, err := d.inner.RoundTrip(req)
 	if err == nil && resp.StatusCode == http.StatusOK &&
-		strings.Contains(req.URL.Path, "/referrers/") && resp.Header.Get("Link") != "" {
+		d.referrersTarget.matchesGET(req) && resp.Header.Get("Link") != "" {
 		d.detected.Store(true)
 	}
 	return resp, err
 }
 
 func referrerDiscoveryOptions(
+	digest name.Digest,
 	opts []remote.Option,
 	strict bool,
 ) ([]remote.Option, *referrerPaginationDetector) {
 	if !strict {
 		return opts, nil
 	}
-	detector := &referrerPaginationDetector{}
+	referrersTarget := referrersRequestTarget(digest)
+	fallbackTag := digest.Context().Tag(strings.Replace(digest.DigestStr(), ":", "-", 1))
+	limiter := newStrictResponseTransport(
+		newResponseBodyBudget(MaxAttestationsBytesLimit, "referrers discovery response"),
+		referrersTarget,
+		indexManifestRequestTarget(fallbackTag),
+	)
+	detector := &referrerPaginationDetector{
+		inner:           limiter,
+		referrersTarget: referrersTarget,
+	}
 	strictOpts := make([]remote.Option, 0, len(opts)+1)
 	strictOpts = append(strictOpts, opts...)
 	strictOpts = append(strictOpts, remote.WithTransport(detector))
@@ -246,7 +261,11 @@ func getReferrerImage(
 		return remote.Image(ref, opts...)
 	}
 
-	desc, err := remote.Get(ref, opts...)
+	strictOpts := make([]remote.Option, 0, len(opts)+1)
+	strictOpts = append(strictOpts, opts...)
+	strictOpts = append(strictOpts, remote.WithTransport(newStrictResponseTransport(
+		budget.manifestResponses, manifestRequestTarget(ref))))
+	desc, err := remote.Get(ref, strictOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -256,11 +275,6 @@ func getReferrerImage(
 			"referrer %s manifest size mismatch: index=%d response=%d body=%d",
 			refDesc.Digest.String(), refDesc.Size, desc.Size, actualSize)
 	}
-	if actualSize > budget.manifestBytes {
-		return nil, bundleSetIncompletef("aggregate actual referrer manifest size exceeds the retrieval limit")
-	}
-	budget.manifestBytes -= actualSize
-
 	if isImageIndexMediaType(refDesc.MediaType) || isImageIndexMediaType(desc.MediaType) {
 		return nil, bundleSetIncompletef(
 			"referrer %s is an image index; strict retrieval cannot select one child",

@@ -160,6 +160,8 @@ func RetrieveBundles(ctx context.Context, imageRef string, keychain authn.Keycha
 // attached to imageRef. It resolves imageRef exactly once, then uses that
 // immutable artifact digest for both supported discovery layouts: OCI 1.1
 // referrers and the cosign "sha256-<hex>.sig" tag.
+// Historical cosign "sha256-<hex>.att" and "sha256-<hex>.sbom" tags are not
+// searched; completeness and ErrNoBundles apply only to the two layouts above.
 //
 // Unlike RetrieveBundles, this function never returns a usable prefix when
 // any potentially relevant bundle could not be assessed. Registry or blob
