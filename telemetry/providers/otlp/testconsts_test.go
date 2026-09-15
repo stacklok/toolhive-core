@@ -18,4 +18,8 @@ const (
 	testNameCustomPath   = "endpoint with custom path"
 	testEnvHeaderKey     = "x-env"
 	testInvalidCACert    = "/nonexistent/ca.crt"
+
+	testNameProtocolUnsetDefaultsHTTP = "unset protocol defaults to http/protobuf (backward compat)"
+	testNameProtocolExplicitHTTP      = "explicit http/protobuf"
+	testNameProtocolGRPC              = "grpc selects the gRPC exporter"
 )

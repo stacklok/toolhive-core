@@ -39,6 +39,15 @@ type Config struct {
 	LoggingEnabled bool              // LoggingEnabled controls whether logging is enabled for OTLP
 	SamplingRate   float64           // SamplingRate controls trace sampling (0.0 to 1.0)
 
+	// Protocol selects the OTLP transport for all signals: otlp.ProtocolGRPC
+	// ("grpc") or otlp.ProtocolHTTPProtobuf ("http/protobuf"). Leaving it
+	// empty means OTLP/HTTP with protobuf payloads, exactly today's behavior.
+	Protocol string
+	// TracesProtocol overrides Protocol for the traces signal only, e.g. to
+	// send traces over http/protobuf to a destination that rejects gRPC while
+	// metrics and logs still use Protocol. Falls back to Protocol when unset.
+	TracesProtocol string
+
 	// Prometheus configuration
 	EnablePrometheusMetricsPath bool // EnablePrometheusMetricsPath enables Prometheus /metrics endpoint
 
@@ -52,6 +61,14 @@ type Config struct {
 	// ExtraSpanProcessors contains additional OTEL span processors to register alongside the
 	// default OTLP exporter (e.g. a Sentry bridge processor for dual export).
 	ExtraSpanProcessors []sdktrace.SpanProcessor
+}
+
+// effectiveTracesProtocol returns TracesProtocol when set, else falls back to Protocol.
+func (c Config) effectiveTracesProtocol() string {
+	if c.TracesProtocol != "" {
+		return c.TracesProtocol
+	}
+	return c.Protocol
 }
 
 // ProviderOption is an option type used to configure the telemetry providers
@@ -107,6 +124,26 @@ func WithInsecure(insecure bool) ProviderOption {
 func WithCACertPath(path string) ProviderOption {
 	return func(config *Config) error {
 		config.CACertPath = path
+		return nil
+	}
+}
+
+// WithProtocol sets the OTLP transport protocol for all signals (see otlp.ProtocolGRPC
+// and otlp.ProtocolHTTPProtobuf). Leaving it unset preserves the default OTLP/HTTP behavior.
+func WithProtocol(protocol string) ProviderOption {
+	return func(config *Config) error {
+		config.Protocol = protocol
+		return nil
+	}
+}
+
+// WithTracesProtocol overrides the OTLP transport protocol for the traces signal only,
+// independent of Protocol. Useful when traces and metrics/logs must reach destinations
+// with different transport requirements (e.g. traces over http/protobuf while metrics
+// stay on gRPC).
+func WithTracesProtocol(protocol string) ProviderOption {
+	return func(config *Config) error {
+		config.TracesProtocol = protocol
 		return nil
 	}
 }
