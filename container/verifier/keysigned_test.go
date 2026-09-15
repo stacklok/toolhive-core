@@ -422,7 +422,7 @@ func TestFetchSimpleSigningPayloadRejectsTamperedBlob(t *testing.T) {
 	_, err := fetchSimpleSigningPayload(t.Context(), parsed.Context(), v1.Descriptor{
 		MediaType: types.MediaType(MediaTypeCosignSimpleSigningV1JSON),
 		Digest:    v1.Hash{Algorithm: DigestAlgorithmSHA256, Hex: hex.EncodeToString(bogus[:])},
-	}, nil, maxSimpleSigningPayloadTotalBytes)
+	}, nil, maxSimpleSigningPayloadTotalBytes, false)
 	require.Error(t, err)
 
 	// An unsupported digest algorithm is refused before any network call:
@@ -430,7 +430,7 @@ func TestFetchSimpleSigningPayloadRejectsTamperedBlob(t *testing.T) {
 	_, err = fetchSimpleSigningPayload(t.Context(), parsed.Context(), v1.Descriptor{
 		MediaType: types.MediaType(MediaTypeCosignSimpleSigningV1JSON),
 		Digest:    v1.Hash{Algorithm: "sha512", Hex: strings.Repeat("ab", 64)},
-	}, nil, maxSimpleSigningPayloadTotalBytes)
+	}, nil, maxSimpleSigningPayloadTotalBytes, false)
 	require.ErrorContains(t, err, "unsupported simple signing layer digest algorithm")
 }
 

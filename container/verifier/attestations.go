@@ -6,96 +6,89 @@ package verifier
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 	containerdigest "github.com/opencontainers/go-digest"
 	"github.com/sigstore/sigstore-go/pkg/bundle"
 )
+
+// maxSigstoreReferrers bounds the registry work caused by a single referrers
+// index in strict mode. Descriptors with a non-Sigstore artifact type are not
+// counted; ambiguous descriptors are, because deciding whether they carry a
+// bundle requires fetching them.
+const maxSigstoreReferrers = 32
 
 // bundleFromAttestation retrieves the attestation bundles from the image reference. Note that the attestation
 // bundles are stored as OCI image references. The function uses the referrers API to get the attestation. GitHub supports
 // discovering the attestations via their API, but this is not supported here for now.
 func bundleFromAttestation(ctx context.Context, imageRef string, keychain authn.Keychain) ([]sigstoreBundle, error) {
-	var bundles []sigstoreBundle
+	target, err := getSignatureReferenceFromOCIImage(ctx, imageRef, keychain)
+	if err != nil {
+		return nil, err
+	}
+	return bundleFromAttestationTarget(ctx, target, keychain, false)
+}
 
-	// Get the auth options
+// bundleFromAttestationTarget retrieves referrer bundles for an
+// already-resolved artifact. Strict mode reports any operational failure or
+// work-limit truncation as ErrBundleSetIncomplete, while material that was
+// fully fetched but is malformed remains an unusable/rejected bundle.
+func bundleFromAttestationTarget(
+	ctx context.Context,
+	target signatureTarget,
+	keychain authn.Keychain,
+	strict bool,
+) ([]sigstoreBundle, error) {
 	opts := []remote.Option{remote.WithAuthFromKeychain(keychain), remote.WithContext(ctx)}
-
-	// Get the image reference
-	ref, err := name.ParseReference(imageRef)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing image reference: %w", err)
-	}
-
-	// Get the image descriptor
-	desc, err := remote.Get(ref, opts...)
-	if err != nil {
-		return nil, fmt.Errorf("error getting image descriptor: %w", err)
-	}
-
-	// Get the digest
-	digest := ref.Context().Digest(desc.Digest.String())
-
-	// Get the digest in bytes
-	digestByte, err := hex.DecodeString(desc.Digest.Hex)
+	digestByte, err := hex.DecodeString(target.artifactDigest.Hex)
 	if err != nil {
 		return nil, err
 	}
 
-	// Use the referrers API to get the attestation reference
-	referrers, err := remote.Referrers(digest, opts...)
+	refManifest, err := getReferrersManifest(target, opts, strict)
 	if err != nil {
-		return nil, fmt.Errorf("error getting referrers: %w, %s", ErrProvenanceNotFoundOrIncomplete, err.Error())
+		return nil, err
+	}
+	if err := checkReferrerLimit(refManifest.Manifests, strict); err != nil {
+		return nil, err
 	}
 
-	refManifest, err := referrers.IndexManifest()
-	if err != nil {
-		return nil, fmt.Errorf("error getting referrers manifest: %w, %s", ErrProvenanceNotFoundOrIncomplete, err.Error())
+	digestAlgo := containerdigest.Canonical.String()
+	if strict {
+		digestAlgo = target.artifactDigest.Algorithm
 	}
-
-	// Loop through all available attestations and extract the bundle
+	bundles := make([]sigstoreBundle, 0, len(refManifest.Manifests))
+	var budget *referrerRetrievalBudget
+	if strict {
+		budget = &referrerRetrievalBudget{
+			manifestResponses: newResponseBodyBudget(
+				MaxAttestationsBytesLimit, "aggregate referrer manifest responses"),
+			bundleBytes: MaxAttestationsBytesLimit,
+		}
+	}
 	for _, refDesc := range refManifest.Manifests {
-		// Fast path: skip referrers that are clearly not sigstore bundles without
-		// fetching the manifest. Only do a deep inspection when the artifact type
-		// is ambiguous (empty or "application/vnd.oci.empty.v1+json"), which
-		// happens due to a go-containerregistry bug (google/go-containerregistry#1997)
-		// where the referrers fallback tag doesn't propagate the inner manifest's
-		// artifactType.
-		if !hasSigstoreBundlePrefix(refDesc.ArtifactType) &&
-			refDesc.ArtifactType != MediaTypeOCIEmptyV1JSON &&
-			refDesc.ArtifactType != "" {
-			continue
-		}
-
-		refImg, err := remote.Image(ref.Context().Digest(refDesc.Digest.String()), opts...)
+		b, err := bundleFromReferrer(target, refDesc, opts, strict, budget)
 		if err != nil {
-			slog.Debug("error getting referrer image", "error", err)
+			return nil, err
+		}
+		if b == nil {
 			continue
 		}
-
-		// When the index descriptor's artifactType is ambiguous, inspect the
-		// actual manifest to determine whether this is a sigstore bundle.
-		if !hasSigstoreBundlePrefix(refDesc.ArtifactType) && !isSigstoreBundle(refImg) {
-			continue
-		}
-
-		b, err := extractBundleFromImage(refImg)
-		if err != nil {
-			slog.Debug("error extracting bundle from referrer", "error", err)
-			continue
-		}
-
 		bundles = append(bundles, sigstoreBundle{
 			bundle:      b,
 			digestBytes: digestByte,
-			digestAlgo:  containerdigest.Canonical.String(),
+			digestAlgo:  digestAlgo,
 		})
 	}
 	if len(bundles) == 0 {
@@ -104,30 +97,272 @@ func bundleFromAttestation(ctx context.Context, imageRef string, keychain authn.
 	return bundles, nil
 }
 
+type referrerRetrievalBudget struct {
+	manifestResponses *responseBodyBudget
+	bundleBytes       int64
+}
+
+func getReferrersManifest(
+	target signatureTarget,
+	opts []remote.Option,
+	strict bool,
+) (*v1.IndexManifest, error) {
+	digest := target.repo.Digest(target.artifactDigest.String())
+	referrerOpts, pagination := referrerDiscoveryOptions(digest, opts, strict)
+	referrers, err := remote.Referrers(digest, referrerOpts...)
+	if err != nil {
+		if strict {
+			return nil, bundleSetIncompleteBecause(err, "reading referrers index")
+		}
+		return nil, fmt.Errorf("error getting referrers: %w, %s", ErrProvenanceNotFoundOrIncomplete, err.Error())
+	}
+	if pagination != nil && pagination.detected.Load() {
+		return nil, bundleSetIncompletef("referrers response is paginated")
+	}
+	refManifest, err := referrers.IndexManifest()
+	if err != nil {
+		if strict {
+			return nil, bundleSetIncompleteBecause(err, "parsing referrers index")
+		}
+		return nil, fmt.Errorf("error getting referrers manifest: %w, %s", ErrProvenanceNotFoundOrIncomplete, err.Error())
+	}
+	return refManifest, nil
+}
+
+type referrerPaginationDetector struct {
+	detected        atomic.Bool
+	inner           http.RoundTripper
+	referrersTarget registryRequestTarget
+}
+
+func (d *referrerPaginationDetector) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := d.inner.RoundTrip(req)
+	if err == nil && resp.StatusCode == http.StatusOK &&
+		d.referrersTarget.matchesGET(req) && resp.Header.Get("Link") != "" {
+		d.detected.Store(true)
+	}
+	return resp, err
+}
+
+func referrerDiscoveryOptions(
+	digest name.Digest,
+	opts []remote.Option,
+	strict bool,
+) ([]remote.Option, *referrerPaginationDetector) {
+	if !strict {
+		return opts, nil
+	}
+	referrersTarget := referrersRequestTarget(digest)
+	fallbackTag := digest.Context().Tag(strings.Replace(digest.DigestStr(), ":", "-", 1))
+	limiter := newStrictResponseTransport(
+		newResponseBodyBudget(MaxAttestationsBytesLimit, "referrers discovery response"),
+		referrersTarget,
+		indexManifestRequestTarget(fallbackTag),
+	)
+	detector := &referrerPaginationDetector{
+		inner:           limiter,
+		referrersTarget: referrersTarget,
+	}
+	strictOpts := make([]remote.Option, 0, len(opts)+1)
+	strictOpts = append(strictOpts, opts...)
+	strictOpts = append(strictOpts, remote.WithTransport(detector))
+	return strictOpts, detector
+}
+
+func checkReferrerLimit(referrers []v1.Descriptor, strict bool) error {
+	if !strict {
+		return nil
+	}
+	potentiallyRelevant, err := validateReferrerCandidateManifests(referrers)
+	if err != nil {
+		return err
+	}
+	if potentiallyRelevant <= maxSigstoreReferrers {
+		return nil
+	}
+	return bundleSetIncompletef(
+		"referrers index has %d potentially relevant bundles; limit is %d",
+		potentiallyRelevant, maxSigstoreReferrers)
+}
+
+func validateReferrerCandidateManifests(referrers []v1.Descriptor) (int, error) {
+	potentiallyRelevant := 0
+	var totalSize int64
+	for _, refDesc := range referrers {
+		if !isPotentiallySigstoreReferrer(refDesc) {
+			continue
+		}
+		potentiallyRelevant++
+		if refDesc.Size <= 0 {
+			return 0, bundleSetIncompletef(
+				"referrer %s has invalid declared manifest size %d",
+				refDesc.Digest.String(), refDesc.Size)
+		}
+		if refDesc.Size > MaxAttestationsBytesLimit-totalSize {
+			return 0, bundleSetIncompletef(
+				"aggregate declared referrer manifest size exceeds the retrieval limit")
+		}
+		totalSize += refDesc.Size
+	}
+	return potentiallyRelevant, nil
+}
+
+func bundleFromReferrer(
+	target signatureTarget,
+	refDesc v1.Descriptor,
+	opts []remote.Option,
+	strict bool,
+	budget *referrerRetrievalBudget,
+) (*bundle.Bundle, error) {
+	if !isPotentiallySigstoreReferrer(refDesc) {
+		return nil, nil
+	}
+	refImg, err := getReferrerImage(target, refDesc, opts, strict, budget)
+	if err != nil {
+		return nil, handleReferrerAcquisitionError(strict, "getting referrer image", refDesc, err)
+	}
+	if !hasSigstoreBundlePrefix(refDesc.ArtifactType) {
+		isBundle, inspectErr := inspectSigstoreBundle(refImg)
+		if inspectErr != nil {
+			return nil, handleReferrerAcquisitionError(strict, "inspecting referrer", refDesc, inspectErr)
+		}
+		if !isBundle {
+			return nil, nil
+		}
+	}
+	readBudget := MaxAttestationsBytesLimit
+	if strict {
+		readBudget = budget.bundleBytes
+	}
+	b, bytesRead, err := extractBundleFromImage(refImg, strict, readBudget)
+	if strict {
+		budget.bundleBytes -= bytesRead
+	}
+	if err != nil {
+		if strict && errors.Is(err, ErrBundleSetIncomplete) {
+			return nil, err
+		}
+		slog.Debug("error extracting bundle from referrer",
+			"referrer_digest", refDesc.Digest.String(), "error", err)
+		return nil, nil
+	}
+	return b, nil
+}
+
+func getReferrerImage(
+	target signatureTarget,
+	refDesc v1.Descriptor,
+	opts []remote.Option,
+	strict bool,
+	budget *referrerRetrievalBudget,
+) (v1.Image, error) {
+	ref := target.repo.Digest(refDesc.Digest.String())
+	if !strict {
+		return remote.Image(ref, opts...)
+	}
+
+	strictOpts := make([]remote.Option, 0, len(opts)+1)
+	strictOpts = append(strictOpts, opts...)
+	strictOpts = append(strictOpts, remote.WithTransport(newStrictResponseTransport(
+		budget.manifestResponses, manifestRequestTarget(ref))))
+	desc, err := remote.Get(ref, strictOpts...)
+	if err != nil {
+		return nil, err
+	}
+	actualSize := int64(len(desc.Manifest))
+	if desc.Size != refDesc.Size || actualSize != refDesc.Size {
+		return nil, bundleSetIncompletef(
+			"referrer %s manifest size mismatch: index=%d response=%d body=%d",
+			refDesc.Digest.String(), refDesc.Size, desc.Size, actualSize)
+	}
+	if isImageIndexMediaType(refDesc.MediaType) || isImageIndexMediaType(desc.MediaType) {
+		return nil, bundleSetIncompletef(
+			"referrer %s is an image index; strict retrieval cannot select one child",
+			refDesc.Digest.String())
+	}
+	return desc.Image()
+}
+
+func isImageIndexMediaType(mediaType types.MediaType) bool {
+	return mediaType == types.OCIImageIndex || mediaType == types.DockerManifestList
+}
+
+func isPotentiallySigstoreReferrer(refDesc v1.Descriptor) bool {
+	return hasSigstoreBundlePrefix(refDesc.ArtifactType) ||
+		refDesc.ArtifactType == MediaTypeOCIEmptyV1JSON || refDesc.ArtifactType == ""
+}
+
+func handleReferrerAcquisitionError(strict bool, operation string, refDesc v1.Descriptor, err error) error {
+	if strict {
+		if errors.Is(err, ErrBundleSetIncomplete) {
+			return err
+		}
+		return bundleSetIncompleteBecause(err, "%s %s", operation, refDesc.Digest.String())
+	}
+	slog.Debug("error "+operation, "referrer_digest", refDesc.Digest.String(), "error", err)
+	return nil
+}
+
 // extractBundleFromImage reads and parses a sigstore bundle from the first layer of an OCI image.
-func extractBundleFromImage(img v1.Image) (*bundle.Bundle, error) {
+func extractBundleFromImage(img v1.Image, strict bool, readBudget int64) (*bundle.Bundle, int64, error) {
 	layers, err := img.Layers()
 	if err != nil {
-		return nil, fmt.Errorf("error getting referrer layers: %w", err)
+		if strict {
+			return nil, 0, bundleSetIncompleteBecause(err, "getting referrer layers")
+		}
+		return nil, 0, fmt.Errorf("error getting referrer layers: %w", err)
 	}
-	if len(layers) == 0 {
-		return nil, fmt.Errorf("referrer has no layers")
+	readLimit, err := referrerLayerReadLimit(len(layers), strict, readBudget)
+	if err != nil {
+		return nil, 0, err
 	}
 	layer0, err := layers[0].Uncompressed()
 	if err != nil {
-		return nil, fmt.Errorf("error uncompressing referrer layer: %w", err)
+		if strict {
+			return nil, 0, bundleSetIncompleteBecause(err, "opening referrer layer")
+		}
+		return nil, 0, fmt.Errorf("error uncompressing referrer layer: %w", err)
 	}
-	// Cap the read: the layer comes from the registry (untrusted) and the
-	// signature-manifest path enforces the same limit.
-	bundleBytes, err := io.ReadAll(io.LimitReader(layer0, MaxAttestationsBytesLimit))
+	defer func() { _ = layer0.Close() }()
+	bundleBytes, err := io.ReadAll(io.LimitReader(layer0, readLimit))
 	if err != nil {
-		return nil, fmt.Errorf("error reading referrer layer: %w", err)
+		if strict {
+			return nil, int64(len(bundleBytes)), bundleSetIncompleteBecause(err, "reading referrer layer")
+		}
+		return nil, int64(len(bundleBytes)), fmt.Errorf("error reading referrer layer: %w", err)
+	}
+	bytesRead := int64(len(bundleBytes))
+	if strict && bytesRead > readBudget {
+		return nil, bytesRead, bundleSetIncompletef("aggregate referrer bundle byte limit is exceeded")
 	}
 	b := &bundle.Bundle{}
 	if err = b.UnmarshalJSON(bundleBytes); err != nil {
-		return nil, fmt.Errorf("error unmarshalling bundle: %w", err)
+		return nil, bytesRead, fmt.Errorf("error unmarshalling bundle: %w", err)
 	}
-	return b, nil
+	return b, bytesRead, nil
+}
+
+func referrerLayerReadLimit(layerCount int, strict bool, readBudget int64) (int64, error) {
+	if layerCount == 0 {
+		return 0, fmt.Errorf("referrer has no layers")
+	}
+	if strict && layerCount > 1 {
+		return 0, bundleSetIncompletef(
+			"referrer has %d layers; strict retrieval requires exactly one", layerCount)
+	}
+	if strict && readBudget <= 0 {
+		return 0, bundleSetIncompletef("aggregate referrer bundle byte limit is exhausted")
+	}
+
+	// Cap the read: the layer comes from the registry (untrusted) and the
+	// signature-manifest path enforces the same limit.
+	readLimit := min(readBudget, MaxAttestationsBytesLimit)
+	if strict {
+		// Read one bounded byte beyond the accepted limit so strict retrieval
+		// can distinguish truncation from completely read malformed content.
+		readLimit++
+	}
+	return readLimit, nil
 }
 
 // isSigstoreBundle inspects the actual manifest of a referrer image to
@@ -135,25 +370,36 @@ func extractBundleFromImage(img v1.Image) (*bundle.Bundle, error) {
 // the referrer index descriptor's artifactType is ambiguous (e.g. GHCR sets it
 // to "application/vnd.oci.empty.v1+json" due to google/go-containerregistry#1997).
 func isSigstoreBundle(img v1.Image) bool {
-	mf, err := img.Manifest()
+	isBundle, err := inspectSigstoreBundle(img)
 	if err != nil {
 		slog.Debug("error fetching manifest for sigstore bundle check", "error", err)
 		return false
 	}
+	return isBundle
+}
+
+// inspectSigstoreBundle is the error-preserving form of isSigstoreBundle.
+// Strict retrieval needs the error to distinguish an operationally
+// incomplete inspection from fully-read malformed material.
+func inspectSigstoreBundle(img v1.Image) (bool, error) {
+	mf, err := img.Manifest()
+	if err != nil {
+		return false, err
+	}
 
 	// Check the config descriptor's artifactType (set by cosign v2+ when using OCI 1.1 referrers)
 	if hasSigstoreBundlePrefix(mf.Config.ArtifactType) {
-		return true
+		return true, nil
 	}
 
 	// Check layer media types as a final fallback
 	for _, layer := range mf.Layers {
 		if hasSigstoreBundlePrefix(string(layer.MediaType)) {
-			return true
+			return true, nil
 		}
 	}
 
-	return false
+	return false, nil
 }
 
 // hasSigstoreBundlePrefix checks if a media/artifact type string indicates a sigstore bundle.
