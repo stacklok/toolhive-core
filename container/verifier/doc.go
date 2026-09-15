@@ -9,12 +9,12 @@
 //   - [New] builds a [Sigstore] verifier with a live TUF-refreshed trust
 //     root for verifying MCP server images against registry-declared
 //     provenance ([Sigstore.VerifyServer]).
-//   - [RetrieveBundles], [VerifyBundle], [VerifyBundleWithKey], and
-//     [VerifyBundleOffline] expose the bundle-level building blocks for
-//     consumers that manage their own trust decisions — retrieving the
-//     bundles attached to an artifact, verifying them against keyless
-//     (Fulcio) or key-pair material, binding an expected [Identity] into
-//     the verification policy, and re-verifying stored bundles offline
+//   - [RetrieveBundles], [RetrieveBundlesStrict], [VerifyBundle],
+//     [VerifyBundleWithKey], and [VerifyBundleOffline] expose the bundle-level
+//     building blocks for consumers that manage their own trust decisions —
+//     retrieving the bundles attached to an artifact, verifying them against
+//     keyless (Fulcio) or key-pair material, binding an expected [Identity]
+//     into the verification policy, and re-verifying stored bundles offline
 //     against the embedded trust root.
 //
 // # Verifying a retrieved bundle
@@ -30,6 +30,11 @@
 //	identity, _ := verifier.IdentityFromResult(result)
 //	// store bundles[0].Raw and identity; later:
 //	_, err = verifier.VerifyBundleOffline(storedRaw, "sha256:"+artifactHex, &identity)
+//
+// Callers that use a negative verification result to make trust decisions
+// should use [RetrieveBundlesStrict]. It returns [ErrBundleSetIncomplete]
+// instead of a partial slice when registry failures or resource limits mean
+// not every potentially relevant attachment could be assessed.
 //
 // Key-signed bundles (Bundle.HasCertificate() == false, the "cosign sign
 // --key" layout) carry no certificate identity; verify them with

@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"path"
 
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/sigstore/sigstore-go/pkg/tuf"
 	"github.com/sigstore/sigstore-go/pkg/verify"
 )
@@ -38,6 +40,51 @@ var (
 	// We'll limit this to 10mb for now
 	MaxAttestationsBytesLimit int64 = 10 * 1024 * 1024
 )
+
+// bundleMaterialFetchError marks an operational failure while downloading
+// material named by an already-read manifest. Its Error and Unwrap methods
+// preserve the legacy error text and chain; strict retrieval uses the marker
+// to distinguish an incomplete read from malformed material that was fully
+// downloaded and rejected.
+type bundleMaterialFetchError struct {
+	err error
+}
+
+func (e *bundleMaterialFetchError) Error() string { return e.err.Error() }
+func (e *bundleMaterialFetchError) Unwrap() error { return e.err }
+
+func markBundleMaterialFetchError(err error) error {
+	return &bundleMaterialFetchError{err: err}
+}
+
+func isBundleMaterialFetchError(err error) bool {
+	var fetchErr *bundleMaterialFetchError
+	return errors.As(err, &fetchErr)
+}
+
+// isOperationalFetchError separates an interrupted registry/blob read from
+// content that was completely read but could not be parsed or used. Strict
+// retrieval must report the former as an incomplete bundle set, while the
+// latter is simply rejected verification material.
+func isOperationalFetchError(err error) bool {
+	if isBundleMaterialFetchError(err) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var transportErr *transport.Error
+	if errors.As(err, &transportErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+func bundleSetIncompletef(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrBundleSetIncomplete, fmt.Sprintf(format, args...))
+}
+
+func bundleSetIncompleteBecause(cause error, format string, args ...any) error {
+	return fmt.Errorf("%w: %s: %w", ErrBundleSetIncomplete, fmt.Sprintf(format, args...), cause)
+}
 
 // OCI and Sigstore media type constants used when inspecting referrer manifests.
 const (
@@ -178,6 +225,49 @@ func getSigstoreBundles(
 	// Nothing usable. A signature that was found and refused for not
 	// covering this artifact is a different verdict from no signature at all
 	// and is reported as itself.
+	if errors.Is(sigErr, ErrSignatureArtifactMismatch) {
+		return nil, sigErr
+	}
+	return nil, ErrProvenanceNotFoundOrIncomplete
+}
+
+// getSigstoreBundlesStrict resolves imageRef once and requires complete,
+// bounded retrieval from both supported attachment layouts. It deliberately
+// does not reuse getSigstoreBundles: that legacy path preserves permissive
+// partial-result behavior for existing callers.
+func getSigstoreBundlesStrict(
+	ctx context.Context,
+	imageRef string,
+	keychain authn.Keychain,
+) ([]sigstoreBundle, error) {
+	target, err := getSignatureReferenceFromOCIImage(ctx, imageRef, keychain)
+	if err != nil {
+		if isOperationalFetchError(err) {
+			return nil, bundleSetIncompleteBecause(err, "resolving artifact reference")
+		}
+		return nil, err
+	}
+
+	referrerBundles, referrerErr := bundleFromAttestationTarget(ctx, target, keychain, true)
+	if referrerErr != nil && !errors.Is(referrerErr, ErrProvenanceNotFoundOrIncomplete) {
+		return nil, referrerErr
+	}
+
+	sigBundles, sigErr := bundleFromSigstoreSignedTarget(ctx, target, keychain, true)
+	switch {
+	case sigErr == nil:
+	case errors.Is(sigErr, ErrProvenanceNotFoundOrIncomplete), errors.Is(sigErr, ErrSignatureArtifactMismatch):
+		// Absence and fully assessed, rejected material do not make the set
+		// incomplete. A mismatch is returned below only when no referrer
+		// bundle remains usable.
+	default:
+		return nil, sigErr
+	}
+
+	bundles := append(referrerBundles, sigBundles...)
+	if len(bundles) > 0 {
+		return bundles, nil
+	}
 	if errors.Is(sigErr, ErrSignatureArtifactMismatch) {
 		return nil, sigErr
 	}

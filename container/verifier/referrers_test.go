@@ -4,11 +4,17 @@
 package verifier
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
@@ -87,6 +93,34 @@ func referrersTag(repo name.Repository, artifact v1.Hash) name.Tag {
 	return repo.Tag(fmt.Sprint(artifact.Algorithm, "-", artifact.Hex))
 }
 
+// paginatedReferrersRegistry returns an empty but successful first referrers
+// page with a Link header. Other registry operations are handled normally so
+// tests can attach usable cosign material to the same artifact.
+func paginatedReferrersRegistry(t *testing.T) string {
+	t.Helper()
+
+	firstPage, err := json.Marshal(v1.IndexManifest{
+		SchemaVersion: 2,
+		MediaType:     types.OCIImageIndex,
+		Manifests:     []v1.Descriptor{},
+	})
+	require.NoError(t, err)
+
+	inner := registry.New()
+	reg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/referrers/") {
+			w.Header().Set("Content-Type", string(types.OCIImageIndex))
+			w.Header().Set("Link", `</v2/test/referrers/next>; rel="next"`)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(firstPage)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(reg.Close)
+	return strings.TrimPrefix(reg.URL, "http://")
+}
+
 // TestRetrieveAttestationBundleRoundTrip pins the referrer path: it was
 // already bound to the artifact digest by construction and must stay that
 // way, persisting as bare Sigstore bundle JSON with no payload wrapper.
@@ -117,6 +151,28 @@ func TestRetrieveAttestationBundleRoundTrip(t *testing.T) {
 
 	_, err = VerifyBundleOfflineWithKey(bundles[0].Raw, d.String(), pubPEM)
 	require.NoError(t, err, "the stored attestation bundle must re-verify against the artifact digest")
+}
+
+// TestRetrieveBundlesStrictAttestationRoundTrip is the positive strict-path
+// counterpart to the fail-closed referrer tests below. A normal one-layer
+// Sigstore referrer is a complete bounded set and must remain retrievable and
+// cryptographically verifiable.
+func TestRetrieveBundlesStrictAttestationRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	host := newTestRegistry(t)
+	parsed, d := pushArtifact(t, host, "test/strict-attested")
+	pubPEM := attachAttestationReferrer(t, parsed, d)
+
+	bundles, err := RetrieveBundlesStrict(t.Context(), parsed.Name(), nil)
+	require.NoError(t, err)
+	require.Len(t, bundles, 1)
+	assert.Equal(t, d.Hex, bundles[0].DigestHex)
+	assert.Empty(t, bundles[0].SimpleSigningPayload)
+	_, err = VerifyBundleWithKey(bundles[0], pubPEM)
+	require.NoError(t, err)
+	_, err = VerifyBundleOfflineWithKey(bundles[0].Raw, d.String(), pubPEM)
+	require.NoError(t, err)
 }
 
 // TestRetrieveBundlesReturnsBothLayouts covers discovery when an artifact
@@ -169,6 +225,201 @@ func TestRetrieveBundlesKeepsAttestationWhenSignatureIsSubstituted(t *testing.T)
 	require.Len(t, bundles, 1, "the substituted signature must be dropped")
 	_, err = VerifyBundleWithKey(bundles[0], attestationPub)
 	require.NoError(t, err)
+}
+
+// TestRetrieveBundlesStrictRejectsPaginatedReferrers guards against treating
+// the first page as the complete signer set. A valid cosign signature cannot
+// soften that ambiguity; the legacy best-effort API remains compatible.
+func TestRetrieveBundlesStrictRejectsPaginatedReferrers(t *testing.T) {
+	t.Parallel()
+
+	host := paginatedReferrersRegistry(t)
+	parsed, d := pushArtifact(t, host, "test/paginated-referrers")
+	pubPEM := attachKeySignature(t, sigTag(parsed, d), simpleSigningPayloadFor(parsed.Context().Name(), d))
+
+	strictBundles, err := RetrieveBundlesStrict(t.Context(), parsed.Name(), nil)
+	require.ErrorIs(t, err, ErrBundleSetIncomplete)
+	assert.Empty(t, strictBundles, "strict retrieval must not expose cosign material beside an incomplete layout")
+
+	legacyBundles, err := RetrieveBundles(t.Context(), parsed.Name(), nil)
+	require.NoError(t, err, "legacy retrieval must retain its best-effort behavior")
+	require.Len(t, legacyBundles, 1)
+	_, err = VerifyBundleWithKey(legacyBundles[0], pubPEM)
+	require.NoError(t, err)
+}
+
+// TestRetrieveBundlesStrictRejectsMultiLayerReferrer pins the referrer shape
+// invariant. Reading only layer zero would make later bundle material
+// invisible, so strict retrieval must return neither it nor any partial
+// result; legacy retrieval continues to use its historical first layer.
+func TestRetrieveBundlesStrictRejectsMultiLayerReferrer(t *testing.T) {
+	t.Parallel()
+
+	host := newTestRegistry(t)
+	parsed, d := pushArtifact(t, host, "test/multi-layer-referrer")
+	rawBundle, _, _ := signTestBundle(t, []byte("first layer bundle"))
+
+	refImg := empty.Image
+	for _, content := range [][]byte{rawBundle, []byte("second potentially relevant layer")} {
+		var err error
+		refImg, err = mutate.Append(refImg, mutate.Addendum{
+			Layer:     static.NewLayer(content, types.MediaType(MediaTypeSigstoreBundleV03JSON)),
+			MediaType: types.MediaType(MediaTypeSigstoreBundleV03JSON),
+		})
+		require.NoError(t, err)
+	}
+	refImg = mutate.MediaType(refImg, types.OCIManifestSchema1)
+	refImg = mutate.ConfigMediaType(refImg, types.MediaType(MediaTypeSigstoreBundleV03JSON))
+	index := mutate.AppendManifests(empty.Index, mutate.IndexAddendum{Add: refImg})
+	require.NoError(t, remote.WriteIndex(referrersTag(parsed.Context(), d), index))
+
+	strictBundles, err := RetrieveBundlesStrict(t.Context(), parsed.Name(), nil)
+	require.ErrorIs(t, err, ErrBundleSetIncomplete)
+	assert.Empty(t, strictBundles, "strict retrieval must not expose layer zero as a complete bundle set")
+
+	legacyBundles, err := RetrieveBundles(t.Context(), parsed.Name(), nil)
+	require.NoError(t, err, "legacy retrieval must retain its first-layer behavior")
+	require.Len(t, legacyBundles, 1)
+}
+
+// TestRetrieveBundlesStrictRejectsLyingReferrerManifestSize ensures an index
+// cannot evade the aggregate manifest budget by declaring a tiny size for a
+// larger candidate. The child image itself is valid and retrievable; only the
+// discovery descriptor's size is dishonest.
+func TestRetrieveBundlesStrictRejectsLyingReferrerManifestSize(t *testing.T) {
+	t.Parallel()
+
+	host := newTestRegistry(t)
+	parsed, d := pushArtifact(t, host, "test/lying-referrer-size")
+	rawBundle, _, _ := signTestBundle(t, []byte("valid referrer bundle"))
+	refImg, err := mutate.Append(empty.Image, mutate.Addendum{
+		Layer:     static.NewLayer(rawBundle, types.MediaType(MediaTypeSigstoreBundleV03JSON)),
+		MediaType: types.MediaType(MediaTypeSigstoreBundleV03JSON),
+	})
+	require.NoError(t, err)
+	refImg = mutate.MediaType(refImg, types.OCIManifestSchema1)
+	refImg = mutate.ConfigMediaType(refImg, types.MediaType(MediaTypeSigstoreBundleV03JSON))
+	actualSize, err := refImg.Size()
+	require.NoError(t, err)
+	require.Greater(t, actualSize, int64(1))
+
+	index := mutate.AppendManifests(empty.Index, mutate.IndexAddendum{
+		Add: refImg,
+		Descriptor: v1.Descriptor{
+			Size: 1,
+		},
+	})
+	require.NoError(t, remote.WriteIndex(referrersTag(parsed.Context(), d), index))
+
+	bundles, err := RetrieveBundlesStrict(t.Context(), parsed.Name(), nil)
+	require.ErrorIs(t, err, ErrBundleSetIncomplete)
+	assert.Empty(t, bundles, "strict retrieval must not trust a lying candidate size")
+}
+
+// TestRetrieveBundlesStrictRejectsIndexShapedReferrer ensures every relevant
+// discovery descriptor is assessed as exactly one image manifest. Treating a
+// nested index as an image could hide additional candidate manifests behind
+// one counted descriptor.
+func TestRetrieveBundlesStrictRejectsIndexShapedReferrer(t *testing.T) {
+	t.Parallel()
+
+	host := newTestRegistry(t)
+	parsed, d := pushArtifact(t, host, "test/index-shaped-referrer")
+	nested := empty.Index
+	index := mutate.AppendManifests(empty.Index, mutate.IndexAddendum{
+		Add: nested,
+		Descriptor: v1.Descriptor{
+			ArtifactType: MediaTypeSigstoreBundleV03JSON,
+		},
+	})
+	require.NoError(t, remote.WriteIndex(referrersTag(parsed.Context(), d), index))
+
+	bundles, err := RetrieveBundlesStrict(t.Context(), parsed.Name(), nil)
+	require.ErrorIs(t, err, ErrBundleSetIncomplete)
+	assert.Empty(t, bundles, "strict retrieval must not accept an index as one referrer image")
+}
+
+// TestExtractBundleFromImageStrictReadBudget exercises the aggregate-budget
+// boundary directly, avoiding a 10 MiB fixture. Strict extraction succeeds at
+// the exact budget and fails closed when the caller's remaining aggregate
+// allowance cannot hold the complete bundle.
+func TestExtractBundleFromImageStrictReadBudget(t *testing.T) {
+	t.Parallel()
+
+	rawBundle, _, _ := signTestBundle(t, []byte("budgeted bundle"))
+	tests := []struct {
+		name      string
+		budget    int64
+		wantBytes int64
+		wantErr   bool
+	}{
+		{name: "exact budget", budget: int64(len(rawBundle)), wantBytes: int64(len(rawBundle))},
+		{name: "one byte short", budget: int64(len(rawBundle) - 1), wantBytes: int64(len(rawBundle)), wantErr: true},
+		{name: "exhausted", budget: 0, wantBytes: 0, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			img, err := mutate.Append(empty.Image, mutate.Addendum{
+				Layer: static.NewLayer(rawBundle, types.MediaType(MediaTypeSigstoreBundleV03JSON)),
+			})
+			require.NoError(t, err)
+			got, bytesRead, err := extractBundleFromImage(img, true, tc.budget)
+			assert.Equal(t, tc.wantBytes, bytesRead)
+			if tc.wantErr {
+				require.ErrorIs(t, err, ErrBundleSetIncomplete)
+				assert.Nil(t, got)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, got)
+		})
+	}
+}
+
+// TestRetrieveBundlesStrictPreservesContextErrors ensures the completeness
+// sentinel does not hide why retrieval stopped. Callers can classify both the
+// strict contract and cancellation/deadline through errors.Is.
+func TestRetrieveBundlesStrictPreservesContextErrors(t *testing.T) {
+	t.Parallel()
+
+	host := newTestRegistry(t)
+	parsed, _ := pushArtifact(t, host, "test/strict-context")
+	tests := []struct {
+		name    string
+		newCtx  func(context.Context) (context.Context, context.CancelFunc)
+		wantErr error
+	}{
+		{
+			name: "canceled",
+			newCtx: func(parent context.Context) (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(parent)
+				cancel()
+				return ctx, cancel
+			},
+			wantErr: context.Canceled,
+		},
+		{
+			name: "deadline exceeded",
+			newCtx: func(parent context.Context) (context.Context, context.CancelFunc) {
+				return context.WithDeadline(parent, time.Now().Add(-time.Second))
+			},
+			wantErr: context.DeadlineExceeded,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx, cancel := tc.newCtx(t.Context())
+			defer cancel()
+			bundles, err := RetrieveBundlesStrict(ctx, parsed.Name(), nil)
+			require.ErrorIs(t, err, ErrBundleSetIncomplete)
+			require.ErrorIs(t, err, tc.wantErr)
+			assert.Empty(t, bundles)
+		})
+	}
 }
 
 // TestStoredBundleRoundTrip covers the persisted form directly: what

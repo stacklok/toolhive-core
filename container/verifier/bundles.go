@@ -30,6 +30,17 @@ const DigestAlgorithmSHA256 = "sha256"
 // i.e. the artifact is unsigned as far as this package can tell.
 var ErrNoBundles = errors.New("no sigstore bundles found for artifact")
 
+// ErrBundleSetIncomplete is returned by RetrieveBundlesStrict when registry
+// failures or retrieval limits prevent it from assessing every potentially
+// relevant Sigstore bundle attached to the resolved artifact. The strict
+// function returns no partial bundle slice with this error: callers must not
+// infer that an omitted signer is absent from the artifact.
+//
+// An individual bundle or signed payload that was completely retrieved but
+// is malformed or fails later cryptographic verification is not "incomplete"
+// and does not wrap this error.
+var ErrBundleSetIncomplete = errors.New("sigstore bundle set is incomplete")
+
 // ErrVerificationFailed wraps every cryptographic verification failure
 // returned by the VerifyBundle* functions, so callers can distinguish
 // "signed but failed verification" from malformed input with errors.Is
@@ -142,7 +153,42 @@ func RetrieveBundles(ctx context.Context, imageRef string, keychain authn.Keycha
 	if len(internal) == 0 {
 		return nil, ErrNoBundles
 	}
+	return exportBundles(internal)
+}
 
+// RetrieveBundlesStrict fetches the complete bounded set of Sigstore bundles
+// attached to imageRef. It resolves imageRef exactly once, then uses that
+// immutable artifact digest for both supported discovery layouts: OCI 1.1
+// referrers and the cosign "sha256-<hex>.sig" tag.
+//
+// Unlike RetrieveBundles, this function never returns a usable prefix when
+// any potentially relevant bundle could not be assessed. Registry or blob
+// fetch failures and work-limit truncation return ErrBundleSetIncomplete and
+// a nil bundle slice. A missing layout is ordinary absence, so one completely
+// retrieved layout may still succeed when the other has no attachments.
+// A fully retrieved but malformed bundle or signed payload is rejected
+// without being labelled incomplete; cryptographic validity remains the
+// VerifyBundle* functions' responsibility.
+//
+// ErrNoBundles therefore means neither supported layout contained a usable
+// bundle after both layouts were completely assessed. As with
+// RetrieveBundles, ErrSignatureArtifactMismatch distinguishes a discovered
+// cosign signature whose payload names another artifact.
+func RetrieveBundlesStrict(ctx context.Context, imageRef string, keychain authn.Keychain) ([]Bundle, error) {
+	internal, err := getSigstoreBundlesStrict(ctx, imageRef, keychain)
+	if errors.Is(err, ErrProvenanceNotFoundOrIncomplete) {
+		return nil, fmt.Errorf("%w: %w", ErrNoBundles, err)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(internal) == 0 {
+		return nil, ErrNoBundles
+	}
+	return exportBundles(internal)
+}
+
+func exportBundles(internal []sigstoreBundle) ([]Bundle, error) {
 	bundles := make([]Bundle, 0, len(internal))
 	for _, b := range internal {
 		// MarshalJSON is protojson under the hood — the canonical bundle
