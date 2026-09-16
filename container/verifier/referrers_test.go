@@ -19,6 +19,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/google/go-containerregistry/pkg/v1/static"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/sigstore/sigstore-go/pkg/bundle"
@@ -337,6 +338,61 @@ func TestRetrieveBundlesStrictRejectsIndexShapedReferrer(t *testing.T) {
 	bundles, err := RetrieveBundlesStrict(t.Context(), parsed.Name(), nil)
 	require.ErrorIs(t, err, ErrBundleSetIncomplete)
 	assert.Empty(t, bundles, "strict retrieval must not accept an index as one referrer image")
+}
+
+// TestRetrieveBundlesStrictPreservesReferrersFallbackRedirectFailure proves a
+// valid .sig bundle cannot turn a failed referrers fallback read into a
+// complete subset. go-containerregistry treats every fallback-tag 404 as
+// absence, so strict retrieval must fetch that tag itself and classify the
+// exact failed endpoint before aggregation.
+func TestRetrieveBundlesStrictPreservesReferrersFallbackRedirectFailure(t *testing.T) {
+	t.Parallel()
+
+	inner := registry.New()
+	var fallbackPath string
+	reg := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/referrers/"):
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodGet && fallbackPath != "" && r.URL.Path == fallbackPath:
+			http.Redirect(w, r, "/login", http.StatusFound)
+		case r.URL.Path == "/login":
+			http.NotFound(w, r)
+		default:
+			inner.ServeHTTP(w, r)
+		}
+	}))
+	t.Cleanup(reg.Close)
+
+	host := strings.TrimPrefix(reg.URL, "http://")
+	parsed, digest := pushArtifact(t, host, "test/referrers-fallback-redirect")
+	attachKeySignature(t, sigTag(parsed, digest), simpleSigningPayloadFor(parsed.Context().Name(), digest))
+	fallbackPath = indexManifestRequestTarget(referrersTag(parsed.Context(), digest)).path
+
+	bundles, err := RetrieveBundlesStrict(t.Context(), parsed.Name(), nil)
+	require.ErrorIs(t, err, ErrBundleSetIncomplete)
+	assert.Empty(t, bundles, "strict retrieval must not expose the otherwise valid .sig subset")
+	var transportErr *transport.Error
+	require.ErrorAs(t, err, &transportErr)
+	require.NotNil(t, transportErr.Request)
+	assert.Equal(t, "/login", transportErr.Request.URL.Path)
+}
+
+// TestRetrieveBundlesStrictRejectsIndexShapedSignatureTag ensures a .sig tag
+// cannot hide unassessed signatures behind an OCI index. A usable referrer is
+// present to prove strict aggregation returns no partial evidence.
+func TestRetrieveBundlesStrictRejectsIndexShapedSignatureTag(t *testing.T) {
+	t.Parallel()
+
+	host := newTestRegistry(t)
+	parsed, digest := pushArtifact(t, host, "test/index-shaped-signature")
+	attachAttestationReferrer(t, parsed, digest)
+	index := mutate.AppendManifests(empty.Index, mutate.IndexAddendum{Add: empty.Image})
+	require.NoError(t, remote.WriteIndex(sigTag(parsed, digest), index))
+
+	bundles, err := RetrieveBundlesStrict(t.Context(), parsed.Name(), nil)
+	require.ErrorIs(t, err, ErrBundleSetIncomplete)
+	assert.Empty(t, bundles, "strict retrieval must not expose the otherwise valid referrer subset")
 }
 
 // TestExtractBundleFromImageStrictReadBudget exercises the aggregate-budget

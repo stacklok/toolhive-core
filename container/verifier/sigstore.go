@@ -446,6 +446,11 @@ func getSimpleSigningLayersFromSignatureTargetStrict(
 	if err != nil {
 		return nil, fmt.Errorf("error getting signature manifest: %w", err)
 	}
+	if isImageIndexMediaType(desc.MediaType) {
+		return nil, bundleSetIncompletef(
+			"cosign signature tag %s is an image index; strict retrieval cannot select one child",
+			target.sigTag.Name())
+	}
 
 	manifest, err := v1.ParseManifest(bytes.NewReader(desc.Manifest))
 	if err != nil {

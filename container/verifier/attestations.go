@@ -4,6 +4,7 @@
 package verifier
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -18,6 +19,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	containerdigest "github.com/opencontainers/go-digest"
 	"github.com/sigstore/sigstore-go/pkg/bundle"
@@ -108,15 +110,29 @@ func getReferrersManifest(
 	strict bool,
 ) (*v1.IndexManifest, error) {
 	digest := target.repo.Digest(target.artifactDigest.String())
-	referrerOpts, pagination := referrerDiscoveryOptions(digest, opts, strict)
+	referrerOpts, discovery := referrerDiscoveryOptions(digest, opts, strict)
+	if strict {
+		// Fetch the fallback tag ourselves. remote.Referrers turns every 404
+		// from that request into an empty index, including redirected and
+		// authentication failures that strict retrieval must preserve.
+		referrerOpts = append(referrerOpts, remote.WithReferrersTagFallback(false))
+	}
 	referrers, err := remote.Referrers(digest, referrerOpts...)
+	if strict {
+		if failure := discovery.failure.Load(); failure != nil {
+			return nil, bundleSetIncompleteBecause(failure, "reading referrers index")
+		}
+		if err != nil && discovery.fallback.Load() {
+			return getReferrersFallbackManifest(digest, referrerOpts)
+		}
+	}
 	if err != nil {
 		if strict {
 			return nil, bundleSetIncompleteBecause(err, "reading referrers index")
 		}
 		return nil, fmt.Errorf("error getting referrers: %w, %s", ErrProvenanceNotFoundOrIncomplete, err.Error())
 	}
-	if pagination != nil && pagination.detected.Load() {
+	if discovery != nil && discovery.pagination.Load() {
 		return nil, bundleSetIncompletef("referrers response is paginated")
 	}
 	refManifest, err := referrers.IndexManifest()
@@ -129,26 +145,67 @@ func getReferrersManifest(
 	return refManifest, nil
 }
 
-type referrerPaginationDetector struct {
-	detected        atomic.Bool
+func getReferrersFallbackManifest(
+	digest name.Digest,
+	opts []remote.Option,
+) (*v1.IndexManifest, error) {
+	fallbackTag := digest.Context().Tag(strings.Replace(digest.DigestStr(), ":", "-", 1))
+	desc, err := remote.Get(fallbackTag, opts...)
+	if err != nil {
+		if isManifestNotFound(err, fallbackTag) {
+			return &v1.IndexManifest{}, nil
+		}
+		return nil, bundleSetIncompleteBecause(err, "reading referrers fallback index")
+	}
+	if !isImageIndexMediaType(desc.MediaType) {
+		return nil, bundleSetIncompletef(
+			"referrers fallback tag %s has media type %s, not an image index",
+			fallbackTag.Name(), desc.MediaType)
+	}
+	manifest, err := v1.ParseIndexManifest(bytes.NewReader(desc.Manifest))
+	if err != nil {
+		return nil, bundleSetIncompleteBecause(err, "parsing referrers fallback index")
+	}
+	return manifest, nil
+}
+
+type referrerDiscoveryMonitor struct {
+	pagination      atomic.Bool
+	fallback        atomic.Bool
+	failure         atomic.Pointer[transport.Error]
 	inner           http.RoundTripper
 	referrersTarget registryRequestTarget
 }
 
-func (d *referrerPaginationDetector) RoundTrip(req *http.Request) (*http.Response, error) {
+func (d *referrerDiscoveryMonitor) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := d.inner.RoundTrip(req)
-	if err == nil && resp.StatusCode == http.StatusOK &&
-		d.referrersTarget.matchesGET(req) && resp.Header.Get("Link") != "" {
-		d.detected.Store(true)
+	if err != nil || !d.referrersTarget.matchesGET(req) {
+		return resp, err
 	}
-	return resp, err
+	if resp.StatusCode == http.StatusOK &&
+		resp.Header.Get("Content-Type") == string(types.OCIImageIndex) {
+		if resp.Header.Get("Link") != "" {
+			d.pagination.Store(true)
+		}
+		return resp, nil
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound &&
+		resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusNotAcceptable {
+		return resp, nil
+	}
+	if d.referrersTarget.matchesExactGET(req) {
+		d.fallback.Store(true)
+	} else {
+		d.failure.CompareAndSwap(nil, &transport.Error{StatusCode: resp.StatusCode, Request: req})
+	}
+	return resp, nil
 }
 
 func referrerDiscoveryOptions(
 	digest name.Digest,
 	opts []remote.Option,
 	strict bool,
-) ([]remote.Option, *referrerPaginationDetector) {
+) ([]remote.Option, *referrerDiscoveryMonitor) {
 	if !strict {
 		return opts, nil
 	}
@@ -159,7 +216,7 @@ func referrerDiscoveryOptions(
 		referrersTarget,
 		indexManifestRequestTarget(fallbackTag),
 	)
-	detector := &referrerPaginationDetector{
+	detector := &referrerDiscoveryMonitor{
 		inner:           limiter,
 		referrersTarget: referrersTarget,
 	}
