@@ -6,6 +6,11 @@ set -eu
 
 ./scripts/validate-release.sh redisconn/v1.2.3 >/dev/null
 
+(
+	cd scripts/testdata/release-current-core
+	../../../scripts/validate-release.sh v1.2.3 >/dev/null
+)
+
 if (
 	cd scripts/testdata/release-nonzero
 	../../../scripts/validate-release.sh redisconn/aws/v1.2.3 >/dev/null 2>&1
@@ -40,6 +45,13 @@ if (
 	../../../scripts/validate-release.sh v1.2.3 >/dev/null 2>&1
 ); then
 	echo "root release unexpectedly accepted a real but stale (drifted) redisconn pin" >&2
+	exit 1
+fi
+if (
+	cd scripts/testdata/release-stale-provider
+	../../../scripts/validate-release.sh v1.2.3 >/dev/null 2>&1
+); then
+	echo "root release unexpectedly accepted a stale provider pin" >&2
 	exit 1
 fi
 

@@ -50,7 +50,19 @@ printf '%s\n' "$requirements" | while read -r module required_version; do
 		echo "$manifest requires $module $required_version, but released tag $required_tag is not available locally; fetch required previous tags before tagging $tag" >&2
 		exit 1
 	fi
-	if ! git -C "$repo_root" diff --quiet "$required_tag" -- "$child_dir"; then
+	# A parent module's source tree does not include directories containing
+	# nested modules. In particular, redisconn/aws, redisconn/azure, and
+	# redisconn/gcp are independent modules and must not make redisconn itself
+	# appear to have drifted from its tag.
+	if [ "$child_dir" = redisconn ]; then
+		set -- "$child_dir" \
+			':(exclude)redisconn/aws' \
+			':(exclude)redisconn/azure' \
+			':(exclude)redisconn/gcp'
+	else
+		set -- "$child_dir"
+	fi
+	if ! git -C "$repo_root" diff --quiet "$required_tag" -- "$@"; then
 		echo "$manifest requires $module $required_version, but $child_dir has changed since $required_tag was tagged; publish a new $child_dir tag and update this manifest's requirement before tagging $tag" >&2
 		exit 1
 	fi
