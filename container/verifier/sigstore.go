@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -23,6 +24,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	protobundle "github.com/sigstore/protobuf-specs/gen/pb-go/bundle/v1"
 	protocommon "github.com/sigstore/protobuf-specs/gen/pb-go/common/v1"
 	protorekor "github.com/sigstore/protobuf-specs/gen/pb-go/rekor/v1"
@@ -40,11 +42,10 @@ import (
 // digits, and a simple-signing payload is a few hundred bytes of JSON.
 //
 // maxSimpleSigningLayers bounds how many layers of one manifest are
-// processed; layers past it are ignored rather than treated as an error,
-// since a genuine signature is within the first few and the rest are exactly
-// the padding an attacker added. maxSimpleSigningPayloadTotalBytes bounds the
-// total blob bytes read across all of a manifest's layers, on top of the
-// per-blob cap.
+// processed. The legacy retrieval API ignores layers past it; strict
+// retrieval reports that it could not assess the complete bundle set.
+// maxSimpleSigningPayloadTotalBytes bounds the total blob bytes read across
+// all of a manifest's layers, on top of the per-blob cap.
 const maxSimpleSigningLayers = 32
 
 var maxSimpleSigningPayloadTotalBytes = MaxAttestationsBytesLimit
@@ -90,107 +91,57 @@ func bundleFromSigstoreSignedImage(ctx context.Context, imageRef string, keychai
 	if err != nil {
 		return nil, fmt.Errorf("error getting signature reference from OCI image: %w", err)
 	}
+	return bundleFromSigstoreSignedTarget(ctx, target, keychain, false)
+}
 
-	// Parse the manifest and return a list of all simple signing layers we managed to extract
-	simpleSigningLayers, err := getSimpleSigningLayersFromSignatureManifest(ctx, target.sigTag.Name(), keychain)
+// bundleFromSigstoreSignedTarget retrieves cosign signature bundles for an
+// already-resolved artifact. In strict mode, absence of the signature tag is
+// still ordinary absence, but failures that prevent inspecting every
+// potentially relevant layer are reported as ErrBundleSetIncomplete.
+func bundleFromSigstoreSignedTarget(
+	ctx context.Context,
+	target signatureTarget,
+	keychain authn.Keychain,
+	strict bool,
+) ([]sigstoreBundle, error) {
+	simpleSigningLayers, err := getSimpleSigningLayers(ctx, target, keychain, strict)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrProvenanceNotFoundOrIncomplete, err.Error())
+		return nil, err
 	}
-
 	artifactDigestBytes, err := hex.DecodeString(target.artifactDigest.Hex)
 	if err != nil {
 		return nil, fmt.Errorf("error decoding artifact digest: %w", err)
 	}
 
-	if len(simpleSigningLayers) > maxSimpleSigningLayers {
-		slog.Warn("signature manifest carries more simple signing layers than will be processed",
-			"layers", len(simpleSigningLayers), "limit", maxSimpleSigningLayers)
-		simpleSigningLayers = simpleSigningLayers[:maxSimpleSigningLayers]
-	}
-
-	// Loop through each and build the sigstore bundles
 	var bundles []sigstoreBundle
-	// rejected records that a signature WAS found and deliberately refused,
-	// so the caller can report that rather than "unsigned" — see
-	// ErrSignatureArtifactMismatch.
 	var rejected error
-	// Distinct signatures over the same artifact share one payload blob (the
-	// payload is derived from the artifact, the signature from the key), so
-	// fetch each distinct blob once and reuse it. Keyed by descriptor digest,
-	// which is safe because the bytes are checked against it.
-	payloads := make(map[string][]byte, len(simpleSigningLayers))
-	budget := maxSimpleSigningPayloadTotalBytes
+	payloads := simpleSigningPayloadCache{
+		values: make(map[string][]byte, len(simpleSigningLayers)),
+		budget: maxSimpleSigningPayloadTotalBytes,
+	}
 	for _, layer := range simpleSigningLayers {
-		// Recover the payload the signature actually covers, and refuse the
-		// layer unless that payload says it covers THIS artifact. Without
-		// this, a signature manifest copied onto this artifact's .sig tag
-		// verifies against its original artifact's payload and reports
-		// success here.
-		payload, cached := payloads[layer.Digest.String()]
-		if !cached {
-			fetched, err := fetchSimpleSigningPayload(ctx, target.repo, layer, keychain, budget)
-			if err != nil {
-				slog.Error("error fetching simple signing payload",
+		payload, usable, err := payloads.get(ctx, target, layer, keychain, strict)
+		if err != nil {
+			return nil, err
+		}
+		if !usable {
+			continue
+		}
+		b, err := sigstoreBundleFromSimpleSigningLayer(layer, target, artifactDigestBytes, payload)
+		if err != nil {
+			if errors.Is(err, ErrSignatureArtifactMismatch) {
+				rejected = err
+				slog.Warn("rejecting signature layer that does not cover this artifact",
 					"layer_digest", layer.Digest.String(), "error", err)
-				continue
+			} else {
+				slog.Error("error constructing sigstore bundle",
+					"layer_digest", layer.Digest.String(), "error", err)
 			}
-			budget -= int64(len(fetched))
-			payloads[layer.Digest.String()] = fetched
-			payload = fetched
-		}
-		if err := checkSimpleSigningBinding(
-			payload, target.artifactDigest.Algorithm, target.artifactDigest.Hex, target.repo.Name(),
-		); err != nil {
-			slog.Warn("rejecting signature layer that does not cover this artifact",
-				"layer_digest", layer.Digest.String(), "error", err)
-			rejected = err
 			continue
 		}
-
-		// Build the verification material for the bundle
-		verificationMaterial, err := getBundleVerificationMaterial(layer)
-		if err != nil {
-			slog.Error("error getting bundle verification material",
-				"layer_digest", layer.Digest.String(), "error", err)
-			continue
-		}
-
-		// Build the message signature for the bundle
-		msgSignature, err := getBundleMsgSignature(layer)
-		if err != nil {
-			slog.Error("error getting bundle message signature",
-				"layer_digest", layer.Digest.String(), "error", err)
-			continue
-		}
-
-		// Construct and verify the bundle
-		pbb := protobundle.Bundle{
-			MediaType:            sigstoreBundleMediaType01,
-			VerificationMaterial: verificationMaterial,
-			Content:              msgSignature,
-		}
-		bun, err := bundle.NewBundle(&pbb)
-		if err != nil {
-			slog.Error("error creating protobuf bundle")
-			continue
-		}
-
-		// Store the bundle bound to the ARTIFACT digest, keeping the payload
-		// alongside it: the signature covers the payload, the payload names
-		// the artifact, and both halves are needed to re-check that chain
-		// later (offline, from Bundle.Raw).
-		bundles = append(bundles, sigstoreBundle{
-			bundle:      bun,
-			digestAlgo:  target.artifactDigest.Algorithm,
-			digestBytes: artifactDigestBytes,
-			payload:     payload,
-		})
+		bundles = append(bundles, b)
 	}
 
-	// There's no available provenance information about this image if we failed to find valid bundles from the list
-	// of simple signing layers. A layer refused for not covering this
-	// artifact is reported as such — it is not the same finding as an
-	// artifact that simply carries no signature.
 	if len(bundles) == 0 {
 		if rejected != nil {
 			return nil, rejected
@@ -200,6 +151,122 @@ func bundleFromSigstoreSignedImage(ctx context.Context, imageRef string, keychai
 
 	// Return the bundles
 	return bundles, nil
+}
+
+func getSimpleSigningLayers(
+	ctx context.Context,
+	target signatureTarget,
+	keychain authn.Keychain,
+	strict bool,
+) ([]v1.Descriptor, error) {
+	var (
+		layers []v1.Descriptor
+		err    error
+	)
+	if strict {
+		layers, err = getSimpleSigningLayersFromSignatureTargetStrict(ctx, target, keychain)
+	} else {
+		layers, err = getSimpleSigningLayersFromSignatureManifest(ctx, target.sigTag.Name(), keychain)
+	}
+	if err != nil {
+		if strict && isManifestNotFound(err, target.sigTag) {
+			return nil, ErrProvenanceNotFoundOrIncomplete
+		}
+		if strict {
+			return nil, bundleSetIncompleteBecause(err, "reading cosign signature manifest")
+		}
+		return nil, fmt.Errorf("%w: %s", ErrProvenanceNotFoundOrIncomplete, err.Error())
+	}
+	if len(layers) <= maxSimpleSigningLayers {
+		return layers, nil
+	}
+	if strict {
+		return nil, bundleSetIncompletef(
+			"cosign signature manifest has %d simple-signing layers; limit is %d",
+			len(layers), maxSimpleSigningLayers)
+	}
+	slog.Warn("signature manifest carries more simple signing layers than will be processed",
+		"layers", len(layers), "limit", maxSimpleSigningLayers)
+	return layers[:maxSimpleSigningLayers], nil
+}
+
+type simpleSigningPayloadCache struct {
+	values map[string][]byte
+	budget int64
+}
+
+func (c *simpleSigningPayloadCache) get(
+	ctx context.Context,
+	target signatureTarget,
+	layer v1.Descriptor,
+	keychain authn.Keychain,
+	strict bool,
+) ([]byte, bool, error) {
+	digest := layer.Digest.String()
+	if payload, ok := c.values[digest]; ok {
+		return payload, true, nil
+	}
+	if strict && layer.Digest.Algorithm != DigestAlgorithmSHA256 {
+		return nil, false, bundleSetIncompletef(
+			"simple-signing payload %s uses unsupported digest algorithm %s",
+			digest, layer.Digest.Algorithm)
+	}
+	readLimit := min(c.budget, MaxAttestationsBytesLimit)
+	if strict && (readLimit <= 0 || layer.Size > readLimit) {
+		return nil, false, bundleSetIncompletef(
+			"simple-signing payload %s exceeds the remaining retrieval limit", digest)
+	}
+	payload, err := fetchSimpleSigningPayload(ctx, target.repo, layer, keychain, c.budget, strict)
+	if err != nil {
+		if strict && errors.Is(err, ErrBundleSetIncomplete) {
+			return nil, false, err
+		}
+		if strict && isBundleMaterialFetchError(err) {
+			return nil, false, bundleSetIncompleteBecause(
+				err, "fetching simple-signing payload %s", digest)
+		}
+		slog.Error("error fetching simple signing payload", "layer_digest", digest, "error", err)
+		return nil, false, nil
+	}
+	c.budget -= int64(len(payload))
+	c.values[digest] = payload
+	return payload, true, nil
+}
+
+func sigstoreBundleFromSimpleSigningLayer(
+	layer v1.Descriptor,
+	target signatureTarget,
+	artifactDigestBytes []byte,
+	payload []byte,
+) (sigstoreBundle, error) {
+	if err := checkSimpleSigningBinding(
+		payload, target.artifactDigest.Algorithm, target.artifactDigest.Hex, target.repo.Name(),
+	); err != nil {
+		return sigstoreBundle{}, err
+	}
+	verificationMaterial, err := getBundleVerificationMaterial(layer)
+	if err != nil {
+		return sigstoreBundle{}, fmt.Errorf("getting bundle verification material: %w", err)
+	}
+	msgSignature, err := getBundleMsgSignature(layer)
+	if err != nil {
+		return sigstoreBundle{}, fmt.Errorf("getting bundle message signature: %w", err)
+	}
+	pbb := protobundle.Bundle{
+		MediaType:            sigstoreBundleMediaType01,
+		VerificationMaterial: verificationMaterial,
+		Content:              msgSignature,
+	}
+	bun, err := bundle.NewBundle(&pbb)
+	if err != nil {
+		return sigstoreBundle{}, fmt.Errorf("creating protobuf bundle: %w", err)
+	}
+	return sigstoreBundle{
+		bundle:      bun,
+		digestAlgo:  target.artifactDigest.Algorithm,
+		digestBytes: artifactDigestBytes,
+		payload:     payload,
+	}, nil
 }
 
 // fetchSimpleSigningPayload downloads the blob a simple-signing layer
@@ -219,7 +286,12 @@ func bundleFromSigstoreSignedImage(ctx context.Context, imageRef string, keychai
 // a payload that hashes to anything else would be verified against a digest
 // it does not have.
 func fetchSimpleSigningPayload(
-	ctx context.Context, repo name.Repository, layer v1.Descriptor, keychain authn.Keychain, budget int64,
+	ctx context.Context,
+	repo name.Repository,
+	layer v1.Descriptor,
+	keychain authn.Keychain,
+	budget int64,
+	strict bool,
 ) ([]byte, error) {
 	if layer.Digest.Algorithm != DigestAlgorithmSHA256 {
 		return nil, fmt.Errorf("unsupported simple signing layer digest algorithm: %s", layer.Digest.Algorithm)
@@ -232,17 +304,28 @@ func fetchSimpleSigningPayload(
 		remote.WithAuthFromKeychain(keychain), remote.WithContext(ctx),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error fetching simple signing blob: %w", err)
+		return nil, markBundleMaterialFetchError(fmt.Errorf("error fetching simple signing blob: %w", err))
 	}
 	rc, err := remoteLayer.Compressed()
 	if err != nil {
-		return nil, fmt.Errorf("error reading simple signing blob: %w", err)
+		return nil, markBundleMaterialFetchError(fmt.Errorf("error reading simple signing blob: %w", err))
 	}
 	defer func() { _ = rc.Close() }()
 
-	payload, err := io.ReadAll(io.LimitReader(rc, min(budget, MaxAttestationsBytesLimit)))
+	readLimit := min(budget, MaxAttestationsBytesLimit)
+	readerLimit := readLimit
+	if strict {
+		// Read one bounded byte beyond the accepted limit so strict retrieval
+		// can distinguish truncation from completely read malformed content.
+		readerLimit++
+	}
+	payload, err := io.ReadAll(io.LimitReader(rc, readerLimit))
 	if err != nil {
-		return nil, fmt.Errorf("error reading simple signing blob: %w", err)
+		return nil, markBundleMaterialFetchError(fmt.Errorf("error reading simple signing blob: %w", err))
+	}
+	if strict && int64(len(payload)) > readLimit {
+		return nil, bundleSetIncompletef(
+			"simple-signing payload %s exceeds the retrieval limit", layer.Digest.String())
 	}
 	sum := sha256.Sum256(payload)
 	if hex.EncodeToString(sum[:]) != strings.ToLower(layer.Digest.Hex) {
@@ -251,11 +334,40 @@ func fetchSimpleSigningPayload(
 	return payload, nil
 }
 
+// isManifestNotFound reports the registry's ordinary "this signature tag does
+// not exist" answer. Authentication services can also return transport-level
+// 404s; only the exact registry manifest request is layout absence.
+func isManifestNotFound(err error, signatureTag name.Tag) bool {
+	var transportErr *transport.Error
+	if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusNotFound ||
+		transportErr.Request == nil || !manifestRequestTarget(signatureTag).matchesExactGET(transportErr.Request) {
+		return false
+	}
+	for _, diagnostic := range transportErr.Errors {
+		if diagnostic.Code != transport.ManifestUnknownErrorCode {
+			return false
+		}
+	}
+	return true
+}
+
 // getSignatureReferenceFromOCIImage resolves imageRef and returns where its
 // cosign signatures live together with the artifact identity they must bind
 // to — see signatureTarget.
 func getSignatureReferenceFromOCIImage(
 	ctx context.Context, imageRef string, keychain authn.Keychain,
+) (signatureTarget, error) {
+	return getSignatureReferenceFromOCIImageMode(ctx, imageRef, keychain, false)
+}
+
+func getSignatureReferenceFromOCIImageStrict(
+	ctx context.Context, imageRef string, keychain authn.Keychain,
+) (signatureTarget, error) {
+	return getSignatureReferenceFromOCIImageMode(ctx, imageRef, keychain, true)
+}
+
+func getSignatureReferenceFromOCIImageMode(
+	ctx context.Context, imageRef string, keychain authn.Keychain, strict bool,
 ) (signatureTarget, error) {
 	// 0. Get the auth options
 	opts := []remote.Option{remote.WithAuthFromKeychain(keychain), remote.WithContext(ctx)}
@@ -264,6 +376,11 @@ func getSignatureReferenceFromOCIImage(
 	ref, err := name.ParseReference(imageRef)
 	if err != nil {
 		return signatureTarget{}, fmt.Errorf("error parsing image reference: %w", err)
+	}
+	if strict {
+		budget := newResponseBodyBudget(MaxAttestationsBytesLimit, "artifact manifest response")
+		opts = append(opts, remote.WithTransport(newStrictResponseTransport(
+			budget, manifestRequestTarget(ref))))
 	}
 
 	// 2. Get the image descriptor
@@ -310,6 +427,41 @@ func getSimpleSigningLayersFromSignatureManifest(
 	}
 
 	// Return the results - we may not have found any simple signing layers, but we still return the results
+	return results, nil
+}
+
+func getSimpleSigningLayersFromSignatureTargetStrict(
+	ctx context.Context,
+	target signatureTarget,
+	keychain authn.Keychain,
+) ([]v1.Descriptor, error) {
+	budget := newResponseBodyBudget(MaxAttestationsBytesLimit, "cosign signature manifest response")
+	desc, err := remote.Get(
+		target.sigTag,
+		remote.WithAuthFromKeychain(keychain),
+		remote.WithContext(ctx),
+		remote.WithTransport(newStrictResponseTransport(
+			budget, manifestRequestTarget(target.sigTag))),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error getting signature manifest: %w", err)
+	}
+	if isImageIndexMediaType(desc.MediaType) {
+		return nil, bundleSetIncompletef(
+			"cosign signature tag %s is an image index; strict retrieval cannot select one child",
+			target.sigTag.Name())
+	}
+
+	manifest, err := v1.ParseManifest(bytes.NewReader(desc.Manifest))
+	if err != nil {
+		return nil, fmt.Errorf("error parsing signature manifest: %w", err)
+	}
+	var results []v1.Descriptor
+	for _, layer := range manifest.Layers {
+		if layer.MediaType == MediaTypeCosignSimpleSigningV1JSON {
+			results = append(results, layer)
+		}
+	}
 	return results, nil
 }
 
