@@ -254,6 +254,77 @@ func TestNewHandler(t *testing.T) {
 	})
 }
 
+func TestNewHandler_WithHandlerMiddleware(t *testing.T) {
+	t.Parallel()
+
+	t.Run("wraps the handler NewHandler builds", func(t *testing.T) {
+		t.Parallel()
+		var buf bytes.Buffer
+		handler := NewHandler(WithOutput(&buf), WithHandlerMiddleware(func(h slog.Handler) slog.Handler {
+			return &attrInjectingHandler{Handler: h, attr: slog.String("injected", "yes")}
+		}))
+		logger := slog.New(handler)
+
+		logger.Info("hello")
+
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &entry))
+		assert.Equal(t, "yes", entry["injected"], "the middleware's own attribute must be present in the emitted record")
+	})
+
+	t.Run("applies no middleware when none is given", func(t *testing.T) {
+		t.Parallel()
+		var buf bytes.Buffer
+		handler := NewHandler(WithOutput(&buf))
+		slog.New(handler).Info("hello")
+
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &entry))
+		assert.NotContains(t, entry, "injected")
+	})
+
+	t.Run("multiple middlewares apply in order, last wraps outermost", func(t *testing.T) {
+		t.Parallel()
+		var buf bytes.Buffer
+		handler := NewHandler(
+			WithOutput(&buf),
+			WithHandlerMiddleware(func(h slog.Handler) slog.Handler { return &suffixHandler{Handler: h, suffix: "-A"} }),
+			WithHandlerMiddleware(func(h slog.Handler) slog.Handler { return &suffixHandler{Handler: h, suffix: "-B"} }),
+		)
+		slog.New(handler).Info("hello")
+
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal(buf.Bytes(), &entry))
+		assert.Equal(t, "hello-B-A", entry["msg"],
+			"the LAST WithHandlerMiddleware call must wrap every earlier one and run first")
+	})
+}
+
+// attrInjectingHandler is a minimal slog.Handler middleware test double that
+// adds one fixed attribute to every record before delegating.
+type attrInjectingHandler struct {
+	slog.Handler
+	attr slog.Attr
+}
+
+func (h *attrInjectingHandler) Handle(ctx context.Context, r slog.Record) error {
+	r.AddAttrs(h.attr)
+	return h.Handler.Handle(ctx, r)
+}
+
+// suffixHandler is a minimal slog.Handler middleware test double that
+// appends a fixed suffix to the record's message before delegating, used to
+// observe the order multiple middlewares run in.
+type suffixHandler struct {
+	slog.Handler
+	suffix string
+}
+
+func (h *suffixHandler) Handle(ctx context.Context, r slog.Record) error {
+	r.Message += h.suffix
+	return h.Handler.Handle(ctx, r)
+}
+
 func TestNewHandler_WithFormat(t *testing.T) {
 	t.Parallel()
 

@@ -26,9 +26,10 @@ const (
 
 // config holds the resolved configuration for creating a logger.
 type config struct {
-	format Format
-	level  slog.Leveler
-	output io.Writer
+	format     Format
+	level      slog.Leveler
+	output     io.Writer
+	middleware []func(slog.Handler) slog.Handler
 }
 
 // Option configures [New] and [NewHandler].
@@ -65,10 +66,31 @@ func WithOutput(w io.Writer) Option {
 	}
 }
 
+// WithHandlerMiddleware wraps the handler [NewHandler] builds with fn before
+// returning it, so a caller can inject a cross-cutting concern — trace-context
+// stamping, redaction, sampling, or anything else expressible as
+// func(slog.Handler) slog.Handler — without this package taking a dependency
+// on it. Applying more than one middleware is equivalent to manually chaining
+// fn calls in the given order: the last WithHandlerMiddleware call wraps every
+// earlier one, so it is the outermost handler and sees (and can filter or
+// annotate) each record before the others do.
+//
+//	handler := logging.NewHandler(
+//		logging.WithFormat(logging.FormatText),
+//		logging.WithHandlerMiddleware(myTraceContextHandler),
+//	)
+func WithHandlerMiddleware(fn func(slog.Handler) slog.Handler) Option {
+	return func(c *config) {
+		c.middleware = append(c.middleware, fn)
+	}
+}
+
 // NewHandler creates a pre-configured [log/slog.Handler] with consistent
-// defaults used across the ToolHive ecosystem. Use this when you need to wrap
-// the handler with middleware (e.g., trace injection) before creating the
-// final logger.
+// defaults used across the ToolHive ecosystem. Use [WithHandlerMiddleware] to
+// wrap the handler with cross-cutting concerns (e.g., trace injection) before
+// the final logger is created — or, for a one-off need, call NewHandler and
+// wrap its return value directly instead of creating the final logger with
+// [New].
 //
 // Defaults:
 //   - Format: JSON ([FormatJSON])
@@ -91,15 +113,21 @@ func NewHandler(opts ...Option) slog.Handler {
 		ReplaceAttr: replaceAttr,
 	}
 
+	var handler slog.Handler
 	switch cfg.format {
 	case FormatText:
-		return slog.NewTextHandler(cfg.output, handlerOpts)
+		handler = slog.NewTextHandler(cfg.output, handlerOpts)
 	case FormatJSON:
-		return slog.NewJSONHandler(cfg.output, handlerOpts)
+		handler = slog.NewJSONHandler(cfg.output, handlerOpts)
+	default:
+		// Unreachable for known Format values; default to JSON for safety.
+		handler = slog.NewJSONHandler(cfg.output, handlerOpts)
 	}
 
-	// Unreachable for known Format values; default to JSON for safety.
-	return slog.NewJSONHandler(cfg.output, handlerOpts)
+	for _, mw := range cfg.middleware {
+		handler = mw(handler)
+	}
+	return handler
 }
 
 // New creates a pre-configured [*log/slog.Logger] with consistent defaults
