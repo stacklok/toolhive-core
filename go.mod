@@ -1,6 +1,6 @@
 module github.com/stacklok/toolhive-core
 
-go 1.27
+go 1.27.0
 
 // Development-only replacement for the untagged nested module. Dependency
 // module replacements are ignored by downstream consumers.
@@ -43,7 +43,7 @@ require (
 	github.com/shirou/gopsutil/v4 v4.26.8
 	github.com/sigstore/protobuf-specs v0.5.2
 	github.com/sigstore/rekor v1.5.4
-	github.com/sigstore/sigstore v1.10.9
+	github.com/sigstore/sigstore v1.11.0
 	github.com/sigstore/sigstore-go v1.3.0
 	github.com/stacklok/toolhive-core/redisconn v0.0.2
 	github.com/stacklok/toolhive-core/redisconn/aws v0.0.3
