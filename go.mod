@@ -32,7 +32,7 @@ require (
 	github.com/in-toto/attestation v1.2.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/lestrrat-go/httprc/v3 v3.0.6
-	github.com/lestrrat-go/jwx/v3 v3.2.0
+	github.com/lestrrat-go/jwx/v3 v3.3.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/modelcontextprotocol/registry v1.8.1
 	github.com/opencontainers/go-digest v1.0.0
