@@ -81,7 +81,12 @@ func (w *recordingWriter) setSSEHeaders() {
 // fails the test on timeout so a broken expectation cannot hang the suite.
 func waitFor(t *testing.T, cond func() bool, msg string) {
 	t.Helper()
-	const timeout = 2 * time.Second
+	waitForWithin(t, 2*time.Second, cond, msg)
+}
+
+// waitForWithin is waitFor with a caller-chosen deadline.
+func waitForWithin(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
+	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if cond() {

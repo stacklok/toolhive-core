@@ -72,11 +72,10 @@ func (m *countingSessionManager) Terminate(sessionID string) (bool, error) {
 //     `if session.InitializeParams() == nil` (its #578 fix) — but the
 //     discover handler just set InitializeParams, so that guard never
 //     fires. go-sdk does NOT close the discover-probe session.
-//  4. With StreamableHTTPOptions.SessionTimeout unset (this shim never sets
-//     it — and must not, see WithSessionIdManager's doc; a timeout would
-//     reap legitimate idle sessions too), go-sdk never reaps it either: the
-//     probe session lives in go-sdk's internal session map for the process
-//     lifetime.
+//  4. With StreamableHTTPOptions.SessionTimeout unset (the default: the shim
+//     only sets it when the caller opts in via WithSessionIdleTimeout, which
+//     this test does not), go-sdk never reaps it either: the probe session
+//     lives in go-sdk's internal session map for the process lifetime.
 //  5. The client never learns the probe's session ID (go-sdk only echoes the
 //     Mcp-Session-Id response header on an initialize response, not on
 //     discover — mcp/streamable.go:1660), so it cannot terminate the probe
@@ -98,8 +97,10 @@ func (m *countingSessionManager) Terminate(sessionID string) (bool, error) {
 //
 // KNOWN TRANSITIONAL: fixed when PR2's stateless backend path lands (no
 // discover probe against a stateless server needs the new-session path) or
-// go-sdk starts closing/timing-out discover-only sessions. Tracks the #5911
-// unexported-version-pin gap.
+// go-sdk starts closing/timing-out discover-only sessions. A caller that sets
+// WithSessionIdleTimeout already gets the go-sdk probe session closed after
+// the timeout; the SessionIdManager placeholder is still never terminated.
+// Tracks the #5911 unexported-version-pin gap.
 func TestDiscoverFallback_ExtraSessionOnStatefulServer(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

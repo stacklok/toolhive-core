@@ -267,9 +267,47 @@ func (s *MCPServer) contextWithSession(ctx context.Context, ss *gosdk.ServerSess
 	if ss.ID() == "" {
 		return ctx
 	}
-	cs := s.sessionFor(ss.ID())
-	cs.goSession.Store(ss)
+	cs := s.bindSession(ss.ID(), ss)
 	return context.WithValue(ctx, sessionContextKey{}, ClientSession(cs))
+}
+
+// bindSession returns the clientSession registered for id, bound to the go-sdk
+// session ss, creating the entry if needed. The first time an entry is bound to
+// a given go-sdk session, a watcher is started that drops the entry once that
+// session ends (see forgetWhenClosed), so the registry follows the go-sdk
+// session lifecycle whatever ends it.
+func (s *MCPServer) bindSession(id string, ss *gosdk.ServerSession) *clientSession {
+	// Fast path: every request on an established session arrives here with the
+	// same go-sdk session already bound.
+	if v, ok := s.sessions.Load(id); ok {
+		if cs := v.(*clientSession); cs.goSession.Load() == ss {
+			return cs
+		}
+	}
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	cs := s.sessionFor(id)
+	if cs.goSession.Swap(ss) != ss {
+		go s.forgetWhenClosed(id, ss)
+	}
+	return cs
+}
+
+// forgetWhenClosed waits for the go-sdk session ss to end and then drops the
+// local bookkeeping for id, unless the entry has meanwhile been bound to a
+// newer go-sdk session (for example one rehydrated for the same ID after ss was
+// reaped). It is what reclaims a session the go-sdk closes on its own, such as
+// one reaped by the idle timeout (WithSessionIdleTimeout): those closes never
+// pass through forgetSession.
+func (s *MCPServer) forgetWhenClosed(id string, ss *gosdk.ServerSession) {
+	_ = ss.Wait()
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	v, ok := s.sessions.Load(id)
+	if !ok || v.(*clientSession).goSession.Load() != ss {
+		return
+	}
+	s.forgetSessionLocked(id)
 }
 
 // sessionFor returns the registered clientSession for id, creating it if
@@ -342,8 +380,7 @@ func (s *MCPServer) registerAndSync(ctx context.Context, ss *gosdk.ServerSession
 	if ss == nil || ss.ID() == "" {
 		return
 	}
-	cs := s.sessionFor(ss.ID())
-	cs.goSession.Store(ss)
+	cs := s.bindSession(ss.ID(), ss)
 	cs.owner.Store(s)
 	cs.boundServer.Store(srv)
 	// Mark the session local: it was initialized on this instance, so the go-sdk
@@ -529,11 +566,11 @@ func (s *MCPServer) isLocalSession(id string) bool {
 	return ok
 }
 
-// forgetSession drops all local bookkeeping for a session ID. It is called when
-// a session is terminated (DELETE) so a later request with the same ID is not
-// mistaken for a live local session. It also closes the notification channel so
-// the drain goroutine started in newClientSession exits, preventing a goroutine
-// leak per closed session.
+// forgetSession drops all local bookkeeping for a session ID. It is called on
+// DELETE (the go-sdk handler then closes the session) and, through
+// terminateSession, when a Validate reports a local session terminated, so a
+// later request with the same ID is not mistaken for a live local session.
+// Sessions the go-sdk ends on its own are reclaimed by forgetWhenClosed.
 func (s *MCPServer) forgetSession(id string) {
 	// id=="" would otherwise LoadAndDelete/close the shared entry a stateless
 	// contextWithSession call must never create in the first place; guard
@@ -542,11 +579,39 @@ func (s *MCPServer) forgetSession(id string) {
 	if id == "" {
 		return
 	}
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	s.forgetSessionLocked(id)
+}
+
+// forgetSessionLocked removes the registry entries for id and closes the
+// session's notification channel so the drain goroutine started in
+// newClientSession exits. The caller must hold sessionsMu.
+func (s *MCPServer) forgetSessionLocked(id string) {
 	v, ok := s.sessions.LoadAndDelete(id)
 	s.localSessions.Delete(id)
 	if ok {
 		cs := v.(*clientSession)
 		cs.notifClose.Do(func() { close(cs.notifCh) })
+	}
+}
+
+// terminateSession drops all local bookkeeping for id, as forgetSession does,
+// and closes the go-sdk session bound to it, which releases its per-session
+// go-sdk server. It is used when a Validate reports a local session
+// terminated: that request never reaches the go-sdk handler, so unlike DELETE
+// nothing else would close the session. The close runs in the background
+// because ServerSession.Close waits for the session's in-flight requests.
+func (s *MCPServer) terminateSession(id string) {
+	s.sessionsMu.Lock()
+	var ss *gosdk.ServerSession
+	if v, ok := s.sessions.Load(id); ok {
+		ss = v.(*clientSession).goSession.Load()
+	}
+	s.forgetSessionLocked(id)
+	s.sessionsMu.Unlock()
+	if ss != nil {
+		go func() { _ = ss.Close() }()
 	}
 }
 
@@ -561,8 +626,7 @@ func (s *MCPServer) forgetSession(id string) {
 // SetSessionTools/SetSessionResources/SetSessionPrompts reconcile the overlay
 // onto srv.
 func (s *MCPServer) bindRehydratedSession(id string, ss *gosdk.ServerSession, srv *gosdk.Server) {
-	cs := s.sessionFor(id)
-	cs.goSession.Store(ss)
+	cs := s.bindSession(id, ss)
 	cs.owner.Store(s)
 	cs.boundServer.Store(srv)
 	cs.Initialize()
