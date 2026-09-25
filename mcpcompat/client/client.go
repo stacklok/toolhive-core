@@ -48,6 +48,7 @@ type Client struct {
 	mu       sync.Mutex
 	client   *gosdk.Client
 	session  *gosdk.ClientSession
+	closing  *closeState
 	notifyMu sync.Mutex
 	notify   []func(mcp.JSONRPCNotification)
 
@@ -76,6 +77,10 @@ type Client struct {
 	// automatic multi round-trip (MRTR, SEP-2322) handling. See
 	// WithoutMultiRoundTrip.
 	disableMultiRoundTrip bool
+}
+
+type closeState struct {
+	done chan struct{}
 }
 
 // ElicitationHandler handles server->client elicitation/create requests. It
@@ -246,7 +251,15 @@ func (*Client) Start(_ context.Context) error { return nil }
 // resume path is exercised by resume_test.go.
 func (c *Client) Initialize(ctx context.Context, request mcp.InitializeRequest) (*mcp.InitializeResult, error) {
 	ctx = withErrCapture(ctx)
-	c.mu.Lock()
+	for {
+		c.mu.Lock()
+		closing := c.closing
+		if closing == nil {
+			break
+		}
+		c.mu.Unlock()
+		<-closing.done
+	}
 	defer c.mu.Unlock()
 
 	if c.session != nil {
@@ -329,12 +342,26 @@ func (c *Client) buildTransport() (gosdk.Transport, error) {
 // Close terminates the session.
 func (c *Client) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.session == nil {
+	if c.closing != nil || c.session == nil {
+		c.mu.Unlock()
 		return nil
 	}
-	err := c.session.Close()
-	c.session = nil
+	session := c.session
+	closing := &closeState{done: make(chan struct{})}
+	c.closing = closing
+	c.mu.Unlock()
+
+	err := session.Close()
+
+	c.mu.Lock()
+	if c.session == session {
+		c.session = nil
+	}
+	if c.closing == closing {
+		c.closing = nil
+		close(closing.done)
+	}
+	c.mu.Unlock()
 	return err
 }
 
