@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v4/jwk"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -70,7 +70,7 @@ func mintRSABits(t *testing.T, kid string, bits int) rsaPair {
 	t.Helper()
 	priv, err := rsa.GenerateKey(rand.Reader, bits)
 	require.NoError(t, err)
-	pub, err := jwk.Import(&priv.PublicKey)
+	pub, err := jwk.Import[jwk.Key](&priv.PublicKey)
 	require.NoError(t, err)
 	require.NoError(t, pub.Set(jwk.KeyIDKey, kid))
 	return rsaPair{priv: priv, jwk: pub}
@@ -109,7 +109,7 @@ func mintECCurve(t *testing.T, kid string, curve elliptic.Curve) ecPair {
 	t.Helper()
 	priv, err := ecdsa.GenerateKey(curve, rand.Reader)
 	require.NoError(t, err)
-	pub, err := jwk.Import(&priv.PublicKey)
+	pub, err := jwk.Import[jwk.Key](&priv.PublicKey)
 	require.NoError(t, err)
 	require.NoError(t, pub.Set(jwk.KeyIDKey, kid))
 	return ecPair{priv: priv, jwk: pub}
@@ -400,7 +400,7 @@ func TestValidateAcceptance(t *testing.T) {
 		other := mintRSA(t, "rsa-2")
 		// The signing key is published with no kid so the token's kid-less
 		// header matches it.
-		noKid, err := jwk.Import(&rsaKey.priv.PublicKey)
+		noKid, err := jwk.Import[jwk.Key](&rsaKey.priv.PublicKey)
 		require.NoError(t, err)
 		js := newJWKSServer(t, noKid, other.jwk)
 		v, err := NewValidator(context.Background(), js.configFor())
@@ -825,11 +825,20 @@ func TestValidateRejection(t *testing.T) {
 			name    string
 			use     string // "" means don't set use at all
 			wantErr bool
+			// errSubstr is what the failure must name. "enc" is a value jwx
+			// itself recognizes as a valid (if wrong) key usage, so the key
+			// survives JWKS parsing intact and this package's own use check
+			// rejects it by name. "foo" is not a registered key usage value
+			// (jwk.RegisterKeyUsage), so jwx rejects it as unparseable while
+			// decoding the JWKS response — the key never survives to reach
+			// this package's use check at all, and comes out as an
+			// unsupported/undecodable placeholder instead.
+			errSubstr string
 		}{
 			{name: "absent use is eligible", use: ""},
 			{name: "sig is eligible", use: "sig"},
-			{name: "enc is ineligible", use: "enc", wantErr: true},
-			{name: "arbitrary value is ineligible", use: "foo", wantErr: true},
+			{name: "enc is ineligible", use: "enc", wantErr: true, errSubstr: "use"},
+			{name: "arbitrary value is ineligible", use: "foo", wantErr: true, errSubstr: "decoded"},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
@@ -847,10 +856,10 @@ func TestValidateRejection(t *testing.T) {
 				_, err = v.Validate(context.Background(), token)
 				if tt.wantErr {
 					// The key is present under that kid but not published for
-					// verification, so the failure names the `use` problem
+					// verification, so the failure names the specific problem
 					// instead of implying the kid is unknown.
 					requireAuthnError(t, err, CodeInvalidToken, ReasonKeyUnsupported)
-					assert.Contains(t, err.Error(), "use")
+					assert.Contains(t, err.Error(), tt.errSubstr)
 					return
 				}
 				require.NoError(t, err)
