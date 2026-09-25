@@ -16,7 +16,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/lestrrat-go/httprc/v3"
-	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v4/jwk"
 )
 
 const (
@@ -769,8 +769,8 @@ func keyTypeMatchesAlg(key jwk.Key, alg string) keyRejection {
 		}
 		// Export to reach the modulus: the strength floor cannot be checked from
 		// the JWK's metadata alone.
-		var raw rsa.PublicKey
-		if err := jwk.Export(key, &raw); err != nil {
+		raw, err := jwk.Export[*rsa.PublicKey](key)
+		if err != nil {
 			return rejectExport
 		}
 		// A successful Export should always populate N; this guard is
@@ -787,8 +787,8 @@ func keyTypeMatchesAlg(key jwk.Key, alg string) keyRejection {
 		if key.KeyType().String() != "EC" {
 			return rejectKeyType
 		}
-		var raw ecdsa.PublicKey
-		if err := jwk.Export(key, &raw); err != nil {
+		raw, err := jwk.Export[*ecdsa.PublicKey](key)
+		if err != nil {
 			return rejectExport
 		}
 		// The Curve nil-check must precede Params(): the promoted raw.Params()
@@ -847,17 +847,17 @@ func exportCandidates(keys []jwk.Key, alg string) (any, error) {
 func exportKey(key jwk.Key, alg string) (any, error) {
 	switch {
 	case strings.HasPrefix(alg, "RS") || strings.HasPrefix(alg, "PS"):
-		var raw rsa.PublicKey
-		if err := jwk.Export(key, &raw); err != nil {
+		raw, err := jwk.Export[*rsa.PublicKey](key)
+		if err != nil {
 			return nil, err
 		}
-		return &raw, nil
+		return raw, nil
 	case strings.HasPrefix(alg, "ES"):
-		var raw ecdsa.PublicKey
-		if err := jwk.Export(key, &raw); err != nil {
+		raw, err := jwk.Export[*ecdsa.PublicKey](key)
+		if err != nil {
 			return nil, err
 		}
-		return &raw, nil
+		return raw, nil
 	default:
 		// Unreachable via Validate: the alg gate admits only RS/PS/ES algs.
 		return nil, fmt.Errorf("unsupported alg %q", alg)

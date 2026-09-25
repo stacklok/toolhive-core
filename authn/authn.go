@@ -15,8 +15,9 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/jwx-go/jwkfetch/v4"
 	"github.com/lestrrat-go/httprc/v3"
-	"github.com/lestrrat-go/jwx/v3/jwk"
+	"github.com/lestrrat-go/jwx/v4/jwk"
 
 	"github.com/stacklok/toolhive-core/networking"
 	httpvalidation "github.com/stacklok/toolhive-core/validation/http"
@@ -305,7 +306,7 @@ type Validator struct {
 
 	// jwksCache refreshes the registered JWKS URL in the background and
 	// serves key sets to Validate. Read by Validate in Step 4.
-	jwksCache *jwk.Cache
+	jwksCache *jwkfetch.Cache
 	// jwksWhitelist restricts the URLs the cache's httprc client will fetch to
 	// the resolved JWKS URL (defense-in-depth on top of the https scheme check).
 	jwksWhitelist httprc.MapWhitelist
@@ -405,11 +406,11 @@ func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
 	}
 	// Deriving the lifetime context before any construction I/O guarantees a
 	// validator that can fail construction never leaks refresh goroutines:
-	// jwk.NewCache starts them, so on failure the fresh cancel runs before
+	// jwkfetch.NewCache starts them, so on failure the fresh cancel runs before
 	// the error return below.
 	v.ctx, v.cancel = context.WithCancel(ctx)
 
-	// init is handed the LIFETIME context: jwk.NewCache permanently binds the
+	// init is handed the LIFETIME context: jwkfetch.NewCache permanently binds the
 	// httprc controller/worker refresh goroutines to the context it receives,
 	// so the cache must be created with v.ctx (which Close cancels), not a
 	// short-lived construction context. Per-operation construction network I/O
@@ -605,14 +606,14 @@ func validateHTTPSURI(field, raw string, insecureAllowHTTP bool) error {
 
 // init resolves the JWKS URL, starts the jwx cache, and registers the URL with
 // it. The ctx passed here is the validator's LIFETIME context (v.ctx):
-// jwk.NewCache permanently binds the httprc controller/worker refresh
+// jwkfetch.NewCache permanently binds the httprc controller/worker refresh
 // goroutines to it, and Close cancels it.
 //
 // The JWKS URL is resolved BEFORE the httprc client is created so the
 // whitelist can include a discovered jwks_uri. All construction network I/O —
 // the discovery fetch and the first JWKS fetch inside Register/Refresh — runs
 // under a context derived from ctx with constructionTimeout; that bound must
-// NOT reach jwk.NewCache.
+// NOT reach jwkfetch.NewCache.
 func (v *Validator) init(ctx context.Context) error {
 	// Resolve the JWKS URL first: either the explicit Config.JWKSURL or the
 	// jwks_uri discovered from the issuer's OIDC metadata.
@@ -660,7 +661,36 @@ func (v *Validator) init(ctx context.Context) error {
 	// NewCache starts the httprc client (and its refresh goroutines) bound
 	// to ctx; canceling v.ctx via Close stops them. Until a URL is registered
 	// the cache is running but idle.
-	cache, err := jwk.NewCache(ctx, httprcClient)
+	//
+	// WithHTTPClient injects our body-capped, redirect-refusing client at
+	// the cache level: jwkfetch.Cache.Register builds its own per-resource
+	// httprc.Resource and falls back to jwkfetch.DefaultHTTPClient() for any
+	// option not supplied here, so this must be passed to NewCache (it is no
+	// longer a Register-level option). WithStrictKeySetParsing(false)
+	// diverges from the jwx default deliberately: strict parsing fails the
+	// ENTIRE key set on the first unusable entry, so an IdP publishing one
+	// sub-2048-bit RSA key alongside good ones makes the whole JWKS
+	// unparseable. With no KeyProvider that is a CONSTRUCTION failure, not a
+	// per-request one — the fetch below is synchronous and fails closed, so
+	// NewValidator returns an error and the resource server does not start,
+	// however good the other keys in the set are. (A set that only degrades
+	// after construction instead surfaces as CodeUnavailable once the cached
+	// copy is no longer served.) Either way it contradicts how this package
+	// treats key material everywhere else: keys are filtered individually
+	// (use, key_ops, declared alg, kty/curve, RSA strength), and one bad key
+	// never disqualifies its siblings.
+	//
+	// It is safe because the placeholder jwx retains for the rejected entry
+	// cannot verify anything: it reports kty "RSA", so keyTypeMatchesAlg
+	// reaches jwk.Export, which fails on it, and the key is filtered as
+	// rejectExport and reported as ReasonKeyUnsupported. Nor is strictness a
+	// security control here — an attacker able to inject a key into the JWKS
+	// would inject a VALID one — so it only ever bought data hygiene, at the
+	// cost of availability.
+	cache, err := jwkfetch.NewCache(ctx, httprcClient,
+		jwkfetch.WithHTTPClient(v.httpClient),
+		jwkfetch.WithParseOptions(jwk.WithStrictKeySetParsing(false)),
+	)
 	if err != nil {
 		return fmt.Errorf("authn: failed to start JWKS cache: %w", err)
 	}
@@ -673,36 +703,16 @@ func (v *Validator) init(ctx context.Context) error {
 
 	// WithConstantInterval pins the refresh cadence: the issuer's
 	// Cache-Control/Expires headers do not control how long key material is
-	// trusted locally. WithHTTPClient injects our body-capped,
-	// redirect-refusing client at the resource level. WithWaitReady(false) is
-	// deliberate: httprc's async Add path retries the first fetch until the
-	// context deadline, which would turn every unreachable-JWKS construction
-	// error into a constructionTimeout wait; the synchronous Refresh below
-	// surfaces the real error immediately instead.
-	// WithStrictKeySetParsing(false) diverges from the jwx default deliberately:
-	// strict parsing fails the ENTIRE key set on the first unusable entry, so an
-	// IdP publishing one sub-2048-bit RSA key alongside good ones makes the whole
-	// JWKS unparseable. With no KeyProvider that is a CONSTRUCTION failure, not a
-	// per-request one — the fetch below is synchronous and fails closed, so
-	// NewValidator returns an error and the resource server does not start,
-	// however good the other keys in the set are. (A set that only degrades after
-	// construction instead surfaces as CodeUnavailable once the cached copy is no
-	// longer served.) Either way it contradicts how this package treats key
-	// material everywhere else: keys are filtered individually (use, key_ops,
-	// declared alg, kty/curve, RSA strength), and one bad key never disqualifies
-	// its siblings.
-	//
-	// It is safe because the placeholder jwx retains for the rejected entry
-	// cannot verify anything: it reports kty "RSA", so keyTypeMatchesAlg reaches
-	// jwk.Export, which fails on it, and the key is filtered as rejectExport and
-	// reported as ReasonKeyUnsupported. Nor is strictness a security control
-	// here — an attacker able to inject a key into the JWKS would inject a VALID
-	// one — so it only ever bought data hygiene, at the cost of availability.
+	// trusted locally. The HTTP client and strict-parsing policy are set once,
+	// uniformly, on the cache itself via NewCache above (jwkfetch.Register only
+	// accepts per-URL knobs). WithWaitReady(false) is deliberate: httprc's
+	// async Add path retries the first fetch until the context deadline, which
+	// would turn every unreachable-JWKS construction error into a
+	// constructionTimeout wait; the synchronous Refresh below surfaces the
+	// real error immediately instead.
 	if err := v.jwksCache.Register(fetchCtx, v.jwksURL,
-		jwk.WithHTTPClient(v.httpClient),
-		jwk.WithConstantInterval(jwksRefreshInterval),
-		jwk.WithWaitReady(false),
-		jwk.WithStrictKeySetParsing(false),
+		jwkfetch.WithConstantInterval(jwksRefreshInterval),
+		jwkfetch.WithWaitReady(false),
 	); err != nil {
 		return fmt.Errorf("authn: failed to register JWKS URL %s: %w", v.jwksURL, err)
 	}
