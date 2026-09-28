@@ -14,7 +14,7 @@ replace github.com/stacklok/toolhive-core/redisconn/gcp => ./redisconn/gcp
 
 require (
 	cel.dev/cel-go v0.32.0
-	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1
+	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.2
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.1
 	github.com/adrg/xdg v0.5.3
 	github.com/alicebob/miniredis/v2 v2.39.0
