@@ -7,5 +7,12 @@
   ],
   "labels": ["dependencies"],
   "postUpdateOptions": ["gomodTidy"],
-  "ignorePaths": ["scripts/testdata/**"]
+  "ignorePaths": ["scripts/testdata/**"],
+  "packageRules": [
+    {
+      "description": "v1.84.0 is affected by GO-2026-6443 (server panic on missing :authority/Host headers); the fix has not landed in a stable release yet (only a v1.85.0-dev pseudo-version). Unblock once a stable release contains the fix.",
+      "matchPackageNames": ["google.golang.org/grpc"],
+      "allowedVersions": "!/^v?1\\.84\\.0$/"
+    }
+  ]
 }
