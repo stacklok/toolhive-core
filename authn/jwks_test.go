@@ -197,8 +197,11 @@ func TestJWKSWhitelistRestrictsFetches(t *testing.T) {
 }
 
 // TestJWKSRegistrationUsesConfiguredHTTPClient proves the HTTP client supplied
-// via Config is the one performing the first fetch (per-resource injection
-// point in jwx v3).
+// via Config is the one performing the first fetch. jwkfetch.Cache applies
+// the client passed to NewCache uniformly to every registered URL's
+// per-resource fetch — the same injection point jwx v3.1.0 introduced, now
+// one level up in the companion module rather than in jwk.Cache.Register
+// itself; see the WithHTTPClient placement in Validator.init.
 func TestJWKSRegistrationUsesConfiguredHTTPClient(t *testing.T) {
 	t.Parallel()
 
