@@ -5,6 +5,7 @@ package networking
 
 import (
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -774,6 +777,164 @@ func TestCreateTokenSourceFromFile(t *testing.T) {
 		assert.Contains(t, err.Error(), "failed to read auth token file")
 		assert.Nil(t, tokenSource)
 	})
+}
+
+func TestHttpClientBuilder_TokenFileRotation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		rotate func(t *testing.T, path string)
+	}{
+		{
+			name: "overwrite",
+			rotate: func(t *testing.T, path string) {
+				t.Helper()
+				require.NoError(t, os.WriteFile(path, []byte(" new\n"), 0o600))
+			},
+		},
+		{
+			name: "atomic replacement",
+			rotate: func(t *testing.T, path string) {
+				t.Helper()
+				next := path + ".next"
+				require.NoError(t, os.WriteFile(next, []byte(" new\n"), 0o600))
+				require.NoError(t, os.Rename(next, path))
+			},
+		},
+		{
+			name: "symlink switch",
+			rotate: func(t *testing.T, path string) {
+				t.Helper()
+				next := path + ".next"
+				require.NoError(t, os.WriteFile(next, []byte(" new\n"), 0o600))
+				link := path + ".link"
+				require.NoError(t, os.Symlink(next, link))
+				require.NoError(t, os.Rename(link, path))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "token")
+			require.NoError(t, os.WriteFile(path, []byte("old"), 0o600))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("X-Received-Auth", r.Header.Get("Authorization"))
+			}))
+			t.Cleanup(server.Close)
+			client, err := NewHttpClientBuilder().WithPrivateIPs(true).
+				WithInsecureAllowHTTP(true).WithTokenFromFile(path).Build()
+			require.NoError(t, err)
+
+			getAuth := func() string {
+				t.Helper()
+				resp, err := client.Get(server.URL) //nolint:gosec // local test server
+				require.NoError(t, err)
+				require.NoError(t, resp.Body.Close())
+				return resp.Header.Get("X-Received-Auth")
+			}
+			assert.Equal(t, "Bearer old", getAuth())
+			tt.rotate(t, path)
+			assert.Equal(t, "Bearer new", getAuth())
+		})
+	}
+}
+
+func TestHttpClientBuilder_TokenFileErrorsAfterBuild(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		content string
+		remove  bool
+		wantErr string
+	}{
+		{name: "removed", remove: true, wantErr: "failed to read auth token file"},
+		{name: "empty", wantErr: "auth token file is empty"},
+		{name: "whitespace only", content: "  \n\t", wantErr: "auth token file is empty"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "token")
+			require.NoError(t, os.WriteFile(path, []byte("old"), 0o600))
+			var requests atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				w.Header().Set("X-Received-Auth", r.Header.Get("Authorization"))
+			}))
+			t.Cleanup(server.Close)
+			client, err := NewHttpClientBuilder().WithPrivateIPs(true).
+				WithInsecureAllowHTTP(true).WithTokenFromFile(path).Build()
+			require.NoError(t, err)
+
+			// A rotation before the first request must also be picked up.
+			require.NoError(t, os.WriteFile(path, []byte("first"), 0o600))
+			resp, err := client.Get(server.URL) //nolint:gosec // local test server
+			require.NoError(t, err)
+			assert.Equal(t, "Bearer first", resp.Header.Get("X-Received-Auth"))
+			require.NoError(t, resp.Body.Close())
+
+			if tt.remove {
+				require.NoError(t, os.Remove(path))
+			} else {
+				require.NoError(t, os.WriteFile(path, []byte(tt.content), 0o600))
+			}
+			resp, err = client.Get(server.URL) //nolint:bodyclose,gosec // no response on token error
+			require.Error(t, err)
+			assert.Nil(t, resp)
+			assert.ErrorContains(t, err, tt.wantErr)
+			assert.EqualValues(t, 1, requests.Load(), "bad token must not reach the server")
+
+			require.NoError(t, os.WriteFile(path, []byte("restored"), 0o600))
+			resp, err = client.Get(server.URL) //nolint:gosec // local test server
+			require.NoError(t, err)
+			assert.Equal(t, "Bearer restored", resp.Header.Get("X-Received-Auth"))
+			require.NoError(t, resp.Body.Close())
+			assert.EqualValues(t, 2, requests.Load())
+		})
+	}
+}
+
+func TestHttpClientBuilder_ConcurrentTokenFileRequests(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "token")
+	require.NoError(t, os.WriteFile(path, []byte("shared"), 0o600))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Received-Auth", r.Header.Get("Authorization"))
+	}))
+	t.Cleanup(server.Close)
+	client, err := NewHttpClientBuilder().WithPrivateIPs(true).
+		WithInsecureAllowHTTP(true).WithTokenFromFile(path).Build()
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	results := make(chan error, 32)
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := client.Get(server.URL) //nolint:gosec // local test server
+			if err == nil {
+				if got := resp.Header.Get("X-Received-Auth"); got != "Bearer shared" {
+					err = fmt.Errorf("unexpected authorization %q", got)
+				}
+				if closeErr := resp.Body.Close(); err == nil {
+					err = closeErr
+				}
+			}
+			results <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+	for err := range results {
+		assert.NoError(t, err)
+	}
 }
 
 // mockRoundTripper is a simple mock implementation of http.RoundTripper for testing
