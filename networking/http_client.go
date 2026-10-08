@@ -146,26 +146,30 @@ func (t *ValidatingTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	return t.Transport.RoundTrip(req)
 }
 
-// createTokenSourceFromFile creates an oauth2.TokenSource from a token file
-func createTokenSourceFromFile(tokenFile string) (oauth2.TokenSource, error) {
-	tokenBytes, err := os.ReadFile(tokenFile) // #nosec G304 - tokenFile path is provided by user via CLI flag
+// fileTokenSource reopens the path on each request so token rotation is observed.
+type fileTokenSource string
+
+func (s fileTokenSource) Token() (*oauth2.Token, error) {
+	tokenBytes, err := os.ReadFile(string(s)) // #nosec G304 - path is provided by user via CLI flag
 	if err != nil {
 		return nil, fmt.Errorf("failed to read auth token file: %w", err)
 	}
 
-	// Remove any trailing newlines/whitespace
 	tokenStr := strings.TrimSpace(string(tokenBytes))
 	if tokenStr == "" {
 		return nil, fmt.Errorf("auth token file is empty")
 	}
 
-	// Create a static token source
-	token := &oauth2.Token{
-		AccessToken: tokenStr,
-		TokenType:   "Bearer",
-	}
+	return &oauth2.Token{AccessToken: tokenStr, TokenType: "Bearer"}, nil
+}
 
-	return oauth2.StaticTokenSource(token), nil
+// createTokenSourceFromFile validates the file at build time, then reads it per request.
+func createTokenSourceFromFile(tokenFile string) (oauth2.TokenSource, error) {
+	source := fileTokenSource(tokenFile)
+	if _, err := source.Token(); err != nil {
+		return nil, err
+	}
+	return source, nil
 }
 
 // HttpClientBuilder provides a fluent interface for building HTTP clients
@@ -233,7 +237,9 @@ func (b *HttpClientBuilder) WithCABundle(path string) *HttpClientBuilder {
 	return b
 }
 
-// WithTokenFromFile sets the auth token file path
+// WithTokenFromFile sets the auth token file path. Build validates the file
+// once; each request reads it again to pick up rotations. An unreadable or empty
+// file causes that request to fail rather than reusing a previous token.
 func (b *HttpClientBuilder) WithTokenFromFile(path string) *HttpClientBuilder {
 	b.authTokenFile = path
 	return b
