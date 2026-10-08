@@ -194,16 +194,22 @@ type MCPServer struct {
 	// sessionID. It is the registry consulted by contextWithSession / sessionFor
 	// and SendNotificationToAllClients.
 	//
-	// KNOWN GAP (issue #156, finding 5): entries are only removed on the DELETE
-	// path and on a Validate-failure/termination path (see forgetSession). A
-	// session whose client vanishes, or that the go-sdk handler closes internally
-	// (e.g. on a transport error), never has forgetSession called, so its entry
-	// leaks for the process lifetime and SendNotificationToAllClients iterates
-	// corpses. A reaping mechanism (e.g. a periodic sweep that drops entries
-	// whose go-sdk ServerSession is closed, or a go-sdk close callback wired into
-	// forgetSession) is needed; this is lower priority and tracked separately.
-	// Do not over-engineer here without the upstream close hook.
+	// An entry lives at most as long as the go-sdk ServerSession bound to it:
+	// bindSession starts a watcher per bound session that drops the entry once
+	// that session ends (forgetWhenClosed), whatever ended it — the idle
+	// timeout (WithSessionIdleTimeout), or the go-sdk closing the session on
+	// its own. DELETE and a Validate reporting termination drop the entry
+	// eagerly (forgetSession, terminateSession) and close the session. A
+	// session whose client vanishes without DELETE is only ended by the idle
+	// timeout, so without one it is kept until the process exits.
 	sessions sync.Map // sessionID -> *clientSession
+
+	// sessionsMu serializes binding an entry of sessions to a go-sdk session
+	// (bindSession) against removing it (forgetSession, terminateSession,
+	// forgetWhenClosed), so the watcher of a session that has ended never
+	// removes an entry that was meanwhile re-bound to a newer session with the
+	// same ID. Lookups on the request path stay lock-free.
+	sessionsMu sync.Mutex
 
 	// localSessions records the IDs of sessions that were initialized on THIS
 	// server instance (i.e. the initialize handshake was handled here by the
@@ -211,11 +217,8 @@ type MCPServer struct {
 	// decide, for a request carrying an existing session ID, whether the session
 	// is local (route to the go-sdk handler, which owns its session map) or was
 	// created on another replica (rehydrate; see StreamableHTTPServer). Populated
-	// in registerAndSync (which only fires on this instance's initialize path).
-	//
-	// Shares the same unbounded-growth gap as sessions above (finding 5):
-	// entries are dropped only via forgetSession (DELETE / Validate-termination),
-	// not on a vanished client or an internal go-sdk close.
+	// in registerAndSync (which only fires on this instance's initialize path)
+	// and cleared together with the sessions entry.
 	localSessions sync.Map // sessionID -> struct{}
 
 	// pendingReqCtx bridges per-request context values (identity, audit
