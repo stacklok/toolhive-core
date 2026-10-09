@@ -97,6 +97,9 @@ type StreamableHTTPServer struct {
 	// fresh, temporary session (no initialize handshake, no Mcp-Session-Id) that
 	// go-sdk tears down when the request completes. See WithStateless.
 	stateless bool
+	// sessionIdleTimeout closes a session after this long without a request;
+	// zero keeps sessions until DELETE. See WithSessionIdleTimeout.
+	sessionIdleTimeout time.Duration
 
 	once     sync.Once
 	handler  http.Handler
@@ -118,6 +121,76 @@ type StreamableHTTPServer struct {
 type rehydratedSession struct {
 	transport *gosdk.StreamableServerTransport
 	session   *gosdk.ServerSession
+	// idle applies WithSessionIdleTimeout to this session, which the go-sdk
+	// StreamableHTTPHandler (and so its SessionTimeout) never sees. Nil when
+	// the timeout is disabled.
+	idle *idleTimer
+}
+
+// idleTimer runs onIdle once no POST has been in flight for timeout. It
+// mirrors the go-sdk StreamableHTTPHandler's SessionTimeout accounting (only
+// POSTs count as activity; the countdown is paused while any is in flight) so
+// rehydrated sessions are reaped by the same rule as local ones. A nil
+// *idleTimer is inert.
+type idleTimer struct {
+	timeout time.Duration
+	mu      sync.Mutex
+	timer   *time.Timer // nil once stopped
+	active  int
+}
+
+// newIdleTimer starts the countdown, or returns nil when timeout is not
+// positive.
+func newIdleTimer(timeout time.Duration, onIdle func()) *idleTimer {
+	if timeout <= 0 {
+		return nil
+	}
+	return &idleTimer{timeout: timeout, timer: time.AfterFunc(timeout, onIdle)}
+}
+
+// beginPOST pauses the countdown while a POST is being served.
+func (t *idleTimer) beginPOST() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.timer == nil {
+		return
+	}
+	if t.active == 0 {
+		t.timer.Stop()
+	}
+	t.active++
+}
+
+// endPOST restarts the countdown once no POST is in flight.
+func (t *idleTimer) endPOST() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.timer == nil {
+		return
+	}
+	t.active--
+	if t.active == 0 {
+		t.timer.Reset(t.timeout)
+	}
+}
+
+// stop cancels the countdown permanently.
+func (t *idleTimer) stop() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.timer != nil {
+		t.timer.Stop()
+		t.timer = nil
+	}
 }
 
 // defaultRehydratedProtocolVersion is the MCP protocol version seeded into a
@@ -155,8 +228,9 @@ func WithEndpointPath(endpointPath string) StreamableHTTPOption {
 //   - Validate is called on EVERY request carrying a session ID: for local
 //     sessions (initialized on this instance) it is validated per-request so a
 //     session terminated in the shared store (e.g. via a DELETE on another
-//     replica) is rejected here and its local bookkeeping dropped; for
-//     cross-replica sessions it drives lazy eviction on each request.
+//     replica) is rejected here, its local bookkeeping dropped and its go-sdk
+//     session closed; for cross-replica sessions it drives lazy eviction on
+//     each request.
 //   - Terminate is forwarded the session ID on a DELETE so ToolHive's shared
 //     session storage is cleaned up in lockstep with the local session.
 //
@@ -258,6 +332,34 @@ func WithStateless(stateless bool) StreamableHTTPOption {
 	return func(s *StreamableHTTPServer) { s.stateless = stateless }
 }
 
+// WithSessionIdleTimeout closes a session that has received no POST request for
+// timeout, and releases everything this instance holds for it: the go-sdk
+// session, its per-session go-sdk server (with its copy of the registered
+// tools, resources and prompts), and the shim's own session entry.
+//
+// Without it, a client that goes away without sending DELETE keeps all of that
+// alive until the process exits, so memory grows with every abandoned session.
+// Zero (the default) disables the timeout and keeps the previous behavior.
+//
+// For sessions initialized on this instance the timeout is go-sdk's
+// StreamableHTTPOptions.SessionTimeout; sessions rehydrated from another
+// replica are reaped by the same rule. As in go-sdk, only POST requests count
+// as activity: an open standalone GET stream does not by itself keep a session
+// alive, so a client that stays idle longer than the timeout must ping.
+//
+// Only this instance's copy of the session is released; the SessionIdManager is
+// not asked to Terminate it, because in a multi-replica deployment the same
+// session may still be in use through another replica. A client that returns
+// after its session was reaped here is rehydrated if the SessionIdManager still
+// validates the session, and receives 404 otherwise. Callers whose
+// SessionIdManager expires sessions after a TTL will usually pass that TTL.
+//
+// The option has no effect under WithStateless, where every session already
+// ends with its request.
+func WithSessionIdleTimeout(timeout time.Duration) StreamableHTTPOption {
+	return func(s *StreamableHTTPServer) { s.sessionIdleTimeout = timeout }
+}
+
 // WithHTTPContextFunc installs a per-request context customizer.
 //
 // Context values injected here are applied to ALL POSTs, including the
@@ -322,6 +424,10 @@ func (s *StreamableHTTPServer) build() {
 			// Stateless propagates MCP 2026-07-28 stateless serving to go-sdk.
 			// See WithStateless.
 			Stateless: s.stateless,
+			// SessionTimeout closes idle local sessions; the shim's own entry
+			// follows when the go-sdk session ends (forgetWhenClosed). See
+			// WithSessionIdleTimeout.
+			SessionTimeout: s.sessionIdleTimeout,
 		}
 		// A fresh go-sdk server per client session lets each session carry its own
 		// tool/resource overlay (mcp-go's per-session projection), synced by the
@@ -465,8 +571,9 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		if err != nil {
 			if isTerminated {
 				// Genuinely terminated: drop local bookkeeping so a later request
-				// with the same ID is not mistaken for a live local session.
-				s.mcp.forgetSession(sid)
+				// with the same ID is not mistaken for a live local session, and
+				// close the go-sdk session, which this request never reaches.
+				s.mcp.terminateSession(sid)
 				s.deleteRehydrated(sid)
 				http.Error(w, "Session terminated", http.StatusNotFound)
 				return
@@ -489,7 +596,7 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		if isTerminated {
-			s.mcp.forgetSession(sid)
+			s.mcp.terminateSession(sid)
 			s.deleteRehydrated(sid)
 			http.Error(w, "Session terminated", http.StatusNotFound)
 			return
@@ -566,6 +673,10 @@ func (s *StreamableHTTPServer) serveRehydrated(w http.ResponseWriter, r *http.Re
 			return
 		}
 	}
+	if r.Method == http.MethodPost {
+		rt.idle.beginPOST()
+		defer rt.idle.endPOST()
+	}
 	rt.transport.ServeHTTP(w, r)
 }
 
@@ -586,8 +697,23 @@ func (s *StreamableHTTPServer) deleteRehydrated(sid string) {
 	delete(s.rehydrated, sid)
 	s.rehydratedMu.Unlock()
 	if rt != nil {
+		rt.idle.stop()
 		_ = rt.session.Close()
 	}
+}
+
+// reapRehydrated closes a reconstructed session whose idle timeout fired and
+// drops it from the cache, unless the cache already holds a different session
+// for sid. Closing the go-sdk session also releases the shim's entry for it
+// (forgetWhenClosed).
+func (s *StreamableHTTPServer) reapRehydrated(sid string, rt *rehydratedSession) {
+	s.rehydratedMu.Lock()
+	if s.rehydrated[sid] == rt {
+		delete(s.rehydrated, sid)
+	}
+	s.rehydratedMu.Unlock()
+	rt.idle.stop()
+	_ = rt.session.Close()
 }
 
 // rehydrate reconstructs a session that was created on another replica: it
@@ -651,6 +777,7 @@ func (s *StreamableHTTPServer) rehydrate(r *http.Request, sid string) (*rehydrat
 	s.mcp.bindRehydratedSession(sid, session, srv)
 
 	rt := &rehydratedSession{transport: transport, session: session}
+	rt.idle = newIdleTimer(s.sessionIdleTimeout, func() { s.reapRehydrated(sid, rt) })
 	if s.rehydrated == nil {
 		s.rehydrated = make(map[string]*rehydratedSession)
 	}
