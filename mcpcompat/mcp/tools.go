@@ -361,7 +361,7 @@ func (t Tool) MarshalJSON() ([]byte, error) {
 
 	// Determine which input schema to use
 	if t.RawInputSchema != nil {
-		if t.InputSchema.Type != "" {
+		if ToolArgumentsSchema(t.InputSchema).hasType() {
 			return nil, fmt.Errorf("tool %s has both InputSchema and RawInputSchema set: %w", t.Name, errToolSchemaConflict)
 		}
 		m["inputSchema"] = t.RawInputSchema
@@ -372,11 +372,11 @@ func (t Tool) MarshalJSON() ([]byte, error) {
 
 	// Add output schema if present
 	if t.RawOutputSchema != nil {
-		if t.OutputSchema.Type != "" {
+		if ToolArgumentsSchema(t.OutputSchema).hasType() {
 			return nil, fmt.Errorf("tool %s has both OutputSchema and RawOutputSchema set: %w", t.Name, errToolSchemaConflict)
 		}
 		m["outputSchema"] = t.RawOutputSchema
-	} else if t.OutputSchema.Type != "" { // If no output schema is specified, do not return anything
+	} else if ToolArgumentsSchema(t.OutputSchema).hasType() { // If no output schema is specified, do not return anything
 		m["outputSchema"] = t.OutputSchema
 	}
 
@@ -404,7 +404,11 @@ func (t Tool) MarshalJSON() ([]byte, error) {
 
 // ToolArgumentsSchema represents a JSON Schema for tool arguments.
 type ToolArgumentsSchema struct {
-	Defs                 map[string]any `json:"$defs,omitempty"`
+	Defs map[string]any `json:"$defs,omitempty"`
+	// Type is the top-level JSON Schema "type" when it is a single string. A
+	// top-level "type" that is not a string — notably a JSON Schema type array
+	// such as ["object","null"] — cannot be represented here; it is left empty
+	// and the raw value is preserved in Extra["type"] so it survives a round-trip.
 	Type                 string         `json:"type"`
 	Properties           map[string]any `json:"properties"`
 	Required             []string       `json:"required,omitempty"`
@@ -414,7 +418,8 @@ type ToolArgumentsSchema struct {
 	// patternProperties. Without it, such keywords are silently dropped on an
 	// unmarshal -> marshal round-trip (a schema like {"oneOf": [...]} would be
 	// gutted). Populated by UnmarshalJSON and re-emitted by MarshalJSON; keys
-	// here never overlap the modeled fields. Not a JSON field itself (json:"-");
+	// here never overlap the modeled fields, except "type" when it is not a
+	// string (see Type). Not a JSON field itself (json:"-");
 	// its contents are inlined at the top level.
 	Extra map[string]json.RawMessage `json:"-"`
 }
@@ -499,6 +504,11 @@ func (tas *ToolArgumentsSchema) UnmarshalJSON(data []byte) error {
 	type Alias ToolArgumentsSchema
 	aux := &struct {
 		Definitions map[string]any `json:"definitions,omitempty"`
+		// RawType shadows Alias.Type (it is shallower, so encoding/json prefers
+		// it). Decoding "type" as raw JSON keeps a non-string value, such as a
+		// JSON Schema type array, from failing the whole schema — and so the
+		// whole tools/list page it arrives in.
+		RawType json.RawMessage `json:"type"`
 		*Alias
 	}{
 		Alias: (*Alias)(tas),
@@ -513,6 +523,17 @@ func (tas *ToolArgumentsSchema) UnmarshalJSON(data []byte) error {
 		tas.Defs = aux.Definitions
 	}
 
+	// A string "type" populates Type. Anything else (a type array, or a value
+	// that is not valid JSON Schema) stays in Extra below, verbatim.
+	typeIsString := false
+	if len(aux.RawType) > 0 {
+		var typ string
+		if err := json.Unmarshal(aux.RawType, &typ); err == nil {
+			tas.Type = typ
+			typeIsString = true
+		}
+	}
+
 	// Preserve any top-level keywords not modeled by the struct fields (oneOf,
 	// anyOf, allOf, $ref, enum, const, patternProperties, ...) so they survive
 	// an unmarshal -> marshal round-trip instead of being silently dropped.
@@ -520,14 +541,27 @@ func (tas *ToolArgumentsSchema) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &all); err != nil {
 		return err
 	}
-	for _, modeled := range []string{"$defs", "definitions", "type", "properties", "required", "additionalProperties"} {
+	for _, modeled := range []string{"$defs", "definitions", "properties", "required", "additionalProperties"} {
 		delete(all, modeled)
+	}
+	if typeIsString {
+		delete(all, "type")
 	}
 	if len(all) > 0 {
 		tas.Extra = all
 	}
 
 	return nil
+}
+
+// hasType reports whether the schema declares a top-level "type", either as the
+// modeled string or as a non-string value preserved in Extra.
+func (tas ToolArgumentsSchema) hasType() bool {
+	if tas.Type != "" {
+		return true
+	}
+	_, ok := tas.Extra["type"]
+	return ok
 }
 
 // ToolAnnotation carries tool behavior hints.
