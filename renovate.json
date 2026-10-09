@@ -7,5 +7,13 @@
   ],
   "labels": ["dependencies"],
   "postUpdateOptions": ["gomodTidy"],
-  "ignorePaths": ["scripts/testdata/**"]
+  "ignorePaths": ["scripts/testdata/**"],
+  "packageRules": [
+    {
+      "description": "Update indirect Go dependencies too, so the redisconn/* modules (which only pull x/net etc. in transitively) don't lag behind vulnerability fixes",
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["indirect"],
+      "enabled": true
+    }
+  ]
 }
