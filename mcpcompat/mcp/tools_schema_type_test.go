@@ -109,3 +109,101 @@ func TestTool_TypeArraySchemasThroughTool(t *testing.T) {
 	assert.JSONEq(t, `["object","null"]`, string(got.OutputSchema["type"]))
 	assert.JSONEq(t, `{"r":{"type":"string"}}`, string(got.OutputSchema[keyProperties]))
 }
+
+// TestToolInputSchema_TypeReplacedOnReuse verifies a present "type" replaces
+// whatever the receiver held before, in both directions. encoding/json decodes
+// into existing elements in place (for example into a reused []Tool), so a stale
+// string Type must not survive over a newly decoded type array, which
+// MarshalJSON would otherwise write after the preserved one.
+func TestToolInputSchema_TypeReplacedOnReuse(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		first    string
+		second   string
+		wantType string
+		wantJSON string
+	}{
+		{
+			name:     "string then array",
+			first:    `{"type":"object"}`,
+			second:   `{"type":["object","null"]}`,
+			wantType: "",
+			wantJSON: `["object","null"]`,
+		},
+		{
+			name:     "array then string",
+			first:    `{"type":["object","null"],"oneOf":[{"type":"object"}]}`,
+			second:   `{"type":"object","oneOf":[{"type":"object"}]}`,
+			wantType: schemaTypeObject,
+			wantJSON: `"object"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var schema mcp.ToolInputSchema
+			require.NoError(t, json.Unmarshal([]byte(tt.first), &schema))
+			require.NoError(t, json.Unmarshal([]byte(tt.second), &schema))
+			assert.Equal(t, tt.wantType, schema.Type)
+
+			out, err := json.Marshal(schema)
+			require.NoError(t, err)
+
+			var got map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(out, &got))
+			assert.JSONEq(t, tt.wantJSON, string(got["type"]),
+				"the second decode's type must win; got %s", string(out))
+		})
+	}
+}
+
+// TestTool_RawSchemaConflictWithTypeArray verifies the raw-versus-structured
+// schema conflict check still fires when the structured schema's type is a type
+// array. That type lives in Extra rather than Type, so a check on Type alone would
+// let both be set and silently emit the raw schema.
+func TestTool_RawSchemaConflictWithTypeArray(t *testing.T) {
+	t.Parallel()
+
+	const typeArray = `{"type":["object","null"]}`
+
+	tests := []struct {
+		name    string
+		prepare func(t *testing.T) mcp.Tool
+		wantErr string
+	}{
+		{
+			name: "input schema",
+			prepare: func(t *testing.T) mcp.Tool {
+				t.Helper()
+				tool := mcp.Tool{Name: "conflict", RawInputSchema: json.RawMessage(`{"type":"object"}`)}
+				require.NoError(t, json.Unmarshal([]byte(typeArray), &tool.InputSchema))
+				return tool
+			},
+			wantErr: "both InputSchema and RawInputSchema",
+		},
+		{
+			name: "output schema",
+			prepare: func(t *testing.T) mcp.Tool {
+				t.Helper()
+				tool := mcp.Tool{Name: "conflict", RawOutputSchema: json.RawMessage(`{"type":"object"}`)}
+				require.NoError(t, json.Unmarshal([]byte(typeArray), &tool.OutputSchema))
+				return tool
+			},
+			wantErr: "both OutputSchema and RawOutputSchema",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := json.Marshal(tt.prepare(t))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}

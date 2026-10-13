@@ -527,6 +527,11 @@ func (tas *ToolArgumentsSchema) UnmarshalJSON(data []byte) error {
 	// that is not valid JSON Schema) stays in Extra below, verbatim.
 	typeIsString := false
 	if len(aux.RawType) > 0 {
+		// A present "type" always replaces the previous value, as it did when
+		// Type was decoded directly. Without this, decoding a type array into a
+		// reused receiver would leave a stale string Type that MarshalJSON then
+		// writes over the preserved array.
+		tas.Type = ""
 		var typ string
 		if err := json.Unmarshal(aux.RawType, &typ); err == nil {
 			tas.Type = typ
