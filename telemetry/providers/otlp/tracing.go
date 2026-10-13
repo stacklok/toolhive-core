@@ -27,6 +27,7 @@ func createHTTPTraceExporter(ctx context.Context, config Config) (sdktrace.SpanE
 	host, basePath := splitEndpointPath(config.Endpoint)
 	opts := []otlptracehttp.Option{
 		otlptracehttp.WithEndpoint(host),
+		otlptracehttp.WithTimeout(config.exportTimeout()),
 	}
 
 	if basePath != "" {
@@ -70,6 +71,7 @@ func createGRPCTraceExporter(ctx context.Context, config Config) (sdktrace.SpanE
 	host, _ := splitEndpointPath(config.Endpoint)
 	opts := []otlptracegrpc.Option{
 		otlptracegrpc.WithEndpoint(host),
+		otlptracegrpc.WithTimeout(config.exportTimeout()),
 	}
 
 	if len(config.Headers) > 0 {
@@ -129,7 +131,13 @@ func NewTracerProviderWithShutdown(
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create trace provider: %w", err)
 		}
-		opts = append(opts, sdktrace.WithBatcher(exporter))
+		opts = append(opts, sdktrace.WithBatcher(exporter,
+			// Same budget as the exporter, deliberately. The processor's own
+			// default is 30s, so a larger ExportTimeout would otherwise be
+			// silently truncated; and under OTLP/HTTP this is what bounds the
+			// exporter's retry of a batch the destination may already have.
+			sdktrace.WithExportTimeout(config.exportTimeout()),
+		))
 	}
 
 	for _, p := range extraProcessors {

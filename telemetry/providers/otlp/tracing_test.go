@@ -6,12 +6,18 @@ package otlp
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 )
 
@@ -275,4 +281,168 @@ func TestNewTracerProviderWithShutdown(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCreateTraceExporter_AppliesExportTimeout(t *testing.T) {
+	t.Parallel()
+
+	// A boundary pair against ONE ingest: the only difference between the two
+	// runs is ExportTimeout, so an outcome that flips can only be attributed to
+	// it. The permissive run also proves the endpoint is sound, so the strict
+	// run's failure is not a dial or handshake error wearing the right costume.
+	const answersIn = 400 * time.Millisecond
+
+	t.Run("a timeout under the ingest's response time abandons the export", func(t *testing.T) {
+		t.Parallel()
+
+		srv := delayedOTLPIngest(t, answersIn)
+		exporter, err := createTraceExporter(t.Context(), Config{
+			Endpoint:      srv.Listener.Addr().String(),
+			Insecure:      true,
+			ExportTimeout: 100 * time.Millisecond,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = exporter.Shutdown(context.Background()) })
+
+		// Bounds the exporter's retry backoff, which is otherwise minutes.
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+
+		err = exporter.ExportSpans(ctx, endedSpans(t))
+
+		require.Error(t, err, "an ingest answering in %s must not satisfy a 100ms timeout — "+
+			"it would under the SDK's own 10s default", answersIn)
+		var netErr net.Error
+		require.ErrorAs(t, err, &netErr, "export failed for some reason other than a deadline: %v", err)
+		assert.True(t, netErr.Timeout(), "export failed on %v, not on its deadline", netErr)
+	})
+
+	t.Run("a timeout above the ingest's response time lets the export through", func(t *testing.T) {
+		t.Parallel()
+
+		srv := delayedOTLPIngest(t, answersIn)
+		exporter, err := createTraceExporter(t.Context(), Config{
+			Endpoint:      srv.Listener.Addr().String(),
+			Insecure:      true,
+			ExportTimeout: 3 * time.Second,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = exporter.Shutdown(context.Background()) })
+
+		assert.NoError(t, exporter.ExportSpans(t.Context(), endedSpans(t)))
+	})
+}
+
+func TestCreateTraceExporter_GRPCAppliesExportTimeout(t *testing.T) {
+	t.Parallel()
+
+	// Under gRPC the timeout bounds the whole export rather than one request,
+	// so it shows up as how long ExportSpans takes against a peer that accepts
+	// the connection and then says nothing.
+	const exportTimeout = 300 * time.Millisecond
+
+	exporter, err := createTraceExporter(t.Context(), Config{
+		Endpoint:      silentTCPPeer(t),
+		Insecure:      true,
+		Protocol:      ProtocolGRPC,
+		ExportTimeout: exportTimeout,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = exporter.Shutdown(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err = exporter.ExportSpans(ctx, endedSpans(t))
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Less(t, elapsed, 2*time.Second,
+		"export ran %s against a silent peer — the configured %s is not in force", elapsed, exportTimeout)
+	assert.GreaterOrEqual(t, elapsed, exportTimeout-20*time.Millisecond,
+		"export gave up after %s, before the configured %s", elapsed, exportTimeout)
+}
+
+func TestNewTracerProviderWithShutdown_BatcherBudgetFollowsExportTimeout(t *testing.T) {
+	t.Parallel()
+
+	// Without this the processor keeps its own 30s default, which both caps a
+	// larger ExportTimeout and leaves the HTTP exporter's retry loop room to
+	// re-send a batch the destination already has.
+	srv := delayedOTLPIngest(t, 30*time.Second)
+
+	provider, shutdown, err := NewTracerProviderWithShutdown(t.Context(), Config{
+		Endpoint:      srv.Listener.Addr().String(),
+		Insecure:      true,
+		SamplingRate:  1.0,
+		ExportTimeout: 150 * time.Millisecond,
+	}, resource.Empty())
+	require.NoError(t, err)
+	require.NotNil(t, shutdown)
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+
+	sdkProvider, ok := provider.(*sdktrace.TracerProvider)
+	require.True(t, ok, "expected a real tracer provider, got %T", provider)
+
+	_, span := sdkProvider.Tracer("test").Start(t.Context(), "batch-budget")
+	span.End()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_ = sdkProvider.ForceFlush(ctx)
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, 3*time.Second,
+		"flush against an unresponsive ingest took %s — the processor is still on its own 30s budget "+
+			"rather than the configured 150ms", elapsed)
+}
+
+// delayedOTLPIngest serves OTLP/HTTP and accepts every batch, but takes delay
+// to answer — the shape that trips an export deadline. The handler always
+// returns on its own, so a client that has already given up cannot leave it
+// wedged against the server's shutdown.
+func delayedOTLPIngest(t *testing.T, delay time.Duration) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(delay)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.CloseClientConnections)
+	return srv
+}
+
+// silentTCPPeer accepts connections and then says nothing, so a gRPC client
+// stalls in its handshake until its own deadline rather than failing to dial.
+func silentTCPPeer(t *testing.T) string {
+	t.Helper()
+	var lc net.ListenConfig
+	lis, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lis.Close() })
+
+	go func() {
+		for {
+			conn, err := lis.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+		}
+	}()
+	return lis.Addr().String()
+}
+
+// endedSpans returns one ended span in the read-only form an exporter takes.
+func endedSpans(t *testing.T) []sdktrace.ReadOnlySpan {
+	t.Helper()
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	_, span := provider.Tracer("test").Start(t.Context(), "export-timeout")
+	span.End()
+	spans := recorder.Ended()
+	require.Len(t, spans, 1)
+	return spans
 }
