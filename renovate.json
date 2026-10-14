@@ -14,6 +14,14 @@
       "matchManagers": ["gomod"],
       "matchDepTypes": ["indirect"],
       "enabled": true
+    },
+    {
+      "description": "Transitive major migrations require upstream import/API work",
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["indirect"],
+      "matchPackageNames": ["github.com/cenkalti/backoff/v5", "github.com/theupdateframework/go-tuf"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
     }
   ]
 }
