@@ -44,7 +44,7 @@ require (
 	github.com/shirou/gopsutil/v4 v4.26.9
 	github.com/sigstore/protobuf-specs v0.5.2
 	github.com/sigstore/rekor v1.5.4
-	github.com/sigstore/sigstore v1.10.9
+	github.com/sigstore/sigstore v1.11.1
 	github.com/sigstore/sigstore-go v1.3.0
 	github.com/stacklok/toolhive-core/redisconn v0.0.3
 	github.com/stacklok/toolhive-core/redisconn/aws v0.0.7
