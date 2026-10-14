@@ -77,7 +77,7 @@ require (
 
 require (
 	cel.dev/expr v0.25.3 // indirect
-	cloud.google.com/go/compute/metadata v0.9.0 // indirect
+	cloud.google.com/go/compute/metadata v0.10.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.13.0 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.8.0 // indirect
 	github.com/ProtonMail/go-crypto v1.4.1 // indirect
