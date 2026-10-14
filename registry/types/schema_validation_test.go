@@ -480,6 +480,45 @@ func TestValidatePublisherProvidedExtensionsBytes(t *testing.T) {
 			}`,
 			wantErr: false,
 		},
+		{
+			// Example from the upstream MCP Registry server.json docs: values
+			// under publisher-provided are not required to be namespaced objects.
+			name: "allows non-object values for other keys",
+			data: `{
+				"tool": "publisher-cli",
+				"version": "1.2.3",
+				"buildInfo": {
+					"commit": "abc123def456",
+					"pipelineId": "build-789",
+					"timestamp": "2023-12-01T10:30:00Z"
+				},
+				"count": 3,
+				"enabled": true,
+				"labels": ["a", "b"],
+				"nothing": null
+			}`,
+			wantErr: false,
+		},
+		{
+			name: "validates stacklok namespace alongside non-object values",
+			data: `{
+				"tool": "publisher-cli",
+				"io.github.stacklok": {
+					"ghcr.io/example/server:v1.0.0": {
+						"tier": "Official"
+					}
+				}
+			}`,
+			wantErr:       true,
+			errorContains: "status",
+		},
+		{
+			name: "stacklok namespace must still be an object",
+			data: `{
+				"io.github.stacklok": "not-an-object"
+			}`,
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -833,6 +872,22 @@ func TestValidateServerJSON(t *testing.T) {
 			wantErr:            false,
 		},
 		{
+			name: "server with non-object publisher-provided values - validate enabled",
+			data: `{
+				"name": "test-server",
+				"description": "A test server",
+				"version": "1.0.0",
+				"_meta": {
+					"io.modelcontextprotocol.registry/publisher-provided": {
+						"tool": "publisher-cli",
+						"version": "1.2.3"
+					}
+				}
+			}`,
+			validateExtensions: true,
+			wantErr:            false,
+		},
+		{
 			name:               "invalid JSON",
 			data:               `{invalid json`,
 			validateExtensions: false,
@@ -1133,13 +1188,18 @@ func TestServerExtensions_Validate(t *testing.T) {
 		expectError bool
 	}{
 		{
-			name:        "invalid extensions - empty struct fails schema structure",
+			name:        "invalid extensions - empty struct is missing status",
 			extensions:  &ServerExtensions{},
 			expectError: true,
 		},
 		{
-			name:        "invalid extensions - non-empty struct fails schema structure",
+			name:        "valid extensions",
 			extensions:  &ServerExtensions{Status: testStatusActive, Tier: "Official"},
+			expectError: false,
+		},
+		{
+			name:        "invalid extensions - unknown tier",
+			extensions:  &ServerExtensions{Status: testStatusActive, Tier: "NotATier"},
 			expectError: true,
 		},
 	}
