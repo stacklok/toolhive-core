@@ -1,6 +1,6 @@
 module github.com/stacklok/toolhive-core
 
-go 1.27
+go 1.27.0
 
 // Development-only replacement for the untagged nested module. Dependency
 // module replacements are ignored by downstream consumers.
@@ -44,7 +44,7 @@ require (
 	github.com/shirou/gopsutil/v4 v4.26.9
 	github.com/sigstore/protobuf-specs v0.5.2
 	github.com/sigstore/rekor v1.5.4
-	github.com/sigstore/sigstore v1.10.9
+	github.com/sigstore/sigstore v1.11.0
 	github.com/sigstore/sigstore-go v1.3.0
 	github.com/stacklok/toolhive-core/redisconn v0.0.2
 	github.com/stacklok/toolhive-core/redisconn/aws v0.0.6
@@ -156,7 +156,7 @@ require (
 	github.com/segmentio/encoding v0.5.4 // indirect
 	github.com/shibumi/go-pathspec v1.3.0 // indirect
 	github.com/sigstore/rekor-tiles/v2 v2.3.0 // indirect
-	github.com/sigstore/timestamp-authority/v2 v2.1.3 // indirect
+	github.com/sigstore/timestamp-authority/v2 v2.1.4 // indirect
 	github.com/sirupsen/logrus v1.10.2 // indirect
 	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
