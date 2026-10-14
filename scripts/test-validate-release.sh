@@ -24,7 +24,7 @@ git -C "$fixture" init -q
 git -C "$fixture" config user.email release-validation@example.com
 git -C "$fixture" config user.name "Release validation test"
 git -C "$fixture" add go.mod redisconn
-git -C "$fixture" commit -qm "release validation fixture"
+git -C "$fixture" -c commit.gpgSign=false commit -qm "release validation fixture"
 git -C "$fixture" tag --no-sign redisconn/v0.0.2
 
 (
