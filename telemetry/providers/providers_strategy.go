@@ -61,12 +61,13 @@ func (*OTLPTracerStrategy) CreateTracerProvider(
 		"extra_processors", len(config.ExtraSpanProcessors))
 
 	otlpConfig := otlp.Config{
-		Endpoint:     config.OTLPEndpoint,
-		Headers:      config.Headers,
-		Insecure:     config.Insecure,
-		SamplingRate: config.SamplingRate,
-		CACertPath:   config.CACertPath,
-		Protocol:     config.effectiveTracesProtocol(),
+		Endpoint:      config.OTLPEndpoint,
+		Headers:       config.Headers,
+		Insecure:      config.Insecure,
+		SamplingRate:  config.SamplingRate,
+		CACertPath:    config.CACertPath,
+		Protocol:      config.effectiveTracesProtocol(),
+		ExportTimeout: config.ExportTimeout,
 	}
 
 	provider, shutdown, err := otlp.NewTracerProviderWithShutdown(ctx, otlpConfig, res, config.ExtraSpanProcessors...)
