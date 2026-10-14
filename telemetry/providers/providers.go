@@ -39,6 +39,15 @@ type Config struct {
 	LoggingEnabled bool              // LoggingEnabled controls whether logging is enabled for OTLP
 	SamplingRate   float64           // SamplingRate controls trace sampling (0.0 to 1.0)
 
+	// ExportTimeout bounds a single trace export, covering both the exporter
+	// and the batch span processor. Zero means otlp.DefaultExportTimeout.
+	//
+	// Setting it takes precedence over OTEL_EXPORTER_OTLP_TRACES_TIMEOUT and
+	// OTEL_BSP_EXPORT_TIMEOUT: the SDK applies env first and explicit options
+	// after, so this is the knob to reach for when a destination needs longer
+	// than the default.
+	ExportTimeout time.Duration
+
 	// Protocol selects the OTLP transport for all signals: otlp.ProtocolGRPC
 	// ("grpc") or otlp.ProtocolHTTPProtobuf ("http/protobuf"). Leaving it
 	// empty means OTLP/HTTP with protobuf payloads, exactly today's behavior.
@@ -176,6 +185,20 @@ func WithLoggingEnabled(loggingEnabled bool) ProviderOption {
 func WithSamplingRate(samplingRate float64) ProviderOption {
 	return func(config *Config) error {
 		config.SamplingRate = samplingRate
+		return nil
+	}
+}
+
+// WithExportTimeout sets the budget for a single trace export, applied to both
+// the exporter and the batch span processor. Leaving it unset means
+// otlp.DefaultExportTimeout; a non-positive value is treated the same way.
+//
+// Reach for this when traces go to a destination that answers slower than the
+// default, such as a third-party ingest route. It overrides
+// OTEL_EXPORTER_OTLP_TRACES_TIMEOUT and OTEL_BSP_EXPORT_TIMEOUT.
+func WithExportTimeout(exportTimeout time.Duration) ProviderOption {
+	return func(config *Config) error {
+		config.ExportTimeout = exportTimeout
 		return nil
 	}
 }

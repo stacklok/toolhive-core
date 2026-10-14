@@ -6,11 +6,15 @@ package providers
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 
 	"github.com/stacklok/toolhive-core/telemetry/providers/otlp"
@@ -143,4 +147,77 @@ func TestCompositeProvider_LoggerProvider(t *testing.T) {
 		assert.NotContains(t, fmt.Sprintf("%T", provider.LoggerProvider()), "noop")
 		assert.NoError(t, provider.Shutdown(ctx))
 	})
+}
+
+func TestWithExportTimeout(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{name: "explicit value is stored as given", timeout: 90 * time.Second, want: 90 * time.Second},
+		// The option is a plain setter: normalizing a non-positive value to the
+		// default is otlp.Config's job, so the provider layer must not quietly
+		// substitute one here and hide what the caller actually asked for.
+		{name: "zero is passed through untouched", timeout: 0, want: 0},
+		{name: "negative is passed through untouched", timeout: -time.Second, want: -time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			config := &Config{}
+			require.NoError(t, WithExportTimeout(tt.timeout)(config))
+			assert.Equal(t, tt.want, config.ExportTimeout)
+		})
+	}
+}
+
+func TestOTLPTracerStrategy_CreateTracerProvider_AppliesExportTimeout(t *testing.T) {
+	t.Parallel()
+
+	// The gap this covers is wiring, not the timeout itself: ExportTimeout
+	// reaching otlp.Config is what a struct-field assertion would miss, so this
+	// drives the built provider against an ingest that never answers in time
+	// and asserts the flush gives up on the configured budget.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(30 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.CloseClientConnections)
+
+	res, err := resource.New(t.Context(), resource.WithAttributes(semconv.ServiceName("test-service")))
+	require.NoError(t, err)
+
+	strategy := &OTLPTracerStrategy{}
+	provider, shutdown, err := strategy.CreateTracerProvider(t.Context(), Config{
+		OTLPEndpoint:   srv.Listener.Addr().String(),
+		Insecure:       true,
+		TracingEnabled: true,
+		SamplingRate:   1.0,
+		ExportTimeout:  150 * time.Millisecond,
+	}, res)
+	require.NoError(t, err)
+	require.NotNil(t, shutdown)
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+
+	sdkProvider, ok := provider.(*sdktrace.TracerProvider)
+	require.True(t, ok, "expected a real tracer provider, got %T", provider)
+
+	_, span := sdkProvider.Tracer("test").Start(t.Context(), "export-timeout")
+	span.End()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_ = sdkProvider.ForceFlush(ctx)
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, 3*time.Second,
+		"flush against an unresponsive ingest took %s — ExportTimeout is not reaching otlp.Config, "+
+			"leaving the export on the 30s default", elapsed)
 }
