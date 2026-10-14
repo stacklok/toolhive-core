@@ -4,8 +4,10 @@
 package registry
 
 import (
+	"bytes"
 	"embed"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"strings"
@@ -56,19 +58,16 @@ func ensurePreloaded() error {
 func (r *UpstreamRegistry) Validate() error {
 	data, err := json.Marshal(r)
 	if err != nil {
-		return fmt.Errorf("failed to serialize upstream registry: %w", err)
+		return errors.New("failed to serialize upstream registry")
 	}
-	if err := validateAgainstSchema(data, "data/upstream-registry.schema.json", "registry schema validation failed"); err != nil {
-		return err
-	}
-	return validateRegistryExtensions(data)
+	return ValidateUpstreamRegistryBytes(data)
 }
 
 // Validate validates the ServerExtensions against the publisher-provided schema.
 func (e *ServerExtensions) Validate() error {
 	data, err := json.Marshal(e)
 	if err != nil {
-		return fmt.Errorf("failed to serialize server extensions: %w", err)
+		return errors.New("failed to serialize server extensions")
 	}
 	const schemaFile = "data/publisher-provided.schema.json"
 	return validateAgainstSchema(data, schemaFile, "publisher-provided extensions schema validation failed")
@@ -78,7 +77,7 @@ func (e *ServerExtensions) Validate() error {
 func (s *Skill) Validate() error {
 	data, err := json.Marshal(s)
 	if err != nil {
-		return fmt.Errorf("failed to serialize skill: %w", err)
+		return errors.New("failed to serialize skill")
 	}
 	return validateAgainstSchema(data, "data/skill.schema.json", "skill schema validation failed")
 }
@@ -87,56 +86,86 @@ func (s *Skill) Validate() error {
 func (p *Plugin) Validate() error {
 	data, err := json.Marshal(p)
 	if err != nil {
-		return fmt.Errorf("failed to serialize plugin: %w", err)
+		return errors.New("failed to serialize plugin")
 	}
 	return validateAgainstSchema(data, "data/plugin.schema.json", "plugin schema validation failed")
 }
 
-// ValidateUpstreamRegistryBytes validates raw upstream registry JSON bytes against the upstream registry schema.
-// It also validates any publisher-provided extensions found in server definitions.
+// ValidateUpstreamRegistryBytes validates strict original registry JSON against
+// the embedded schemas, including MCP 2025-12-11 servers. ToolHive publisher
+// extension policy is always enabled for whole registries.
 func ValidateUpstreamRegistryBytes(registryData []byte) error {
-	const schemaFile = "data/upstream-registry.schema.json"
-	if err := validateAgainstSchema(registryData, schemaFile, "registry schema validation failed"); err != nil {
+	value, err := validateJSONAgainstSchema(registryData, "data/upstream-registry.schema.json", "registry schema validation failed")
+	if err != nil {
 		return err
 	}
-	return validateRegistryExtensions(registryData)
+	return validateRegistryExtensions(value.(map[string]any))
 }
 
-// ValidatePublisherProvidedExtensionsBytes validates raw publisher-provided extensions JSON bytes.
+// ValidatePublisherProvidedExtensionsBytes validates strict original publisher
+// metadata JSON, requiring object-valued namespaces and ToolHive schema compliance.
 func ValidatePublisherProvidedExtensionsBytes(extensionsData []byte) error {
 	const schemaFile = "data/publisher-provided.schema.json"
 	return validateAgainstSchema(extensionsData, schemaFile, "publisher-provided extensions schema validation failed")
 }
 
-// ValidateSkillBytes validates raw skill JSON bytes against the skill schema.
+// ValidateSkillBytes validates strict original skill JSON against the embedded skill schema.
 func ValidateSkillBytes(skillData []byte) error {
 	return validateAgainstSchema(skillData, "data/skill.schema.json", "skill schema validation failed")
 }
 
-// ValidatePluginBytes validates raw plugin JSON bytes against the plugin schema.
+// ValidatePluginBytes validates strict original plugin JSON against the embedded plugin schema.
 func ValidatePluginBytes(pluginData []byte) error {
 	return validateAgainstSchema(pluginData, "data/plugin.schema.json", "plugin schema validation failed")
 }
 
-// ValidateServerJSON validates a single MCP server JSON object and optionally validates
-// any publisher-provided extensions found in its _meta field.
+// ValidateServerJSON validates the original JSON against the embedded MCP 2025-12-11
+// server schema, without fetching the submitted $schema URL. validateExtensions
+// only enables additional ToolHive publisher namespace policy; it never disables
+// MCP validation. All raw validators reject duplicate decoded object names,
+// invalid UTF-8 or Unicode escapes, and anything other than one complete JSON value.
 func ValidateServerJSON(serverData []byte, validateExtensions bool) error {
-	var server map[string]any
-	if err := json.Unmarshal(serverData, &server); err != nil {
-		return fmt.Errorf("invalid server JSON: %w", err)
+	value, err := validateJSONAgainstSchema(serverData, "data/server.schema.json", "server schema validation failed")
+	if err != nil {
+		return err
 	}
 	if !validateExtensions {
 		return nil
 	}
-	serverName := getServerName(server, 0)
-	return validateServerExtensions(server, serverName)
+	return validateServerExtensions(value.(map[string]any), "server")
 }
 
-// validateAgainstSchema validates data against a named embedded schema file.
-// Referenced schemas (server.schema.json, skill.schema.json) are preloaded
-// into the schema loader so the validator never makes HTTP requests to
-// resolve external $ref URLs.
+// decodeJSON preserves unconstrained JSON numbers, including values outside the
+// float64 range. Callers must validate original bytes before normalizing them.
+func decodeJSON(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(target); err != nil {
+		return errors.New("invalid JSON")
+	}
+	return nil
+}
+
+func validateJSONAgainstSchema(data []byte, schemaFile, errPrefix string) (any, error) {
+	if !jsontext.Value(data).IsValid() {
+		return nil, fmt.Errorf("%s: invalid JSON", errPrefix)
+	}
+	var value any
+	if err := decodeJSON(data, &value); err != nil {
+		return nil, err
+	}
+	return value, validateValueAgainstSchema(value, schemaFile, errPrefix)
+}
+
+// validateAgainstSchema checks strict original JSON before schema validation.
 func validateAgainstSchema(data []byte, schemaFile, errPrefix string) error {
+	_, err := validateJSONAgainstSchema(data, schemaFile, errPrefix)
+	return err
+}
+
+// validateValueAgainstSchema only accepts values decoded from already checked
+// JSON. Referenced schemas are embedded; instance $schema URLs are never loaded.
+func validateValueAgainstSchema(value any, schemaFile, errPrefix string) error {
 	if err := ensurePreloaded(); err != nil {
 		return fmt.Errorf("%s: %w", errPrefix, err)
 	}
@@ -164,20 +193,67 @@ func validateAgainstSchema(data []byte, schemaFile, errPrefix string) error {
 		return fmt.Errorf("%s: %w", errPrefix, err)
 	}
 
-	result, err := compiled.Validate(gojsonschema.NewBytesLoader(data))
+	result, err := compiled.Validate(gojsonschema.NewRawLoader(value))
 	if err != nil {
-		return fmt.Errorf("%s: %w", errPrefix, err)
+		return fmt.Errorf("%s: unable to validate JSON", errPrefix)
 	}
 
 	if result.Valid() {
 		return nil
 	}
 
+	// Only schema-defined names and error kinds are safe to report. Library
+	// descriptions and instance paths can contain submitted secrets or keys.
+	properties := make(map[string]bool)
+	collectSchemaProperties(schemaData, properties)
+	for _, data := range preloadedSchemaBytes {
+		collectSchemaProperties(data, properties)
+	}
 	msgs := make([]string, 0, len(result.Errors()))
 	for _, desc := range result.Errors() {
-		msgs = append(msgs, desc.String())
+		field := "(root)"
+		for _, part := range strings.Split(desc.Field(), ".") {
+			if properties[part] {
+				field = part
+			}
+		}
+		if desc.Type() == "required" {
+			// Required property names come from the embedded schema, not the instance.
+			field, _ = desc.Details()["property"].(string)
+		}
+		msg := field + ": " + desc.Type()
+		if desc.Type() == "format" {
+			msg += fmt.Sprintf(" (%s)", desc.Details()["format"])
+		}
+		msgs = append(msgs, msg)
 	}
 	return formatNumberedErrors(errPrefix, msgs)
+}
+
+func collectSchemaProperties(data []byte, properties map[string]bool) {
+	var schema any
+	if json.Unmarshal(data, &schema) != nil {
+		return
+	}
+	var visit func(any)
+	visit = func(value any) {
+		switch value := value.(type) {
+		case map[string]any:
+			if names, ok := value["properties"].(map[string]any); ok {
+				for name := range names {
+					properties[name] = true
+				}
+			}
+			for _, child := range value {
+				visit(child)
+			}
+		case []any:
+			for _, child := range value {
+				visit(child)
+			}
+		}
+	}
+	visit(schema)
 }
 
 // formatNumberedErrors formats a list of messages as a single error with a numbered list.
@@ -196,13 +272,8 @@ func formatNumberedErrors(prefix string, msgs []string) error {
 	return errors.New(strings.TrimSuffix(b.String(), "\n"))
 }
 
-// validateRegistryExtensions parses the registry and validates publisher-provided extensions in all servers.
-func validateRegistryExtensions(registryData []byte) error {
-	var registryMap map[string]any
-	if err := json.Unmarshal(registryData, &registryMap); err != nil {
-		return fmt.Errorf("failed to parse registry JSON: %w", err)
-	}
-
+// validateRegistryExtensions applies policy to the already validated original value.
+func validateRegistryExtensions(registryMap map[string]any) error {
 	data, ok := registryMap["data"].(map[string]any)
 	if !ok {
 		return nil
@@ -223,8 +294,7 @@ func validateServerList(servers []any) []string {
 		if !ok {
 			continue
 		}
-		serverName := getServerName(serverMap, i)
-		if err := validateServerExtensions(serverMap, serverName); err != nil {
+		if err := validateServerExtensions(serverMap, fmt.Sprintf("servers[%d]", i)); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -235,7 +305,7 @@ func formatExtensionErrors(errs []string) error {
 	return formatNumberedErrors("publisher-provided extensions validation failed", errs)
 }
 
-func validateServerExtensions(server map[string]any, serverName string) error {
+func validateServerExtensions(server map[string]any, location string) error {
 	meta, ok := server["_meta"].(map[string]any)
 	if !ok {
 		return nil
@@ -244,19 +314,9 @@ func validateServerExtensions(server map[string]any, serverName string) error {
 	if !ok {
 		return nil
 	}
-	extensionsData, err := json.Marshal(publisherProvided)
-	if err != nil {
-		return fmt.Errorf("server %s: failed to serialize extensions: %w", serverName, err)
-	}
-	if err := ValidatePublisherProvidedExtensionsBytes(extensionsData); err != nil {
-		return fmt.Errorf("server %s: %w", serverName, err)
+	if err := validateValueAgainstSchema(publisherProvided, "data/publisher-provided.schema.json",
+		"publisher-provided extensions schema validation failed"); err != nil {
+		return fmt.Errorf("%s: %w", location, err)
 	}
 	return nil
-}
-
-func getServerName(server map[string]any, index int) string {
-	if name, ok := server["name"].(string); ok && name != "" {
-		return name
-	}
-	return fmt.Sprintf("servers[%d]", index)
 }

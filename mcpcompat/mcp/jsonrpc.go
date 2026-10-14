@@ -4,6 +4,7 @@
 package mcp
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -56,8 +57,14 @@ func (m *Meta) MarshalJSON() ([]byte, error) {
 //
 //nolint:revive // method name intentionally matches mcp-go for drop-in compatibility.
 func (m *Meta) UnmarshalJSON(data []byte) error {
+	if !json.Valid(data) {
+		return fmt.Errorf("invalid JSON")
+	}
+
 	raw := make(map[string]any)
-	if err := json.Unmarshal(data, &raw); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&raw); err != nil {
 		return err
 	}
 	m.ProgressToken = raw["progressToken"]

@@ -42,6 +42,71 @@ The ToolHive ecosystem spans multiple Go repositories, and several of these proj
 | `validation/http` | Stable | RFC 7230/8707 compliant HTTP header and URI validation |
 | `validation/group` | Stable | Group name validation |
 
+## Registry JSON validation
+
+`registry/types.ValidateServerJSON(data, validateExtensions)` always validates the
+**original bytes** against the embedded MCP **2025-12-11** server schema. The
+submitted `$schema` URI does not select a schema and is never fetched. Missing
+required fields, wrong types, schema constraint violations, and `packages: null`
+are rejected; omission of `packages` is permitted.
+
+The embedded schema is the published
+[2025-12-11 schema](https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json)
+(SHA-256 `3fba09590c99f61735d234822279f4223fab9e300c0a81e81c91ab62a4114de0`),
+with one local semantic patch: `package.version` has `maxLength: 255`. That
+constraint comes from the [registry v1.8.1 draft schema](https://raw.githubusercontent.com/modelcontextprotocol/registry/v1.8.1/docs/reference/server-json/draft/server.schema.json)
+(SHA-256 `e81b689767ce00722800b2c838ff7e93f6fb1d7bb6d7b2249250f66e4dc4d8c8`).
+The draft is not the released dated schema, so its other changes are excluded:
+its `$id`, Cargo/crates.io documentation, and URL patterns that allow a leading
+template variable. `pkg/api/v0` is the registry Go API import path; module
+`v1.8.1` is its module release; neither selects the dated embedded schema.
+
+All public raw validators in `registry/types` require one complete JSON value and
+reject malformed/trailing input, duplicate decoded member names at any depth
+(including escape-equivalent names), invalid UTF-8, and unpaired Unicode escapes
+before decoding to maps or structs. Member names are case-sensitive: `name` and
+`Name` are distinct, and only `name` satisfies the required MCP property. These
+checks use Go 1.27's standard `encoding/json/jsontext`, without an experiment flag.
+Validate raw input **before** unmarshaling it: typed `Validate` methods and
+`registry/converters` cannot recover information already lost during decoding.
+
+The extension flag controls only additional ToolHive policy on original
+`_meta["io.modelcontextprotocol.registry/publisher-provided"]` metadata:
+
+- `false`: only the MCP schema applies; namespace values may be scalars, arrays,
+  or objects where the MCP schema permits them.
+- `true`: namespace values must be objects. Arbitrary custom namespace objects
+  are accepted; `io.github.stacklok` must also satisfy ToolHive's extension schema.
+- `ValidateUpstreamRegistryBytes` always enables this additional policy.
+
+Dynamic validation and converter extension decodes use `json.Number`, retaining
+numeric spelling and precision through JSON serialization, including
+`9007199254740993`, `18446744073709551615`,
+`0.12345678901234567890123456789`, and `1e400` in unconstrained metadata and
+nested MCP tool definitions. This includes dynamic tool `_meta` fields and JSON
+Schema maps (`$defs`, `properties`, `additionalProperties`, and unmodeled
+keywords) in input and output schemas. The current embedded schemas constrain
+numbers only through integer/range checks for ports and a non-negative range for
+`metadata.stars`; `gojsonschema` evaluates those checks with `big.Rat`, so a
+fractional value near an integer port is rejected. Consumers of dynamic converter
+maps and MCP tool fields must handle `json.Number`, not assume `float64`; callers
+decoding server or registry bytes themselves should use `json.Decoder.UseNumber`
+as well.
+
+This is not a claim of arbitrary-number-exact schema evaluation. In
+`gojsonschema` v1.2.0, `enum`, `const`, and `uniqueItems` equality re-marshals
+numbers through `float64`. The current embedded schemas use those keywords only
+for strings or bounded integer arrays, never arbitrary numeric metadata, but a
+future schema using numeric equality constraints would have that precision
+limitation. Explicitly typed numeric fields retain their Go range/precision
+limits, and converting a `json.Number` to a native numeric type can fail or lose
+precision. Validation does not canonicalize JSON, mutate caller bytes, or impose
+an application-level input byte limit; callers should bound untrusted input size.
+
+Validation errors report schema-defined property names and failure kinds, not
+submitted values, arbitrary namespace/image keys, or server names. Exact error
+text is not an API contract.
+
 ## Package Stability Levels
 
 Each package is marked with a stability level:

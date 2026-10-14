@@ -1170,7 +1170,7 @@ func TestRealWorld_GitHubServer(t *testing.T) {
 	// Verify metadata is preserved
 	metadata, ok := imageData["metadata"].(map[string]interface{})
 	require.True(t, ok, "Metadata should be present")
-	assert.Equal(t, float64(23700), metadata["stars"])
+	assert.Equal(t, json.Number("23700"), metadata["stars"])
 	assert.Equal(t, "2025-10-18T02:26:51Z", metadata["last_updated"])
 }
 

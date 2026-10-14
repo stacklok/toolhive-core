@@ -766,7 +766,7 @@ func TestValidateServerJSON(t *testing.T) {
 		{
 			name: "valid server without extension validation",
 			data: `{
-				"name": "test-server",
+				"name": "io.github.test/test-server",
 				"description": "A test server",
 				"version": "1.0.0"
 			}`,
@@ -776,7 +776,7 @@ func TestValidateServerJSON(t *testing.T) {
 		{
 			name: "valid server with valid extensions",
 			data: `{
-				"name": "test-server",
+				"name": "io.github.test/test-server",
 				"description": "A test server",
 				"version": "1.0.0",
 				"_meta": {
@@ -796,7 +796,7 @@ func TestValidateServerJSON(t *testing.T) {
 		{
 			name: "server with invalid extensions - validate enabled",
 			data: `{
-				"name": "test-server",
+				"name": "io.github.test/test-server",
 				"description": "A test server",
 				"version": "1.0.0",
 				"_meta": {
@@ -816,7 +816,7 @@ func TestValidateServerJSON(t *testing.T) {
 		{
 			name: "server with invalid extensions - validate disabled",
 			data: `{
-				"name": "test-server",
+				"name": "io.github.test/test-server",
 				"description": "A test server",
 				"version": "1.0.0",
 				"_meta": {
@@ -842,8 +842,9 @@ func TestValidateServerJSON(t *testing.T) {
 		{
 			name: "server without _meta - validate enabled",
 			data: `{
-				"name": "test-server",
-				"description": "A test server"
+				"name": "io.github.test/test-server",
+				"description": "A test server",
+				"version": "1.0.0"
 			}`,
 			validateExtensions: true,
 			wantErr:            false,

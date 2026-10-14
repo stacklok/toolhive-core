@@ -14,6 +14,7 @@
 package converters
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 
@@ -260,7 +261,9 @@ func serverExtensionsToMap(ext registry.ServerExtensions) map[string]interface{}
 	}
 
 	var result map[string]interface{}
-	if err := json.Unmarshal(data, &result); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&result); err != nil {
 		return map[string]interface{}{statusKey: ext.Status}
 	}
 

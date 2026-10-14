@@ -6,6 +6,7 @@
 package converters
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -360,8 +361,12 @@ func remarshalToType[T any](data interface{}) T {
 		return result // Return zero value on error
 	}
 
-	// Unmarshal into target type
-	_ = json.Unmarshal(jsonData, &result) // Ignore error, return zero value if fails
+	// Preserve numbers in dynamic extension fields rather than rounding to float64.
+	decoder := json.NewDecoder(bytes.NewReader(jsonData))
+	decoder.UseNumber()
+	if err := decoder.Decode(&result); err != nil {
+		return *new(T)
+	}
 
 	return result
 }

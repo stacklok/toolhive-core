@@ -1,5 +1,5 @@
 {
-  "$comment": "This file is auto-generated from docs/reference/api/openapi.yaml. Do not edit manually. Run 'make generate-schema' to update.",
+  "$comment": "Source: published MCP 2025-12-11 server schema (SHA-256 3fba09590c99f61735d234822279f4223fab9e300c0a81e81c91ab62a4114de0). Local semantic patch: Package.version.maxLength 255 from registry v1.8.1 draft (SHA-256 e81b689767ce00722800b2c838ff7e93f6fb1d7bb6d7b2249250f66e4dc4d8c8); other draft differences are intentionally excluded.",
   "$id": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "$ref": "#/definitions/ServerDetail",
   "$schema": "http://json-schema.org/draft-07/schema#",
@@ -282,6 +282,7 @@
         "version": {
           "description": "Package version. Must be a specific version. Version ranges are rejected (e.g., '^1.2.3', '~1.2.3', '\u003e=1.2.3', '1.x', '1.*').",
           "example": "1.0.2",
+          "maxLength": 255,
           "minLength": 1,
           "not": {
             "const": "latest"

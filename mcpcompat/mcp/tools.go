@@ -4,6 +4,7 @@
 package mcp
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -500,6 +501,10 @@ func (tos *ToolOutputSchema) UnmarshalJSON(data []byte) error {
 
 // UnmarshalJSON implements the json.Unmarshaler interface for ToolArgumentsSchema.
 func (tas *ToolArgumentsSchema) UnmarshalJSON(data []byte) error {
+	if !json.Valid(data) {
+		return fmt.Errorf("invalid JSON")
+	}
+
 	// Use a temporary type to avoid infinite recursion
 	type Alias ToolArgumentsSchema
 	aux := &struct {
@@ -514,7 +519,9 @@ func (tas *ToolArgumentsSchema) UnmarshalJSON(data []byte) error {
 		Alias: (*Alias)(tas),
 	}
 
-	if err := json.Unmarshal(data, aux); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(aux); err != nil {
 		return err
 	}
 

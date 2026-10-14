@@ -422,7 +422,7 @@ func TestValidatePluginBytes(t *testing.T) {
 				"provenance": {"signer_identityy": "typo"}
 			}`,
 			wantErr:       true,
-			errorContains: "signer_identityy",
+			errorContains: "additional_property_not_allowed",
 		},
 		{
 			name: "missing namespace",
