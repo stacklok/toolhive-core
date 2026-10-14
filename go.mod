@@ -46,10 +46,10 @@ require (
 	github.com/sigstore/rekor v1.5.4
 	github.com/sigstore/sigstore v1.10.9
 	github.com/sigstore/sigstore-go v1.3.0
-	github.com/stacklok/toolhive-core/redisconn v0.0.2
-	github.com/stacklok/toolhive-core/redisconn/aws v0.0.6
-	github.com/stacklok/toolhive-core/redisconn/azure v0.0.4
-	github.com/stacklok/toolhive-core/redisconn/gcp v0.0.2
+	github.com/stacklok/toolhive-core/redisconn v0.0.3
+	github.com/stacklok/toolhive-core/redisconn/aws v0.0.7
+	github.com/stacklok/toolhive-core/redisconn/azure v0.0.5
+	github.com/stacklok/toolhive-core/redisconn/gcp v0.0.3
 	github.com/stretchr/testify v1.12.1
 	github.com/xeipuuv/gojsonschema v1.2.0
 	go.opentelemetry.io/otel v1.47.0
