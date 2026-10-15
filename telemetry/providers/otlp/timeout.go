@@ -5,10 +5,14 @@
 package otlp
 
 import (
-	"os"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel"
+
+	"github.com/stacklok/toolhive-core/env"
 )
 
 // envGeneralTimeout is the OTel variable that sets the export budget for every
@@ -58,12 +62,13 @@ var (
 // them here is what keeps them working for a caller that sets no timeout in
 // code; without it, setting this package's default would silently disable a
 // lever callers already use.
-func (c Config) exportTimeoutFor(env signalTimeoutEnv) time.Duration {
+func (c Config) exportTimeoutFor(vars signalTimeoutEnv) time.Duration {
 	if c.ExportTimeout > 0 {
 		return c.ExportTimeout
 	}
-	for _, name := range []string{env.exporter, envGeneralTimeout, env.processor} {
-		if timeout, ok := envTimeoutMillis(name); ok {
+	reader := c.envReader()
+	for _, name := range []string{vars.exporter, envGeneralTimeout, vars.processor} {
+		if timeout, ok := envTimeoutMillis(reader, name); ok {
 			return timeout
 		}
 	}
@@ -74,14 +79,19 @@ func (c Config) exportTimeoutFor(env signalTimeoutEnv) time.Duration {
 // as whole milliseconds. A value that is absent, unparseable or non-positive
 // reports false so the caller falls through to the next tier, matching how the
 // SDK itself treats one it cannot use.
-func envTimeoutMillis(name string) (time.Duration, bool) {
-	raw, ok := os.LookupEnv(name)
+//
+// A value that is set but unusable is also reported through otel.Handle, as
+// the SDK does, so a typo in a variable is visible rather than silently
+// replaced by the next tier.
+func envTimeoutMillis(reader env.Reader, name string) (time.Duration, bool) {
+	raw, ok := reader.LookupEnv(name)
 	if !ok {
 		return 0, false
 	}
 
 	millis, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil || millis <= 0 {
+		otel.Handle(fmt.Errorf("ignoring %s=%q: want a positive whole number of milliseconds", name, raw))
 		return 0, false
 	}
 	return time.Duration(millis) * time.Millisecond, true

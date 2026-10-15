@@ -8,6 +8,8 @@ import (
 	"time"
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+
+	"github.com/stacklok/toolhive-core/env"
 )
 
 // Protocol values accepted by Config.Protocol. An empty/unset Protocol is
@@ -72,11 +74,23 @@ type Config struct {
 	// traces-only setup. Exact paths are an OTLP/HTTP concept, so setting it
 	// with ProtocolGRPC is a configuration error.
 	TracesEndpoint string
+	// EnvReader is consulted for the OTel timeout variables that ExportTimeout
+	// falls back to. A nil value falls back to the real OS environment, so the
+	// zero value of this struct reads the process environment as before.
+	EnvReader env.Reader
 }
 
 // isGRPC reports whether the config selects the OTLP/gRPC transport.
 func (c Config) isGRPC() bool {
 	return c.Protocol == ProtocolGRPC
+}
+
+// envReader returns EnvReader, or the OS environment when it is unset.
+func (c Config) envReader() env.Reader {
+	if c.EnvReader == nil {
+		return &env.OSReader{}
+	}
+	return c.EnvReader
 }
 
 // hasTracesDestination reports whether traces have somewhere to be exported,

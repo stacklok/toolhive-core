@@ -4,10 +4,16 @@
 package otlp
 
 import (
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"go.opentelemetry.io/otel"
+	"go.uber.org/mock/gomock"
+
+	"github.com/stacklok/toolhive-core/env/mocks"
 )
 
 // Not parallel, here or below: t.Setenv forbids it, and these cases are about
@@ -129,7 +135,7 @@ func TestConfig_ExportTimeoutFor_ProcessorVariablesAreSignalScoped(t *testing.T)
 }
 
 // The rest of this file drives the variables through tracesTimeoutEnv and its
-// siblings, so the spelling that actually reaches os.LookupEnv is asserted
+// siblings, so the spelling that actually reaches the env.Reader is asserted
 // here, once. A rename would otherwise retarget every case above in step and
 // go unnoticed.
 func TestSignalTimeoutEnv_Names(t *testing.T) {
@@ -145,4 +151,86 @@ func TestSignalTimeoutEnv_Names(t *testing.T) {
 
 	assert.Equal(t, "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", logsTimeoutEnv.exporter)
 	assert.Equal(t, "OTEL_BLRP_EXPORT_TIMEOUT", logsTimeoutEnv.processor)
+}
+
+// The cases above go through the process environment, which a nil EnvReader
+// falls back to; this pins that an injected reader is consulted instead.
+func TestConfig_ExportTimeoutFor_ReadsInjectedEnvReader(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	reader := mocks.NewMockReader(ctrl)
+	reader.EXPECT().LookupEnv(tracesTimeoutEnv.exporter).Return("45000", true)
+
+	config := Config{EnvReader: reader}
+	assert.Equal(t, 45*time.Second, config.exportTimeoutFor(tracesTimeoutEnv))
+}
+
+//nolint:paralleltest // Swaps the process-wide OTel error handler
+func TestConfig_ExportTimeoutFor_ReportsUnusableValues(t *testing.T) {
+	tests := []struct {
+		name       string
+		exporter   string
+		set        bool
+		want       time.Duration
+		wantReport bool
+	}{
+		{name: "an unparseable value is reported and skipped", exporter: "soon", set: true, want: 20 * time.Second, wantReport: true},
+		{name: "a non-positive value is reported and skipped", exporter: "0", set: true, want: 20 * time.Second, wantReport: true},
+		{name: "a valid value is not reported", exporter: "45000", set: true, want: 45 * time.Second},
+		{name: "an absent value is not reported", want: 20 * time.Second},
+	}
+
+	reports := captureOTelErrors(t)
+
+	for _, tt := range tests { //nolint:paralleltest // Shares the swapped handler above
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			reader := mocks.NewMockReader(ctrl)
+			reader.EXPECT().LookupEnv(tracesTimeoutEnv.exporter).Return(tt.exporter, tt.set)
+			reader.EXPECT().LookupEnv(envGeneralTimeout).Return("20000", true).MaxTimes(1)
+
+			before := len(reports())
+			config := Config{EnvReader: reader}
+			assert.Equal(t, tt.want, config.exportTimeoutFor(tracesTimeoutEnv))
+
+			got := reports()[before:]
+			if !tt.wantReport {
+				assert.Empty(t, got)
+				return
+			}
+			if assert.Len(t, got, 1) {
+				assert.Contains(t, got[0], tracesTimeoutEnv.exporter)
+				assert.Contains(t, got[0], tt.exporter)
+			}
+		})
+	}
+}
+
+// captureOTelErrors routes the global OTel error handler to a recorder for the
+// rest of the test and returns a snapshot func. Only reports about timeout
+// variables are kept, so errors from exporters in other tests can't leak in.
+func captureOTelErrors(t *testing.T) func() []string {
+	t.Helper()
+
+	var (
+		mu   sync.Mutex
+		msgs []string
+	)
+	previous := otel.GetErrorHandler()
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		if !strings.Contains(err.Error(), "ignoring OTEL_") {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		msgs = append(msgs, err.Error())
+	}))
+	t.Cleanup(func() { otel.SetErrorHandler(previous) })
+
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), msgs...)
+	}
 }
