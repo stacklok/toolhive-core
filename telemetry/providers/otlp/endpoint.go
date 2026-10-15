@@ -3,7 +3,11 @@
 
 package otlp
 
-import "strings"
+import (
+	"fmt"
+	"net/url"
+	"strings"
+)
 
 // Default URL path suffixes for the OTLP/HTTP protocol, as defined in the
 // OpenTelemetry specification:
@@ -35,4 +39,26 @@ func splitEndpointPath(endpoint string) (hostPort, basePath string) {
 		return endpoint, ""
 	}
 	return endpoint[:idx], strings.TrimRight(endpoint[idx:], "/")
+}
+
+// validateTracesEndpoint checks that an exact traces URL is one the OTLP/HTTP
+// exporter will honor as given. The SDK's WithEndpointURL logs a URL it cannot
+// parse and carries on with its defaults, and drops a query string without a
+// word, so either would otherwise send traces somewhere other than where the
+// caller pointed them.
+func validateTracesEndpoint(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid traces endpoint %q: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("invalid traces endpoint %q: scheme must be http or https", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("invalid traces endpoint %q: missing host", raw)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("invalid traces endpoint %q: query and fragment are not supported", raw)
+	}
+	return nil
 }

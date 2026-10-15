@@ -18,28 +18,43 @@ import (
 
 func createTraceExporter(ctx context.Context, config Config) (sdktrace.SpanExporter, error) {
 	if config.isGRPC() {
+		if config.TracesEndpoint != "" {
+			return nil, fmt.Errorf("traces endpoint %q requires the %s protocol, not %s",
+				config.TracesEndpoint, ProtocolHTTPProtobuf, ProtocolGRPC)
+		}
 		return createGRPCTraceExporter(ctx, config)
 	}
 	return createHTTPTraceExporter(ctx, config)
 }
 
 func createHTTPTraceExporter(ctx context.Context, config Config) (sdktrace.SpanExporter, error) {
-	host, basePath := splitEndpointPath(config.Endpoint)
 	opts := []otlptracehttp.Option{
-		otlptracehttp.WithEndpoint(host),
 		otlptracehttp.WithTimeout(config.exportTimeoutFor(tracesTimeoutEnv)),
 	}
 
-	if basePath != "" {
-		opts = append(opts, otlptracehttp.WithURLPath(basePath+otlpTracesPath))
+	if config.TracesEndpoint != "" {
+		if err := validateTracesEndpoint(config.TracesEndpoint); err != nil {
+			return nil, err
+		}
+		// Verbatim: WithEndpointURL takes the URL's path as the whole request
+		// path and derives TLS from its scheme, so Insecure, which describes
+		// Endpoint, is deliberately not applied on top.
+		opts = append(opts, otlptracehttp.WithEndpointURL(config.TracesEndpoint))
+	} else {
+		host, basePath := splitEndpointPath(config.Endpoint)
+		opts = append(opts, otlptracehttp.WithEndpoint(host))
+
+		if basePath != "" {
+			opts = append(opts, otlptracehttp.WithURLPath(basePath+otlpTracesPath))
+		}
+
+		if config.Insecure {
+			opts = append(opts, otlptracehttp.WithInsecure())
+		}
 	}
 
 	if len(config.Headers) > 0 {
 		opts = append(opts, otlptracehttp.WithHeaders(config.Headers))
-	}
-
-	if config.Insecure {
-		opts = append(opts, otlptracehttp.WithInsecure())
 	}
 
 	if config.CACertPath != "" {
@@ -102,8 +117,8 @@ func createGRPCTraceExporter(ctx context.Context, config Config) (sdktrace.SpanE
 
 // NewTracerProviderWithShutdown creates an OTLP tracer provider with a shutdown function.
 // Additional span processors (e.g. a Sentry bridge) can be registered via extraProcessors.
-// When endpoint is empty but extra processors are provided, a real SDK provider is created
-// without an OTLP exporter so the processors still receive spans.
+// When neither Endpoint nor TracesEndpoint is set but extra processors are provided, a real
+// SDK provider is created without an OTLP exporter so the processors still receive spans.
 func NewTracerProviderWithShutdown(
 	ctx context.Context,
 	config Config,
@@ -111,22 +126,17 @@ func NewTracerProviderWithShutdown(
 	extraProcessors ...sdktrace.SpanProcessor,
 ) (trace.TracerProvider, func(context.Context) error, error) {
 	// True no-op only when there is nothing at all to do.
-	if config.Endpoint == "" && len(extraProcessors) == 0 {
+	if !config.hasTracesDestination() && len(extraProcessors) == 0 {
 		return tracenoop.NewTracerProvider(), nil, nil
 	}
 
 	opts := []sdktrace.TracerProviderOption{
 		sdktrace.WithResource(res),
-		// ParentBased ensures that when an incoming W3C traceparent header marks
-		// the parent as sampled (e.g. from ToolHive Studio), the child span is
-		// always sampled regardless of the local ratio. Without ParentBased, a
-		// bare TraceIDRatioBased sampler could drop a span even when the remote
-		// parent was sampled, breaking end-to-end distributed trace correlation.
-		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(config.SamplingRate))),
+		sdktrace.WithSampler(config.sampler()),
 	}
 
 	// Only wire an OTLP exporter when an endpoint is actually configured.
-	if config.Endpoint != "" {
+	if config.hasTracesDestination() {
 		exporter, err := createTraceExporter(ctx, config)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create trace provider: %w", err)
@@ -146,4 +156,17 @@ func NewTracerProviderWithShutdown(
 
 	provider := sdktrace.NewTracerProvider(opts...)
 	return provider, provider.Shutdown, nil
+}
+
+// sampler returns the caller's Sampler, or the default when none is set.
+func (c Config) sampler() sdktrace.Sampler {
+	if c.Sampler != nil {
+		return c.Sampler
+	}
+	// ParentBased ensures that when an incoming W3C traceparent header marks
+	// the parent as sampled (e.g. from ToolHive Studio), the child span is
+	// always sampled regardless of the local ratio. Without ParentBased, a
+	// bare TraceIDRatioBased sampler could drop a span even when the remote
+	// parent was sampled, breaking end-to-end distributed trace correlation.
+	return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(c.SamplingRate))
 }

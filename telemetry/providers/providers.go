@@ -57,6 +57,16 @@ type Config struct {
 	// send traces over http/protobuf to a destination that rejects gRPC while
 	// metrics and logs still use Protocol. Falls back to Protocol when unset.
 	TracesProtocol string
+	// TracesEndpoint, when set, is the exact URL traces are POSTed to over
+	// OTLP/HTTP, used verbatim with no "/v1/traces" suffix; its scheme decides
+	// TLS. It takes precedence over OTLPEndpoint for traces only, and metrics
+	// and logs keep using OTLPEndpoint. Tracing works with OTLPEndpoint unset.
+	// Combining it with a gRPC traces protocol is a configuration error.
+	TracesEndpoint string
+
+	// Sampler, when set, replaces the default trace sampler and SamplingRate
+	// is ignored. Unset keeps ParentBased(TraceIDRatioBased(SamplingRate)).
+	Sampler sdktrace.Sampler
 
 	// Prometheus configuration
 	EnablePrometheusMetricsPath bool // EnablePrometheusMetricsPath enables Prometheus /metrics endpoint
@@ -79,6 +89,15 @@ func (c Config) effectiveTracesProtocol() string {
 		return c.TracesProtocol
 	}
 	return c.Protocol
+}
+
+// effectiveTracesEndpoint returns where traces are sent, for logging and
+// error messages: TracesEndpoint when set, else OTLPEndpoint.
+func (c Config) effectiveTracesEndpoint() string {
+	if c.TracesEndpoint != "" {
+		return c.TracesEndpoint
+	}
+	return c.OTLPEndpoint
 }
 
 // ProviderOption is an option type used to configure the telemetry providers
@@ -154,6 +173,37 @@ func WithProtocol(protocol string) ProviderOption {
 func WithTracesProtocol(protocol string) ProviderOption {
 	return func(config *Config) error {
 		config.TracesProtocol = protocol
+		return nil
+	}
+}
+
+// WithTracesEndpoint sets an exact URL for trace export, e.g.
+// "https://ingest.example.com/v2/telemetry/sink". Traces are POSTed to it
+// verbatim over OTLP/HTTP: no "/v1/traces" suffix is appended, and the URL's
+// scheme decides TLS regardless of WithInsecure. Headers and the CA cert from
+// WithHeaders and WithCACertPath still apply.
+//
+// It takes precedence over WithOTLPEndpoint for traces only; metrics and logs
+// keep using the OTLP endpoint. Leaving the OTLP endpoint unset gives a
+// traces-only setup. By default (unset), traces go to the OTLP endpoint with
+// "/v1/traces" appended. Using it with a gRPC traces protocol makes
+// NewCompositeProvider fail, since exact paths only exist in OTLP/HTTP.
+func WithTracesEndpoint(endpoint string) ProviderOption {
+	return func(config *Config) error {
+		config.TracesEndpoint = endpoint
+		return nil
+	}
+}
+
+// WithSampler sets the trace sampler, taking precedence over WithSamplingRate,
+// which is then ignored. By default (unset or nil), the sampler is
+// ParentBased(TraceIDRatioBased(rate)), which inherits an incoming remote
+// parent's decision, including an unsampled one. Supply your own to change
+// that, e.g. ParentBased(ratio, WithRemoteParentNotSampled(ratio)) so an
+// upstream proxy's unsampled traceparent doesn't suppress this service's spans.
+func WithSampler(sampler sdktrace.Sampler) ProviderOption {
+	return func(config *Config) error {
+		config.Sampler = sampler
 		return nil
 	}
 }
@@ -374,7 +424,7 @@ func createTracingProvider(
 	tracerProvider, tracerShutdown, err := tracerStrategy.CreateTracerProvider(ctx, config, res)
 	if err != nil {
 		return fmt.Errorf("failed to create tracer provider with config (endpoint: %s, tracing enabled: %t): %w",
-			config.OTLPEndpoint,
+			config.effectiveTracesEndpoint(),
 			config.TracingEnabled,
 			err)
 	}
