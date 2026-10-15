@@ -4,7 +4,13 @@
 // Package otlp provides OpenTelemetry Protocol (OTLP) provider implementations
 package otlp
 
-import "time"
+import (
+	"time"
+
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+
+	"github.com/stacklok/toolhive-core/env"
+)
 
 // Protocol values accepted by Config.Protocol. An empty/unset Protocol is
 // equivalent to ProtocolHTTPProtobuf.
@@ -54,9 +60,43 @@ type Config struct {
 	// DefaultExportTimeout when those are unset too — see exportTimeoutFor for the
 	// precedence and why this package resolves those variables itself.
 	ExportTimeout time.Duration
+	// Sampler, when non-nil, is the tracer provider's sampler and SamplingRate
+	// is ignored. Nil keeps the default,
+	// ParentBased(TraceIDRatioBased(SamplingRate)), which follows a remote
+	// parent's sampled flag in both directions. Set this when an unsampled
+	// parent from upstream (e.g. an edge proxy sampling at a low rate) must not
+	// suppress this service's spans. Traces sampled that way reference upstream
+	// spans that were never exported, so backends show a missing parent.
+	Sampler sdktrace.Sampler
+	// TracesEndpoint, when set, is the full URL traces are POSTed to, used
+	// verbatim: no "/v1/traces" suffix is appended and its scheme alone decides
+	// TLS (Insecure is not consulted for it). It overrides Endpoint for traces
+	// only; metrics and logs keep using Endpoint, which may be left empty for a
+	// traces-only setup. Exact paths are an OTLP/HTTP concept, so setting it
+	// with ProtocolGRPC is a configuration error, as is a URL with userinfo or
+	// a query, or a path the exporter could not send exactly as written.
+	TracesEndpoint string
+	// EnvReader is consulted for the OTel timeout variables that ExportTimeout
+	// falls back to. A nil value falls back to the real OS environment, so the
+	// zero value of this struct reads the process environment as before.
+	EnvReader env.Reader
 }
 
 // isGRPC reports whether the config selects the OTLP/gRPC transport.
 func (c Config) isGRPC() bool {
 	return c.Protocol == ProtocolGRPC
+}
+
+// envReader returns EnvReader, or the OS environment when it is unset.
+func (c Config) envReader() env.Reader {
+	if c.EnvReader == nil {
+		return &env.OSReader{}
+	}
+	return c.EnvReader
+}
+
+// hasTracesDestination reports whether traces have somewhere to be exported,
+// through either TracesEndpoint or Endpoint.
+func (c Config) hasTracesDestination() bool {
+	return c.TracesEndpoint != "" || c.Endpoint != ""
 }
