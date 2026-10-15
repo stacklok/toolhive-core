@@ -76,16 +76,16 @@ func (c Config) exportTimeoutFor(vars signalTimeoutEnv) time.Duration {
 }
 
 // envTimeoutMillis reads an OTel timeout variable, whose value the spec defines
-// as whole milliseconds. A value that is absent, unparseable or non-positive
-// reports false so the caller falls through to the next tier, matching how the
-// SDK itself treats one it cannot use.
+// as whole milliseconds. A value that is absent, empty, unparseable or
+// non-positive reports false so the caller falls through to the next tier,
+// matching how the SDK itself treats one it cannot use.
 //
 // A value that is set but unusable is also reported through otel.Handle, as
 // the SDK does, so a typo in a variable is visible rather than silently
-// replaced by the next tier.
+// replaced by the next tier. An empty value counts as unset, not as a typo.
 func envTimeoutMillis(reader env.Reader, name string) (time.Duration, bool) {
 	raw, ok := reader.LookupEnv(name)
-	if !ok {
+	if !ok || strings.TrimSpace(raw) == "" {
 		return 0, false
 	}
 

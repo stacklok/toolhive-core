@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -91,13 +92,25 @@ func (c Config) effectiveTracesProtocol() string {
 	return c.Protocol
 }
 
-// effectiveTracesEndpoint returns where traces are sent, for logging and
-// error messages: TracesEndpoint when set, else OTLPEndpoint.
-func (c Config) effectiveTracesEndpoint() string {
+// tracesEndpointForLog describes where traces are sent, for logs and error
+// messages. TracesEndpoint is reduced to its scheme and host, since its path,
+// query or userinfo can carry a credential; OTLPEndpoint is shown as before.
+func (c Config) tracesEndpointForLog() string {
 	if c.TracesEndpoint != "" {
-		return c.TracesEndpoint
+		return redactEndpoint(c.TracesEndpoint)
 	}
 	return c.OTLPEndpoint
+}
+
+// redactEndpoint reduces an endpoint URL to its scheme and host. A value that
+// does not parse as a URL with a host is replaced with a placeholder rather
+// than echoed.
+func redactEndpoint(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "<unparseable endpoint>"
+	}
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
 }
 
 // ProviderOption is an option type used to configure the telemetry providers
@@ -181,7 +194,10 @@ func WithTracesProtocol(protocol string) ProviderOption {
 // "https://ingest.example.com/v2/telemetry/sink". Traces are POSTed to it
 // verbatim over OTLP/HTTP: no "/v1/traces" suffix is appended, and the URL's
 // scheme decides TLS regardless of WithInsecure. Headers and the CA cert from
-// WithHeaders and WithCACertPath still apply.
+// WithHeaders and WithCACertPath still apply, and are where credentials
+// belong: a URL with userinfo or a query string is rejected, as is a path the
+// exporter could not send exactly as written (e.g. one with an escaped "/").
+// Logs and errors show only the URL's scheme and host.
 //
 // It takes precedence over WithOTLPEndpoint for traces only; metrics and logs
 // keep using the OTLP endpoint. Leaving the OTLP endpoint unset gives a
@@ -201,6 +217,13 @@ func WithTracesEndpoint(endpoint string) ProviderOption {
 // parent's decision, including an unsampled one. Supply your own to change
 // that, e.g. ParentBased(ratio, WithRemoteParentNotSampled(ratio)) so an
 // upstream proxy's unsampled traceparent doesn't suppress this service's spans.
+//
+// Two caveats when sampling under an unsampled remote parent. The resulting
+// traces reference upstream spans that were never exported, so backends show
+// them with a missing parent. And sampling every span does not make export
+// lossless: spans are still dropped when the queue is full or an export
+// fails, so anything that must be counted exactly (billing, for instance)
+// needs durable, idempotent records rather than spans alone.
 func WithSampler(sampler sdktrace.Sampler) ProviderOption {
 	return func(config *Config) error {
 		config.Sampler = sampler
@@ -424,7 +447,7 @@ func createTracingProvider(
 	tracerProvider, tracerShutdown, err := tracerStrategy.CreateTracerProvider(ctx, config, res)
 	if err != nil {
 		return fmt.Errorf("failed to create tracer provider with config (endpoint: %s, tracing enabled: %t): %w",
-			config.effectiveTracesEndpoint(),
+			config.tracesEndpointForLog(),
 			config.TracingEnabled,
 			err)
 	}

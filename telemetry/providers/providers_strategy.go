@@ -56,7 +56,7 @@ func (*OTLPTracerStrategy) CreateTracerProvider(
 ) (trace.TracerProvider, func(context.Context) error, error) {
 	//nolint:gosec // G706: OTLP endpoint from config
 	slog.Debug("creating OTLP tracer provider",
-		"endpoint", config.effectiveTracesEndpoint(),
+		"endpoint", config.tracesEndpointForLog(),
 		"sampling_rate", config.SamplingRate,
 		"custom_sampler", config.Sampler != nil,
 		"extra_processors", len(config.ExtraSpanProcessors))
@@ -76,7 +76,7 @@ func (*OTLPTracerStrategy) CreateTracerProvider(
 	provider, shutdown, err := otlp.NewTracerProviderWithShutdown(ctx, otlpConfig, res, config.ExtraSpanProcessors...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create OTLP tracer provider for endpoint %s: %w",
-			config.effectiveTracesEndpoint(), err)
+			config.tracesEndpointForLog(), err)
 	}
 	return provider, shutdown, nil
 }

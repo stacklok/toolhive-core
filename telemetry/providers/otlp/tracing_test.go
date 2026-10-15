@@ -519,6 +519,27 @@ func TestNewTracerProviderWithShutdown_TracesEndpoint(t *testing.T) {
 		assert.Empty(t, collectorPaths(), "traces also went to Endpoint")
 	})
 
+	t.Run("the request target matches the path as written", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name, path, want string
+		}{
+			{name: "trailing slash is kept", path: "/v2/telemetry/sink-abc/", want: "/v2/telemetry/sink-abc/"},
+			{name: "an escape the exporter re-creates is kept", path: "/v2/sink%20name", want: "/v2/sink%20name"},
+			{name: "no path targets the root", path: "", want: "/"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				traceSrv, tracePaths := recordingOTLPIngest(t, httptest.NewServer)
+				exportOneSpan(t, Config{TracesEndpoint: traceSrv.URL + tt.path, SamplingRate: 1.0})
+				assert.Equal(t, []string{tt.want}, tracePaths())
+			})
+		}
+	})
+
 	t.Run("works with Endpoint unset and Insecure off when the scheme is http", func(t *testing.T) {
 		t.Parallel()
 
@@ -563,33 +584,53 @@ func TestCreateTraceExporter_TracesEndpointErrors(t *testing.T) {
 	}{
 		{
 			name:    "grpc protocol",
-			config:  Config{TracesEndpoint: "https://ingest.example.com/v2/sink", Protocol: ProtocolGRPC},
+			config:  Config{TracesEndpoint: "https://ingest.example.com/SECRET/v2/sink", Protocol: ProtocolGRPC},
 			wantErr: "requires the http/protobuf protocol",
 		},
 		{
 			name:    "missing scheme",
-			config:  Config{TracesEndpoint: "ingest.example.com/v2/sink"},
+			config:  Config{TracesEndpoint: "ingest.example.com/SECRET/v2/sink"},
 			wantErr: "scheme must be http or https",
 		},
 		{
 			name:    "unsupported scheme",
-			config:  Config{TracesEndpoint: "grpc://ingest.example.com:4317"},
+			config:  Config{TracesEndpoint: "grpc://ingest.example.com:4317/SECRET"},
 			wantErr: "scheme must be http or https",
 		},
 		{
 			name:    "missing host",
-			config:  Config{TracesEndpoint: "https:///v2/sink"},
+			config:  Config{TracesEndpoint: "https:///SECRET/v2/sink"},
 			wantErr: "missing host",
 		},
 		{
+			name:    "userinfo would be dropped by the SDK",
+			config:  Config{TracesEndpoint: "https://user:SECRET@ingest.example.com/v2/sink"},
+			wantErr: "credentials in the URL are not supported",
+		},
+		{
 			name:    "query string would be dropped by the SDK",
-			config:  Config{TracesEndpoint: "https://ingest.example.com/v2/sink?key=abc"},
+			config:  Config{TracesEndpoint: "https://ingest.example.com/v2/sink?key=SECRET"},
 			wantErr: "query and fragment are not supported",
 		},
 		{
+			name:    "an empty query is rejected too",
+			config:  Config{TracesEndpoint: "https://ingest.example.com/SECRET/v2/sink?"},
+			wantErr: "query and fragment are not supported",
+		},
+		{
+			name:    "an escaped slash would be sent as a real one",
+			config:  Config{TracesEndpoint: "https://ingest.example.com/SECRET%2Fblue/ingest"},
+			wantErr: "path would not be sent as written",
+		},
+		{
+			name:    "an escaped trailing space would be trimmed",
+			config:  Config{TracesEndpoint: "https://ingest.example.com/SECRET/ingest%20"},
+			wantErr: "path would not be sent as written",
+		},
+		{
 			name:    "unparseable URL",
-			config:  Config{TracesEndpoint: "https://ingest.example.com/%zz"},
-			wantErr: "invalid traces endpoint",
+			config:  Config{TracesEndpoint: "https://ingest.example.com/SECRET/%zz"},
+			wantErr: "not a valid URL",
 		},
 	}
 
@@ -600,6 +641,9 @@ func TestCreateTraceExporter_TracesEndpointErrors(t *testing.T) {
 			exporter, err := createTraceExporter(t.Context(), tt.config)
 			require.ErrorContains(t, err, tt.wantErr)
 			assert.Nil(t, exporter)
+			// Every URL above carries a sentinel credential; errors reach logs,
+			// so none may echo it.
+			assert.NotContains(t, err.Error(), "SECRET")
 
 			// The provider surfaces the same error rather than going no-op.
 			provider, shutdown, err := NewTracerProviderWithShutdown(t.Context(), tt.config, resource.Empty())

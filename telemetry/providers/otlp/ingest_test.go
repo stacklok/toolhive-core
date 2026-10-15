@@ -42,7 +42,9 @@ func delayedOTLPIngest(t *testing.T, delay time.Duration) *httptest.Server {
 }
 
 // recordingOTLPIngest accepts every OTLP/HTTP request at once and records its
-// path. The returned func snapshots the paths seen so far.
+// RequestURI, the request target exactly as sent, rather than the decoded
+// r.URL.Path, which would hide an escaped "/" turning into a real one. The
+// returned func snapshots the targets seen so far.
 func recordingOTLPIngest(t *testing.T, newServer func(http.Handler) *httptest.Server) (*httptest.Server, func() []string) {
 	t.Helper()
 
@@ -52,7 +54,7 @@ func recordingOTLPIngest(t *testing.T, newServer func(http.Handler) *httptest.Se
 	)
 	srv := newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		paths = append(paths, r.URL.Path)
+		paths = append(paths, r.RequestURI)
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))

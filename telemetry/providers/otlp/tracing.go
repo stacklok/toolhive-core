@@ -19,8 +19,8 @@ import (
 func createTraceExporter(ctx context.Context, config Config) (sdktrace.SpanExporter, error) {
 	if config.isGRPC() {
 		if config.TracesEndpoint != "" {
-			return nil, fmt.Errorf("traces endpoint %q requires the %s protocol, not %s",
-				config.TracesEndpoint, ProtocolHTTPProtobuf, ProtocolGRPC)
+			return nil, fmt.Errorf("traces endpoint requires the %s protocol, not %s",
+				ProtocolHTTPProtobuf, ProtocolGRPC)
 		}
 		return createGRPCTraceExporter(ctx, config)
 	}

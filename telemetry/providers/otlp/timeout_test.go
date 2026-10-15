@@ -179,6 +179,7 @@ func TestConfig_ExportTimeoutFor_ReportsUnusableValues(t *testing.T) {
 		{name: "a non-positive value is reported and skipped", exporter: "0", set: true, want: 20 * time.Second, wantReport: true},
 		{name: "a valid value is not reported", exporter: "45000", set: true, want: 45 * time.Second},
 		{name: "an absent value is not reported", want: 20 * time.Second},
+		{name: "an empty value counts as unset and is not reported", exporter: "  ", set: true, want: 20 * time.Second},
 	}
 
 	reports := captureOTelErrors(t)

@@ -4,8 +4,10 @@
 package providers
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -473,7 +475,8 @@ func TestNewCompositeProvider_TracesEndpointRejectsGRPC(t *testing.T) {
 }
 
 // recordingIngest accepts every OTLP/HTTP request at once and records its
-// path. The returned func snapshots the paths seen so far.
+// RequestURI, the request target exactly as sent. The returned func snapshots
+// the targets seen so far.
 func recordingIngest(t *testing.T) (*httptest.Server, func() []string) {
 	t.Helper()
 
@@ -483,7 +486,7 @@ func recordingIngest(t *testing.T) (*httptest.Server, func() []string) {
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		paths = append(paths, r.URL.Path)
+		paths = append(paths, r.RequestURI)
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -507,3 +510,101 @@ func emitSpanAndMetric(t *testing.T, provider *CompositeProvider) {
 	require.NoError(t, err)
 	counter.Add(t.Context(), 1)
 }
+
+func TestRedactEndpoint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name, raw, want string
+	}{
+		{name: "path is dropped", raw: "https://ingest.example.com/v2/telemetry/sink", want: "https://ingest.example.com"},
+		{name: "port is kept", raw: "http://127.0.0.1:4318/v2/sink", want: "http://127.0.0.1:4318"},
+		{name: "userinfo and query are dropped", raw: "https://user:SECRET@ingest.example.com/x?key=SECRET", want: "https://ingest.example.com"},
+		{name: "no host is a placeholder", raw: "ingest.example.com/SECRET", want: "<unparseable endpoint>"},
+		{name: "unparseable is a placeholder", raw: "https://ingest.example.com/%zzSECRET", want: "<unparseable endpoint>"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, redactEndpoint(tt.raw))
+		})
+	}
+}
+
+// Drives the traces endpoint through NewCompositeProvider with a sentinel
+// credential in each part of the URL that can carry one, and asserts it
+// reaches neither the returned error nor the debug logs.
+//
+//nolint:paralleltest // Swaps the process-wide default slog logger
+func TestNewCompositeProvider_TracesEndpointNeverLeaksURL(t *testing.T) {
+	traceSrv, _ := recordingIngest(t)
+
+	tests := []struct {
+		name     string
+		endpoint string
+		protocol string
+		wantErr  bool
+	}{
+		{name: "accepted URL with a credential in the path", endpoint: traceSrv.URL + "/SECRET-sink"},
+		{name: "userinfo", endpoint: "https://user:SECRET@ingest.example.com/v2/sink", wantErr: true},
+		{name: "query", endpoint: "https://ingest.example.com/v2/sink?key=SECRET", wantErr: true},
+		{name: "path the exporter would rewrite", endpoint: "https://ingest.example.com/SECRET%2Fblue", wantErr: true},
+		{name: "unparseable", endpoint: "https://ingest.example.com/%zzSECRET", wantErr: true},
+		{name: "grpc", endpoint: "https://ingest.example.com/SECRET", protocol: otlp.ProtocolGRPC, wantErr: true},
+	}
+
+	logs := captureDebugLogs(t)
+
+	for _, tt := range tests { //nolint:paralleltest // Shares the swapped logger above
+		t.Run(tt.name, func(t *testing.T) {
+			provider, err := NewCompositeProvider(t.Context(),
+				WithServiceName("test-service"),
+				WithServiceVersion("1.0.0"),
+				WithTracesEndpoint(tt.endpoint),
+				WithTracesProtocol(tt.protocol),
+				WithTracingEnabled(true),
+			)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.NotContains(t, err.Error(), "SECRET")
+			} else {
+				require.NoError(t, err)
+				require.NoError(t, provider.Shutdown(t.Context()))
+			}
+		})
+	}
+
+	got := logs()
+	// Proves the logger was capturing, so the absence below means something.
+	assert.Contains(t, got, "creating OTLP tracer provider")
+	assert.NotContains(t, got, "SECRET")
+}
+
+// captureDebugLogs routes the default slog logger, at debug level, to a buffer
+// for the rest of the test and returns a snapshot func.
+func captureDebugLogs(t *testing.T) func() string {
+	t.Helper()
+
+	var (
+		mu  sync.Mutex
+		buf bytes.Buffer
+	)
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.Write(p)
+	}), &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	return func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.String()
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
