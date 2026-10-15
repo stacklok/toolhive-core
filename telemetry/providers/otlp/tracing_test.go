@@ -7,8 +7,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"testing"
 	"time"
@@ -400,40 +398,8 @@ func TestNewTracerProviderWithShutdown_BatcherBudgetFollowsExportTimeout(t *test
 			"rather than the configured 150ms", elapsed)
 }
 
-// delayedOTLPIngest serves OTLP/HTTP and accepts every batch, but takes delay
-// to answer — the shape that trips an export deadline. The handler always
-// returns on its own, so a client that has already given up cannot leave it
-// wedged against the server's shutdown.
-func delayedOTLPIngest(t *testing.T, delay time.Duration) *httptest.Server {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		time.Sleep(delay)
-		w.WriteHeader(http.StatusOK)
-	}))
-	t.Cleanup(srv.CloseClientConnections)
-	return srv
-}
-
 // silentTCPPeer accepts connections and then says nothing, so a gRPC client
 // stalls in its handshake until its own deadline rather than failing to dial.
-func silentTCPPeer(t *testing.T) string {
-	t.Helper()
-	var lc net.ListenConfig
-	lis, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = lis.Close() })
-
-	go func() {
-		for {
-			conn, err := lis.Accept()
-			if err != nil {
-				return
-			}
-			t.Cleanup(func() { _ = conn.Close() })
-		}
-	}()
-	return lis.Addr().String()
-}
 
 // endedSpans returns one ended span in the read-only form an exporter takes.
 func endedSpans(t *testing.T) []sdktrace.ReadOnlySpan {

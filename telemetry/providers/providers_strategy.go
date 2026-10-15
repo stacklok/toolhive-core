@@ -113,11 +113,12 @@ func (*OTLPLoggerStrategy) CreateLoggerProvider(
 		"endpoint", config.OTLPEndpoint)
 
 	otlpConfig := otlp.Config{
-		Endpoint:   config.OTLPEndpoint,
-		Headers:    config.Headers,
-		Insecure:   config.Insecure,
-		CACertPath: config.CACertPath,
-		Protocol:   config.Protocol,
+		Endpoint:      config.OTLPEndpoint,
+		Headers:       config.Headers,
+		Insecure:      config.Insecure,
+		CACertPath:    config.CACertPath,
+		Protocol:      config.Protocol,
+		ExportTimeout: config.ExportTimeout,
 	}
 
 	provider, shutdown, err := otlp.NewLoggerProviderWithShutdown(ctx, otlpConfig, res)
@@ -180,12 +181,13 @@ func (s *UnifiedMeterStrategy) CreateMeterProvider(
 			"endpoint", config.OTLPEndpoint)
 
 		otlpConfig := otlp.Config{
-			Endpoint:     config.OTLPEndpoint,
-			Headers:      config.Headers,
-			Insecure:     config.Insecure,
-			SamplingRate: config.SamplingRate,
-			CACertPath:   config.CACertPath,
-			Protocol:     config.Protocol,
+			Endpoint:      config.OTLPEndpoint,
+			Headers:       config.Headers,
+			Insecure:      config.Insecure,
+			SamplingRate:  config.SamplingRate,
+			CACertPath:    config.CACertPath,
+			Protocol:      config.Protocol,
+			ExportTimeout: config.ExportTimeout,
 		}
 
 		reader, err := otlp.NewMetricReader(ctx, otlpConfig)

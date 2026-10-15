@@ -13,6 +13,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/log"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
@@ -220,4 +224,95 @@ func TestOTLPTracerStrategy_CreateTracerProvider_AppliesExportTimeout(t *testing
 	assert.Less(t, elapsed, 3*time.Second,
 		"flush against an unresponsive ingest took %s — ExportTimeout is not reaching otlp.Config, "+
 			"leaving the export on the 30s default", elapsed)
+}
+
+// The traces path is covered by TestOTLPTracerStrategy_CreateTracerProvider_AppliesExportTimeout;
+// these cover the other two strategies, which build their own otlp.Config and
+// so can drop the field independently.
+func TestStrategies_CreateProvider_AppliesExportTimeoutForEverySignal(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		// flush builds the signal's provider from config and forces an export,
+		// returning how long that took.
+		flush func(t *testing.T, config Config) time.Duration
+	}{
+		{
+			name: "logs",
+			flush: func(t *testing.T, config Config) time.Duration {
+				t.Helper()
+
+				provider, shutdown, err := (&OTLPLoggerStrategy{}).CreateLoggerProvider(t.Context(), config, resource.Empty())
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = shutdown(context.Background()) })
+
+				sdkProvider, ok := provider.(*sdklog.LoggerProvider)
+				require.True(t, ok, "expected a real logger provider, got %T", provider)
+
+				var record log.Record
+				record.SetBody(attribute.StringValue("export-timeout"))
+				sdkProvider.Logger("test").Emit(t.Context(), record)
+
+				return timeFlush(t, sdkProvider.ForceFlush)
+			},
+		},
+		{
+			name: "metrics",
+			flush: func(t *testing.T, config Config) time.Duration {
+				t.Helper()
+
+				result, err := (&UnifiedMeterStrategy{EnableOTLP: true}).CreateMeterProvider(t.Context(), config, resource.Empty())
+				require.NoError(t, err)
+				require.NotNil(t, result)
+
+				sdkProvider, ok := result.MeterProvider.(*sdkmetric.MeterProvider)
+				require.True(t, ok, "expected a real meter provider, got %T", result.MeterProvider)
+				t.Cleanup(func() { _ = sdkProvider.Shutdown(context.Background()) })
+
+				counter, err := sdkProvider.Meter("test").Int64Counter("export.timeout")
+				require.NoError(t, err)
+				counter.Add(t.Context(), 1)
+
+				return timeFlush(t, sdkProvider.ForceFlush)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				time.Sleep(30 * time.Second)
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.CloseClientConnections)
+
+			elapsed := tt.flush(t, Config{
+				OTLPEndpoint:   srv.Listener.Addr().String(),
+				Insecure:       true,
+				MetricsEnabled: true,
+				LoggingEnabled: true,
+				ExportTimeout:  150 * time.Millisecond,
+			})
+
+			assert.Less(t, elapsed, 3*time.Second,
+				"flush against an unresponsive ingest took %s — ExportTimeout is not reaching otlp.Config "+
+					"for this signal, leaving the export on the 30s default", elapsed)
+		})
+	}
+}
+
+// timeFlush runs a provider's ForceFlush under a ceiling that keeps a failing
+// case from running to the package timeout, and reports how long it took.
+func timeFlush(t *testing.T, forceFlush func(context.Context) error) time.Duration {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_ = forceFlush(ctx)
+	return time.Since(start)
 }

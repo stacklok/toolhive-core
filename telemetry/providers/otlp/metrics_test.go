@@ -7,9 +7,11 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 
 func TestCreateMetricExporter(t *testing.T) {
@@ -201,4 +203,73 @@ func TestNewMetricReader(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewMetricReader_AppliesExportTimeout(t *testing.T) {
+	t.Parallel()
+
+	// Both halves of the budget at once: the reader's own default is 30s, so a
+	// flush that returns promptly proves the configured value reached the
+	// reader, and reaching it at all means the exporter was built with it too.
+	srv := delayedOTLPIngest(t, 30*time.Second)
+
+	reader, err := NewMetricReader(t.Context(), Config{
+		Endpoint:      srv.Listener.Addr().String(),
+		Insecure:      true,
+		ExportTimeout: 150 * time.Millisecond,
+	})
+	require.NoError(t, err)
+
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+
+	// Without a recorded point there is nothing to export and the flush would
+	// return promptly no matter what the budget is.
+	counter, err := provider.Meter("test").Int64Counter("export.timeout")
+	require.NoError(t, err)
+	counter.Add(t.Context(), 1)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_ = provider.ForceFlush(ctx)
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, 3*time.Second,
+		"flush against an unresponsive ingest took %s — the reader is still on its own 30s budget "+
+			"rather than the configured 150ms", elapsed)
+}
+
+func TestNewMetricReader_ExportTimeoutFromEnvironment(t *testing.T) {
+	// Not parallel: t.Setenv.
+	t.Setenv(metricsTimeoutEnv.exporter, "150")
+
+	srv := delayedOTLPIngest(t, 30*time.Second)
+
+	// No ExportTimeout in code, so the only thing that can bound this flush is
+	// the variable — which the SDK would otherwise ignore, since this package
+	// passes the budget as an explicit option.
+	reader, err := NewMetricReader(t.Context(), Config{
+		Endpoint: srv.Listener.Addr().String(),
+		Insecure: true,
+	})
+	require.NoError(t, err)
+
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+
+	counter, err := provider.Meter("test").Int64Counter("export.timeout.env")
+	require.NoError(t, err)
+	counter.Add(t.Context(), 1)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_ = provider.ForceFlush(ctx)
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, 3*time.Second,
+		"flush took %s — OTEL_EXPORTER_OTLP_METRICS_TIMEOUT is not being honored", elapsed)
 }
