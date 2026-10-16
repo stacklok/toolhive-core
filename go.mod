@@ -15,7 +15,7 @@ replace github.com/stacklok/toolhive-core/redisconn/gcp => ./redisconn/gcp
 require (
 	cel.dev/cel-go v0.32.0
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.3
-	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.1
+	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.15.0
 	github.com/adrg/xdg v0.5.3
 	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/aws/aws-sdk-go-v2 v1.47.3
@@ -46,10 +46,10 @@ require (
 	github.com/sigstore/rekor v1.5.4
 	github.com/sigstore/sigstore v1.11.1
 	github.com/sigstore/sigstore-go v1.3.0
-	github.com/stacklok/toolhive-core/redisconn v0.0.3
-	github.com/stacklok/toolhive-core/redisconn/aws v0.0.7
-	github.com/stacklok/toolhive-core/redisconn/azure v0.0.5
-	github.com/stacklok/toolhive-core/redisconn/gcp v0.0.3
+	github.com/stacklok/toolhive-core/redisconn v0.0.4
+	github.com/stacklok/toolhive-core/redisconn/aws v0.0.8
+	github.com/stacklok/toolhive-core/redisconn/azure v0.0.6
+	github.com/stacklok/toolhive-core/redisconn/gcp v0.0.4
 	github.com/stretchr/testify v1.12.1
 	github.com/xeipuuv/gojsonschema v1.2.0
 	go.opentelemetry.io/otel v1.47.0
@@ -101,10 +101,10 @@ require (
 	github.com/coreos/go-oidc/v3 v3.21.0 // indirect
 	github.com/digitorus/pkcs7 v0.0.0-20260914070511-d678ea5ea03f // indirect
 	github.com/digitorus/timestamp v0.0.0-20260914073129-b4b58b92aa51 // indirect
-	github.com/docker/cli v29.9.0+incompatible // indirect
+	github.com/docker/cli v29.9.1+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.9.10 // indirect
 	github.com/ebitengine/purego v0.11.1 // indirect
-	github.com/go-jose/go-jose/v4 v4.1.5 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.6 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
@@ -127,7 +127,7 @@ require (
 	github.com/go-openapi/validate v1.0.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
-	github.com/grpc-ecosystem/grpc-gateway/v2 v2.31.0 // indirect
+	github.com/grpc-ecosystem/grpc-gateway/v2 v2.32.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-retryablehttp v0.7.8 // indirect
 	github.com/in-toto/in-toto-golang v0.11.0 // indirect

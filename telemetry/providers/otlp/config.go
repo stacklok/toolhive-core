@@ -4,7 +4,13 @@
 // Package otlp provides OpenTelemetry Protocol (OTLP) provider implementations
 package otlp
 
-import "time"
+import (
+	"time"
+
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+
+	"github.com/stacklok/toolhive-core/env"
+)
 
 // Protocol values accepted by Config.Protocol. An empty/unset Protocol is
 // equivalent to ProtocolHTTPProtobuf.
@@ -16,20 +22,21 @@ const (
 	ProtocolGRPC = "grpc"
 )
 
-// DefaultExportTimeout bounds one trace export when Config.ExportTimeout is
-// unset. It replaces the SDK exporters' own 10s default, which is tight for
-// the off-cluster destinations this package exists to reach — a custom base
-// path on Endpoint is how a caller targets a third-party ingest route.
+// DefaultExportTimeout bounds one export when Config.ExportTimeout is unset and
+// no OTel timeout variable applies. It replaces the SDK exporters' own 10s
+// default, which is tight for the off-cluster destinations this package exists
+// to reach — a custom base path on Endpoint is how a caller targets a
+// third-party ingest route.
 //
 // The value matters because the SDK's two timeouts are asymmetric. Under
-// OTLP/HTTP — this package's default transport — the exporter's timeout is
-// the HTTP client's PER-REQUEST deadline, and a request that trips it is
-// classified retryable and sent again; only the span processor's export
-// budget bounds that retry. A destination that accepts a batch but answers
-// slower than the exporter's deadline is therefore handed the same batch
-// twice, and because the retry succeeds nothing is logged on this side. A
-// receiver that counts what it receives then counts those spans twice.
-// Giving both the same budget leaves that re-send no room.
+// OTLP/HTTP — this package's default transport — the exporter's timeout is the
+// HTTP client's PER-REQUEST deadline, and a request that trips it is classified
+// retryable and sent again; only the processor's or reader's export budget
+// bounds that retry. A destination that accepts a batch but answers slower than
+// the exporter's deadline is therefore handed the same batch twice, and because
+// the retry succeeds nothing is logged on this side. A receiver that counts what
+// it receives then counts those spans, points or records twice. Giving both the
+// same budget leaves that re-send no room.
 const DefaultExportTimeout = 30 * time.Second
 
 // Config holds OTLP-specific configuration
@@ -44,12 +51,35 @@ type Config struct {
 	// ProtocolHTTPProtobuf, preserving this package's original HTTP-only
 	// behavior for callers that don't set it.
 	Protocol string
-	// ExportTimeout bounds a single trace export. It is applied to both the
-	// exporter and the span processor, so neither can outlive the other. Set
-	// it above the destination's worst-case response time. Zero or negative
-	// means DefaultExportTimeout — see that constant for why the default is
-	// not the SDK's.
+	// ExportTimeout bounds a single export, for traces, metrics and logs alike.
+	// It is applied to both the exporter and the processor or reader driving it,
+	// so neither can outlive the other. Set it above the destination's worst-case
+	// response time.
+	//
+	// Zero or negative means the OTel environment variables for the signal, and
+	// DefaultExportTimeout when those are unset too — see exportTimeoutFor for the
+	// precedence and why this package resolves those variables itself.
 	ExportTimeout time.Duration
+	// Sampler, when non-nil, is the tracer provider's sampler and SamplingRate
+	// is ignored. Nil keeps the default,
+	// ParentBased(TraceIDRatioBased(SamplingRate)), which follows a remote
+	// parent's sampled flag in both directions. Set this when an unsampled
+	// parent from upstream (e.g. an edge proxy sampling at a low rate) must not
+	// suppress this service's spans. Traces sampled that way reference upstream
+	// spans that were never exported, so backends show a missing parent.
+	Sampler sdktrace.Sampler
+	// TracesEndpoint, when set, is the full URL traces are POSTed to, used
+	// verbatim: no "/v1/traces" suffix is appended and its scheme alone decides
+	// TLS (Insecure is not consulted for it). It overrides Endpoint for traces
+	// only; metrics and logs keep using Endpoint, which may be left empty for a
+	// traces-only setup. Exact paths are an OTLP/HTTP concept, so setting it
+	// with ProtocolGRPC is a configuration error, as is a URL with userinfo or
+	// a query, or a path the exporter could not send exactly as written.
+	TracesEndpoint string
+	// EnvReader is consulted for the OTel timeout variables that ExportTimeout
+	// falls back to. A nil value falls back to the real OS environment, so the
+	// zero value of this struct reads the process environment as before.
+	EnvReader env.Reader
 }
 
 // isGRPC reports whether the config selects the OTLP/gRPC transport.
@@ -57,11 +87,16 @@ func (c Config) isGRPC() bool {
 	return c.Protocol == ProtocolGRPC
 }
 
-// exportTimeout resolves the export deadline, falling back to
-// DefaultExportTimeout for an unset or nonsensical value.
-func (c Config) exportTimeout() time.Duration {
-	if c.ExportTimeout <= 0 {
-		return DefaultExportTimeout
+// envReader returns EnvReader, or the OS environment when it is unset.
+func (c Config) envReader() env.Reader {
+	if c.EnvReader == nil {
+		return &env.OSReader{}
 	}
-	return c.ExportTimeout
+	return c.EnvReader
+}
+
+// hasTracesDestination reports whether traces have somewhere to be exported,
+// through either TracesEndpoint or Endpoint.
+func (c Config) hasTracesDestination() bool {
+	return c.TracesEndpoint != "" || c.Endpoint != ""
 }

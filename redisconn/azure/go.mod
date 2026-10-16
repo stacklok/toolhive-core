@@ -8,8 +8,8 @@ replace github.com/stacklok/toolhive-core/redisconn => ..
 
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.3
-	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.1
-	github.com/stacklok/toolhive-core/redisconn v0.0.3
+	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.15.0
+	github.com/stacklok/toolhive-core/redisconn v0.0.4
 )
 
 require (

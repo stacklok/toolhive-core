@@ -7,9 +7,13 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/log"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 )
@@ -235,4 +239,72 @@ func TestNewLoggerProviderWithShutdown(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewLoggerProviderWithShutdown_AppliesExportTimeout(t *testing.T) {
+	t.Parallel()
+
+	// The batch processor's own export budget is 30s, so a flush that returns
+	// promptly can only mean the configured value reached it.
+	srv := delayedOTLPIngest(t, 30*time.Second)
+
+	provider, shutdown, err := NewLoggerProviderWithShutdown(t.Context(), Config{
+		Endpoint:      srv.Listener.Addr().String(),
+		Insecure:      true,
+		ExportTimeout: 150 * time.Millisecond,
+	}, resource.Empty())
+	require.NoError(t, err)
+	require.NotNil(t, shutdown)
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+
+	sdkProvider, ok := provider.(*sdklog.LoggerProvider)
+	require.True(t, ok, "expected a real logger provider, got %T", provider)
+
+	// Without a record there is nothing to export and the flush proves nothing.
+	var record log.Record
+	record.SetBody(attribute.StringValue("export-timeout"))
+	sdkProvider.Logger("test").Emit(t.Context(), record)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_ = sdkProvider.ForceFlush(ctx)
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, 3*time.Second,
+		"flush against an unresponsive ingest took %s — the batch processor is still on its own 30s "+
+			"budget rather than the configured 150ms", elapsed)
+}
+
+func TestNewLoggerProviderWithShutdown_ExportTimeoutFromEnvironment(t *testing.T) {
+	// Not parallel: t.Setenv.
+	t.Setenv(logsTimeoutEnv.exporter, "150")
+
+	srv := delayedOTLPIngest(t, 30*time.Second)
+
+	// Nothing set in code, so only the variable can bound this flush.
+	provider, shutdown, err := NewLoggerProviderWithShutdown(t.Context(), Config{
+		Endpoint: srv.Listener.Addr().String(),
+		Insecure: true,
+	}, resource.Empty())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+
+	sdkProvider, ok := provider.(*sdklog.LoggerProvider)
+	require.True(t, ok, "expected a real logger provider, got %T", provider)
+
+	var record log.Record
+	record.SetBody(attribute.StringValue("export-timeout-env"))
+	sdkProvider.Logger("test").Emit(t.Context(), record)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_ = sdkProvider.ForceFlush(ctx)
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, 3*time.Second,
+		"flush took %s — OTEL_EXPORTER_OTLP_LOGS_TIMEOUT is not being honored", elapsed)
 }
