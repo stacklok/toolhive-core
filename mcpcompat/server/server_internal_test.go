@@ -166,9 +166,9 @@ func TestSetSessionTools_NonObjectSchemaDoesNotPanic(t *testing.T) {
 
 // TestSyncSessionResources_UnparseableURIDoesNotPanic verifies that an overlay
 // resource whose URI fails url.Parse does not crash the session when synced onto
-// the go-sdk server. go-sdk's AddResource panics on such a URI, so the panic must
-// be recovered by MCPServer.addSessionResource and the offending resource skipped
-// while other resources in the same overlay are still processed.
+// the go-sdk server. go-sdk's AddResource panics on such a URI, so the
+// panic must be avoided by the url.Parse pre-check in syncSessionResources and the offending
+// resource skipped while other resources in the same overlay are still processed.
 func TestSyncSessionResources_UnparseableURIDoesNotPanic(t *testing.T) {
 	t.Parallel()
 	s := NewMCPServer("s", "1")
@@ -190,10 +190,6 @@ func TestSyncSessionResources_UnparseableURIDoesNotPanic(t *testing.T) {
 	})
 
 	assert.NotPanics(t, func() { s.syncSessionResources(srv, cs) })
-
-	// The helper reports false for the bad URI and true for a well-formed one.
-	assert.False(t, s.addSessionResource(srv, &gosdk.Resource{URI: "%zz", Name: badName}, ServerResource{Handler: handler}))
-	assert.True(t, s.addSessionResource(srv, &gosdk.Resource{URI: "file:///ok", Name: "ok"}, ServerResource{Handler: handler}))
 }
 
 func TestHooks_Fire(t *testing.T) {

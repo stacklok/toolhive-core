@@ -5,6 +5,7 @@ package server
 
 import (
 	"context"
+	"net/url"
 	"sync"
 	"sync/atomic"
 
@@ -474,9 +475,9 @@ func (s *MCPServer) addSessionTool(srv *gosdk.Server, gt *gosdk.Tool, h ToolHand
 // server. Resources are add-only here (ToolHive sets them once at registration).
 //
 // go-sdk's AddResource calls url.Parse on the resource URI and PANICS if it
-// fails. This path can run on the live session goroutine, so each resource is
-// registered via addSessionResource, which recovers such a panic, logs it, and
-// skips the offending resource so one bad URI does not take down the session.
+// fails. This path can run on the live session goroutine, so the same check is
+// run first and a resource with an unparseable URI is logged and skipped, so one
+// bad URI does not take down the session.
 func (s *MCPServer) syncSessionResources(srv *gosdk.Server, cs *clientSession) {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
@@ -485,33 +486,14 @@ func (s *MCPServer) syncSessionResources(srv *gosdk.Server, cs *clientSession) {
 		if err := jsonConvert(sr.Resource, gr); err != nil {
 			continue
 		}
-		if !s.addSessionResource(srv, gr, sr) {
+		if _, err := url.Parse(gr.URI); err != nil {
 			if s.logger != nil {
-				s.logger.Warn("skipping per-session resource: AddResource rejected its URI", "uri", uri)
+				s.logger.Warn("skipping per-session resource: unparseable URI", "uri", uri, "error", err)
 			}
+			continue
 		}
+		srv.AddResource(gr, s.wrapServerResource(sr))
 	}
-}
-
-// addSessionResource registers a resource on a per-session go-sdk server,
-// recovering the panic go-sdk's AddResource raises when the resource URI does
-// not parse. It returns false (and logs) when the resource could not be
-// registered, so the caller skips it rather than crashing the session. Mirrors
-// addSessionResourceTemplate.
-func (s *MCPServer) addSessionResource(
-	srv *gosdk.Server, gr *gosdk.Resource, sr ServerResource,
-) (ok bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			if s.logger != nil {
-				s.logger.Error("per-session AddResource panicked; skipping resource",
-					"uri", gr.URI, "panic", r)
-			}
-			ok = false
-		}
-	}()
-	srv.AddResource(gr, s.wrapServerResource(sr))
-	return true
 }
 
 // syncSessionResourceTemplates adds the session's resource-template overlay onto
