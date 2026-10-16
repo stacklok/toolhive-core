@@ -80,9 +80,16 @@ type SentinelConfig struct {
 // TLSConfig configures server verification, custom roots, and mutual TLS.
 type TLSConfig struct {
 	// InsecureSkipVerify disables server certificate verification.
-	InsecureSkipVerify bool
+	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty" yaml:"insecureSkipVerify,omitempty"`
 	// CACert is an optional PEM CA bundle; empty uses system roots.
+	// It is mutually exclusive with CACertFile.
 	CACert []byte
+	// CACertFile is an optional path to a PEM CA bundle, read when the TLS
+	// configuration is built. When set, the bundle replaces the system roots.
+	// A missing, empty, or malformed file is an error; it never falls back to
+	// system roots or plaintext. The file is read once, so changes require a
+	// new client. It is mutually exclusive with CACert.
+	CACertFile string `json:"caCertFile,omitempty" yaml:"caCertFile,omitempty"`
 	// ClientCert and ClientKey are a PEM mTLS certificate pair.
 	ClientCert []byte
 	ClientKey  []byte
@@ -153,9 +160,17 @@ func validateDynamicAuth(c *Config) error {
 	return nil
 }
 
+// validateTLSConfig checks the configuration without touching the filesystem;
+// CACertFile is read and checked by BuildTLSConfig.
 func validateTLSConfig(cfg *TLSConfig) error {
-	if cfg != nil && (len(cfg.ClientCert) == 0) != (len(cfg.ClientKey) == 0) {
+	if cfg == nil {
+		return nil
+	}
+	if (len(cfg.ClientCert) == 0) != (len(cfg.ClientKey) == 0) {
 		return errors.New("client certificate and key must be provided together")
+	}
+	if len(cfg.CACert) > 0 && cfg.CACertFile != "" {
+		return errors.New("CACert and CACertFile are mutually exclusive")
 	}
 	return nil
 }
