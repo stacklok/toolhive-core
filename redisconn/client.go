@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"slices"
 	"time"
 
@@ -51,9 +52,13 @@ func BuildTLSConfig(cfg *TLSConfig) (*tls.Config, error) {
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: cfg.InsecureSkipVerify, //nolint:gosec // explicitly configurable
 	}
-	if len(cfg.CACert) > 0 {
+	caCert, err := loadCACert(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if len(caCert) > 0 {
 		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(cfg.CACert) {
+		if !pool.AppendCertsFromPEM(caCert) {
 			return nil, errors.New("redis: failed to parse CA certificate PEM data")
 		}
 		tlsCfg.RootCAs = pool
@@ -66,6 +71,23 @@ func BuildTLSConfig(cfg *TLSConfig) (*tls.Config, error) {
 		tlsCfg.Certificates = []tls.Certificate{cert}
 	}
 	return tlsCfg, nil
+}
+
+// loadCACert returns the configured CA bundle: CACertFile's contents when set,
+// otherwise CACert. An unreadable or empty CACertFile is an error so a
+// misconfigured path cannot silently select system roots.
+func loadCACert(cfg *TLSConfig) ([]byte, error) {
+	if cfg.CACertFile == "" {
+		return cfg.CACert, nil
+	}
+	data, err := os.ReadFile(cfg.CACertFile) // #nosec G304 -- path comes from trusted configuration
+	if err != nil {
+		return nil, fmt.Errorf("redis: failed to read CA certificate file %q: %w", cfg.CACertFile, err)
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("redis: CA certificate file %q is empty", cfg.CACertFile)
+	}
+	return data, nil
 }
 
 func buildClient(cfg *Config) (goredis.UniversalClient, error) {
