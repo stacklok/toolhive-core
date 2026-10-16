@@ -472,23 +472,53 @@ func (s *MCPServer) addSessionTool(srv *gosdk.Server, gt *gosdk.Tool, h ToolHand
 
 // syncSessionResources adds the session's resource overlay onto its go-sdk
 // server. Resources are add-only here (ToolHive sets them once at registration).
+//
+// go-sdk's AddResource calls url.Parse on the resource URI and PANICS if it
+// fails. This path can run on the live session goroutine, so each resource is
+// registered via addSessionResource, which recovers such a panic, logs it, and
+// skips the offending resource so one bad URI does not take down the session.
 func (s *MCPServer) syncSessionResources(srv *gosdk.Server, cs *clientSession) {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
-	for _, sr := range cs.resources {
+	for uri, sr := range cs.resources {
 		gr := &gosdk.Resource{}
 		if err := jsonConvert(sr.Resource, gr); err != nil {
 			continue
 		}
-		srv.AddResource(gr, s.wrapServerResource(sr))
+		if !s.addSessionResource(srv, gr, sr) {
+			if s.logger != nil {
+				s.logger.Warn("skipping per-session resource: AddResource rejected its URI", "uri", uri)
+			}
+		}
 	}
+}
+
+// addSessionResource registers a resource on a per-session go-sdk server,
+// recovering the panic go-sdk's AddResource raises when the resource URI does
+// not parse. It returns false (and logs) when the resource could not be
+// registered, so the caller skips it rather than crashing the session. Mirrors
+// addSessionResourceTemplate.
+func (s *MCPServer) addSessionResource(
+	srv *gosdk.Server, gr *gosdk.Resource, sr ServerResource,
+) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if s.logger != nil {
+				s.logger.Error("per-session AddResource panicked; skipping resource",
+					"uri", gr.URI, "panic", r)
+			}
+			ok = false
+		}
+	}()
+	srv.AddResource(gr, s.wrapServerResource(sr))
+	return true
 }
 
 // syncSessionResourceTemplates adds the session's resource-template overlay onto
 // its go-sdk server. Templates are add-only here (ToolHive sets them once at
-// registration), mirroring syncSessionResources. Unlike AddResource, go-sdk's
-// AddResourceTemplate parses the URI template and PANICS if it is invalid or not
-// absolute; this path can run on the live session goroutine, so each template is
+// registration), mirroring syncSessionResources. Like AddResource, go-sdk's
+// AddResourceTemplate PANICS on a bad URI (here, an invalid or non-absolute URI
+// template); this path can run on the live session goroutine, so each template is
 // registered via addSessionResourceTemplate, which recovers such a panic, logs
 // it, and skips the offending template so one bad template does not take down
 // the session.
@@ -540,7 +570,7 @@ func (s *MCPServer) addSessionResourceTemplate(
 // without any shim-side dispatch. Prompts are add-only here (ToolHive sets them
 // once at registration). Unlike AddTool, go-sdk's AddPrompt performs no
 // schema/URI validation and cannot panic, so no recover wrapper is needed
-// (mirroring syncSessionResources rather than the tool path).
+// (unlike the tool, resource and resource-template paths).
 func (s *MCPServer) syncSessionPrompts(srv *gosdk.Server, cs *clientSession) {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
