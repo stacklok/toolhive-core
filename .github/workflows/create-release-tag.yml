@@ -1,0 +1,119 @@
+# SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Runs when a release PR (from create-release-pr.yml) changes VERSION on main.
+# Tags the merged commit once per Go module, all with the same version, then
+# creates the GitHub Release. Publishing the release triggers release.yml.
+#
+# The release must be created with the GitHub App token: releases created with
+# GITHUB_TOKEN do not trigger other workflows.
+
+name: Create Release Tag
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - VERSION
+
+permissions:
+  contents: read
+
+jobs:
+  create-tag:
+    name: Tag Modules and Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate release app token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error file=VERSION::VERSION does not contain a valid semver version: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Only a merged release PR may produce a release. Squash merges look like
+      # "Release v1.2.3 (#123)"; merge commits mention the release/v1.2.3 branch.
+      - name: Verify release PR
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          echo "Commit message: $COMMIT_MSG"
+          if [[ "$COMMIT_MSG" =~ ^Release\ v${VERSION//./\\.}([^0-9]|$) ]] || \
+             [[ "$COMMIT_MSG" =~ release/v${VERSION//./\\.}([^0-9]|$) ]]; then
+            echo "Commit is the release PR for v$VERSION"
+          else
+            echo "::error::VERSION changed outside a release PR (expected 'Release v$VERSION'); refusing to release"
+            exit 1
+          fi
+
+      - name: Create module tags
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # One tag per Go module, all at the same version. Tags that already
+          # exist are skipped so a failed run can be retried.
+          tags=()
+          for prefix in "" redisconn/ redisconn/aws/ redisconn/azure/ redisconn/gcp/; do
+            tag="${prefix}v${VERSION}"
+            if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+              if [ "$(git rev-parse "$tag^{commit}")" != "$(git rev-parse HEAD)" ]; then
+                echo "::error::$tag already exists on a different commit"
+                exit 1
+              fi
+              echo "$tag already exists on this commit; skipping"
+              continue
+            fi
+            git tag -a "$tag" -m "Release $tag"
+            tags+=("$tag")
+          done
+
+          if [ "${#tags[@]}" -gt 0 ]; then
+            git push --atomic "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${tags[@]}"
+            printf 'Pushed %s\n' "${tags[@]}"
+          fi
+
+      - name: Create GitHub Release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          TAG="v${VERSION}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; skipping"
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          fi
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          {
+            echo "## Released v$VERSION"
+            echo ""
+            for prefix in "" redisconn/ redisconn/aws/ redisconn/azure/ redisconn/gcp/; do
+              echo "- \`${prefix}v${VERSION}\`"
+            done
+            echo ""
+            echo "release.yml now attaches the registry schemas to the release."
+          } >> "$GITHUB_STEP_SUMMARY"

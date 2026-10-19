@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright 2026 Stacklok, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+# Opens a release PR that bumps the VERSION file. Merging that PR triggers
+# create-release-tag.yml, which tags every module and publishes the release.
+#
+# Usage: run from the Actions tab or `gh workflow run create-release-pr.yml -f bump_type=patch`
+
+name: Create Release PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: Version bump type
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: read
+
+jobs:
+  release-pr:
+    name: Create Release PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate release app token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Create Release PR
+        id: release
+        uses: stacklok/releaseo@80e8d8131d41cf8763254d02360f2c5ce9b7c0df # v0.0.4
+        with:
+          releaseo_version: v0.0.4
+          bump_type: ${{ inputs.bump_type }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          PR_URL: ${{ steps.release.outputs.pr_url }}
+        run: |
+          {
+            echo "## Release PR created"
+            echo ""
+            echo "- **Version**: $VERSION"
+            echo "- **PR**: $PR_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
