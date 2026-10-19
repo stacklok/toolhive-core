@@ -37,7 +37,6 @@ The ToolHive ecosystem spans multiple Go repositories, and several of these proj
 | `redisconn/aws` | Alpha | AWS ElastiCache/MemoryDB IAM credentials for `redisconn` |
 | `redisconn/azure` | Alpha | Azure Entra ID credentials for `redisconn` |
 | `redisconn/gcp` | Alpha | GCP Memorystore IAM credentials for `redisconn` |
-| `redis` | Deprecated | Source-compatible facade; migrate to `redisconn` and a provider child module |
 | `recovery` | Beta | HTTP panic recovery middleware |
 | `validation/http` | Stable | RFC 7230/8707 compliant HTTP header and URI validation |
 | `validation/group` | Stable | Group name validation |
