@@ -2,22 +2,11 @@ module github.com/stacklok/toolhive-core
 
 go 1.27
 
-// Development-only replacement for the untagged nested module. Dependency
-// module replacements are ignored by downstream consumers.
-replace github.com/stacklok/toolhive-core/redisconn => ./redisconn
-
-replace github.com/stacklok/toolhive-core/redisconn/aws => ./redisconn/aws
-
-replace github.com/stacklok/toolhive-core/redisconn/azure => ./redisconn/azure
-
-replace github.com/stacklok/toolhive-core/redisconn/gcp => ./redisconn/gcp
-
 require (
 	cel.dev/cel-go v0.32.0
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.3
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.15.0
 	github.com/adrg/xdg v0.5.3
-	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/aws/aws-sdk-go-v2 v1.47.3
 	github.com/aws/aws-sdk-go-v2/config v1.33.9
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.3
@@ -39,17 +28,12 @@ require (
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/prometheus/client_golang v1.25.0
-	github.com/redis/go-redis/v9 v9.23.0
 	github.com/secure-systems-lab/go-securesystemslib v0.11.1
 	github.com/shirou/gopsutil/v4 v4.26.9
 	github.com/sigstore/protobuf-specs v0.5.2
 	github.com/sigstore/rekor v1.5.4
 	github.com/sigstore/sigstore v1.11.1
 	github.com/sigstore/sigstore-go v1.3.0
-	github.com/stacklok/toolhive-core/redisconn v0.0.4
-	github.com/stacklok/toolhive-core/redisconn/aws v0.0.8
-	github.com/stacklok/toolhive-core/redisconn/azure v0.0.6
-	github.com/stacklok/toolhive-core/redisconn/gcp v0.0.4
 	github.com/stretchr/testify v1.12.1
 	github.com/xeipuuv/gojsonschema v1.2.0
 	go.opentelemetry.io/otel v1.47.0
@@ -169,12 +153,10 @@ require (
 	github.com/xeipuuv/gojsonreference v0.0.0-20180127040603-bd5ef7bd5415 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
-	github.com/yuin/gopher-lua v1.1.1 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.47.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.1 // indirect
-	go.uber.org/atomic v1.12.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/exp v0.0.0-20261014143641-f0251eb4aa3e // indirect
