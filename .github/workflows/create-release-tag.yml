@@ -42,6 +42,9 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          # Don't store GITHUB_TOKEN in the git config: it would take precedence
+          # over the App token in the push URL, and it can only read this repo.
+          persist-credentials: false
 
       - name: Read version
         id: version
