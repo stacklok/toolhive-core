@@ -56,22 +56,27 @@ func (*OTLPTracerStrategy) CreateTracerProvider(
 ) (trace.TracerProvider, func(context.Context) error, error) {
 	//nolint:gosec // G706: OTLP endpoint from config
 	slog.Debug("creating OTLP tracer provider",
-		"endpoint", config.OTLPEndpoint,
+		"endpoint", config.tracesEndpointForLog(),
 		"sampling_rate", config.SamplingRate,
+		"custom_sampler", config.Sampler != nil,
 		"extra_processors", len(config.ExtraSpanProcessors))
 
 	otlpConfig := otlp.Config{
-		Endpoint:     config.OTLPEndpoint,
-		Headers:      config.Headers,
-		Insecure:     config.Insecure,
-		SamplingRate: config.SamplingRate,
-		CACertPath:   config.CACertPath,
-		Protocol:     config.effectiveTracesProtocol(),
+		Endpoint:       config.OTLPEndpoint,
+		TracesEndpoint: config.TracesEndpoint,
+		Headers:        config.Headers,
+		Insecure:       config.Insecure,
+		SamplingRate:   config.SamplingRate,
+		Sampler:        config.Sampler,
+		CACertPath:     config.CACertPath,
+		Protocol:       config.effectiveTracesProtocol(),
+		ExportTimeout:  config.ExportTimeout,
 	}
 
 	provider, shutdown, err := otlp.NewTracerProviderWithShutdown(ctx, otlpConfig, res, config.ExtraSpanProcessors...)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create OTLP tracer provider for endpoint %s: %w", config.OTLPEndpoint, err)
+		return nil, nil, fmt.Errorf("failed to create OTLP tracer provider for endpoint %s: %w",
+			config.tracesEndpointForLog(), err)
 	}
 	return provider, shutdown, nil
 }
@@ -112,11 +117,12 @@ func (*OTLPLoggerStrategy) CreateLoggerProvider(
 		"endpoint", config.OTLPEndpoint)
 
 	otlpConfig := otlp.Config{
-		Endpoint:   config.OTLPEndpoint,
-		Headers:    config.Headers,
-		Insecure:   config.Insecure,
-		CACertPath: config.CACertPath,
-		Protocol:   config.Protocol,
+		Endpoint:      config.OTLPEndpoint,
+		Headers:       config.Headers,
+		Insecure:      config.Insecure,
+		CACertPath:    config.CACertPath,
+		Protocol:      config.Protocol,
+		ExportTimeout: config.ExportTimeout,
 	}
 
 	provider, shutdown, err := otlp.NewLoggerProviderWithShutdown(ctx, otlpConfig, res)
@@ -179,12 +185,13 @@ func (s *UnifiedMeterStrategy) CreateMeterProvider(
 			"endpoint", config.OTLPEndpoint)
 
 		otlpConfig := otlp.Config{
-			Endpoint:     config.OTLPEndpoint,
-			Headers:      config.Headers,
-			Insecure:     config.Insecure,
-			SamplingRate: config.SamplingRate,
-			CACertPath:   config.CACertPath,
-			Protocol:     config.Protocol,
+			Endpoint:      config.OTLPEndpoint,
+			Headers:       config.Headers,
+			Insecure:      config.Insecure,
+			SamplingRate:  config.SamplingRate,
+			CACertPath:    config.CACertPath,
+			Protocol:      config.Protocol,
+			ExportTimeout: config.ExportTimeout,
 		}
 
 		reader, err := otlp.NewMetricReader(ctx, otlpConfig)
@@ -245,7 +252,7 @@ func NewStrategySelector(config Config) *StrategySelector {
 
 // SelectTracerStrategy determines the appropriate tracer strategy based on configuration.
 func (s *StrategySelector) SelectTracerStrategy() TracerStrategy {
-	hasEndpoint := s.config.OTLPEndpoint != ""
+	hasEndpoint := s.hasTracesEndpoint()
 	tracingEnabled := s.config.TracingEnabled
 
 	if hasEndpoint && tracingEnabled {
@@ -304,7 +311,13 @@ func (s *StrategySelector) hasOTLPMetrics() bool {
 
 // hasOTLPTracing returns true if OTLP tracing is wanted.
 func (s *StrategySelector) hasOTLPTracing() bool {
-	return s.config.OTLPEndpoint != "" && s.config.TracingEnabled
+	return s.hasTracesEndpoint() && s.config.TracingEnabled
+}
+
+// hasTracesEndpoint returns true if traces have a destination, either their
+// own TracesEndpoint or the shared OTLPEndpoint.
+func (s *StrategySelector) hasTracesEndpoint() bool {
+	return s.config.TracesEndpoint != "" || s.config.OTLPEndpoint != ""
 }
 
 // hasOTLPLogging returns true if OTLP logging is wanted.

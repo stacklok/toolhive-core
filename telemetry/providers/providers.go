@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -39,6 +40,16 @@ type Config struct {
 	LoggingEnabled bool              // LoggingEnabled controls whether logging is enabled for OTLP
 	SamplingRate   float64           // SamplingRate controls trace sampling (0.0 to 1.0)
 
+	// ExportTimeout bounds a single export for every OTLP signal — traces,
+	// metrics and logs — covering both the exporter and the processor or reader
+	// driving it. Zero means the OTel environment variables for the signal, and
+	// otlp.DefaultExportTimeout when those are unset too.
+	//
+	// Setting it wins over those variables, since the SDK applies env config
+	// first and explicit options after. This is the knob to reach for when a
+	// destination needs longer than the default.
+	ExportTimeout time.Duration
+
 	// Protocol selects the OTLP transport for all signals: otlp.ProtocolGRPC
 	// ("grpc") or otlp.ProtocolHTTPProtobuf ("http/protobuf"). Leaving it
 	// empty means OTLP/HTTP with protobuf payloads, exactly today's behavior.
@@ -47,6 +58,16 @@ type Config struct {
 	// send traces over http/protobuf to a destination that rejects gRPC while
 	// metrics and logs still use Protocol. Falls back to Protocol when unset.
 	TracesProtocol string
+	// TracesEndpoint, when set, is the exact URL traces are POSTed to over
+	// OTLP/HTTP, used verbatim with no "/v1/traces" suffix; its scheme decides
+	// TLS. It takes precedence over OTLPEndpoint for traces only, and metrics
+	// and logs keep using OTLPEndpoint. Tracing works with OTLPEndpoint unset.
+	// Combining it with a gRPC traces protocol is a configuration error.
+	TracesEndpoint string
+
+	// Sampler, when set, replaces the default trace sampler and SamplingRate
+	// is ignored. Unset keeps ParentBased(TraceIDRatioBased(SamplingRate)).
+	Sampler sdktrace.Sampler
 
 	// Prometheus configuration
 	EnablePrometheusMetricsPath bool // EnablePrometheusMetricsPath enables Prometheus /metrics endpoint
@@ -69,6 +90,27 @@ func (c Config) effectiveTracesProtocol() string {
 		return c.TracesProtocol
 	}
 	return c.Protocol
+}
+
+// tracesEndpointForLog describes where traces are sent, for logs and error
+// messages. TracesEndpoint is reduced to its scheme and host, since its path,
+// query or userinfo can carry a credential; OTLPEndpoint is shown as before.
+func (c Config) tracesEndpointForLog() string {
+	if c.TracesEndpoint != "" {
+		return redactEndpoint(c.TracesEndpoint)
+	}
+	return c.OTLPEndpoint
+}
+
+// redactEndpoint reduces an endpoint URL to its scheme and host. A value that
+// does not parse as a URL with a host is replaced with a placeholder rather
+// than echoed.
+func redactEndpoint(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "<unparseable endpoint>"
+	}
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
 }
 
 // ProviderOption is an option type used to configure the telemetry providers
@@ -148,6 +190,47 @@ func WithTracesProtocol(protocol string) ProviderOption {
 	}
 }
 
+// WithTracesEndpoint sets an exact URL for trace export, e.g.
+// "https://ingest.example.com/v2/telemetry/sink". Traces are POSTed to it
+// verbatim over OTLP/HTTP: no "/v1/traces" suffix is appended, and the URL's
+// scheme decides TLS regardless of WithInsecure. Headers and the CA cert from
+// WithHeaders and WithCACertPath still apply, and are where credentials
+// belong: a URL with userinfo or a query string is rejected, as is a path the
+// exporter could not send exactly as written (e.g. one with an escaped "/").
+// Logs and errors show only the URL's scheme and host.
+//
+// It takes precedence over WithOTLPEndpoint for traces only; metrics and logs
+// keep using the OTLP endpoint. Leaving the OTLP endpoint unset gives a
+// traces-only setup. By default (unset), traces go to the OTLP endpoint with
+// "/v1/traces" appended. Using it with a gRPC traces protocol makes
+// NewCompositeProvider fail, since exact paths only exist in OTLP/HTTP.
+func WithTracesEndpoint(endpoint string) ProviderOption {
+	return func(config *Config) error {
+		config.TracesEndpoint = endpoint
+		return nil
+	}
+}
+
+// WithSampler sets the trace sampler, taking precedence over WithSamplingRate,
+// which is then ignored. By default (unset or nil), the sampler is
+// ParentBased(TraceIDRatioBased(rate)), which inherits an incoming remote
+// parent's decision, including an unsampled one. Supply your own to change
+// that, e.g. ParentBased(ratio, WithRemoteParentNotSampled(ratio)) so an
+// upstream proxy's unsampled traceparent doesn't suppress this service's spans.
+//
+// Two caveats when sampling under an unsampled remote parent. The resulting
+// traces reference upstream spans that were never exported, so backends show
+// them with a missing parent. And sampling every span does not make export
+// lossless: spans are still dropped when the queue is full or an export
+// fails, so anything that must be counted exactly (billing, for instance)
+// needs durable, idempotent records rather than spans alone.
+func WithSampler(sampler sdktrace.Sampler) ProviderOption {
+	return func(config *Config) error {
+		config.Sampler = sampler
+		return nil
+	}
+}
+
 // WithTracingEnabled sets the tracing enabled flag
 func WithTracingEnabled(tracingEnabled bool) ProviderOption {
 	return func(config *Config) error {
@@ -176,6 +259,21 @@ func WithLoggingEnabled(loggingEnabled bool) ProviderOption {
 func WithSamplingRate(samplingRate float64) ProviderOption {
 	return func(config *Config) error {
 		config.SamplingRate = samplingRate
+		return nil
+	}
+}
+
+// WithExportTimeout sets the budget for a single export of any OTLP signal,
+// applied to both the exporter and the processor or reader driving it. Leaving
+// it unset falls back to the signal's OTel environment variables and then to
+// otlp.DefaultExportTimeout; a non-positive value is treated the same way.
+//
+// Reach for this when telemetry goes to a destination that answers slower than
+// the default, such as a third-party ingest route. It wins over the
+// environment variables.
+func WithExportTimeout(exportTimeout time.Duration) ProviderOption {
+	return func(config *Config) error {
+		config.ExportTimeout = exportTimeout
 		return nil
 	}
 }
@@ -349,7 +447,7 @@ func createTracingProvider(
 	tracerProvider, tracerShutdown, err := tracerStrategy.CreateTracerProvider(ctx, config, res)
 	if err != nil {
 		return fmt.Errorf("failed to create tracer provider with config (endpoint: %s, tracing enabled: %t): %w",
-			config.OTLPEndpoint,
+			config.tracesEndpointForLog(),
 			config.TracingEnabled,
 			err)
 	}

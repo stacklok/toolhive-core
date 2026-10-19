@@ -25,7 +25,13 @@ func NewMetricReader(ctx context.Context, config Config) (sdkmetric.Reader, erro
 		return nil, fmt.Errorf("failed to create OTLP metric exporter: %w", err)
 	}
 
-	return sdkmetric.NewPeriodicReader(exporter), nil
+	// Same budget as the exporter, deliberately. The reader's own default is
+	// 30s, so a larger ExportTimeout would otherwise be silently truncated; and
+	// under OTLP/HTTP this is what bounds the exporter's retry of a batch the
+	// destination may already have.
+	return sdkmetric.NewPeriodicReader(exporter,
+		sdkmetric.WithTimeout(config.exportTimeoutFor(metricsTimeoutEnv)),
+	), nil
 }
 
 func createMetricExporter(ctx context.Context, config Config) (sdkmetric.Exporter, error) {
@@ -39,6 +45,7 @@ func createHTTPMetricExporter(ctx context.Context, config Config) (sdkmetric.Exp
 	host, basePath := splitEndpointPath(config.Endpoint)
 	opts := []otlpmetrichttp.Option{
 		otlpmetrichttp.WithEndpoint(host),
+		otlpmetrichttp.WithTimeout(config.exportTimeoutFor(metricsTimeoutEnv)),
 	}
 
 	if basePath != "" {
@@ -71,6 +78,7 @@ func createGRPCMetricExporter(ctx context.Context, config Config) (sdkmetric.Exp
 	host, _ := splitEndpointPath(config.Endpoint)
 	opts := []otlpmetricgrpc.Option{
 		otlpmetricgrpc.WithEndpoint(host),
+		otlpmetricgrpc.WithTimeout(config.exportTimeoutFor(metricsTimeoutEnv)),
 	}
 
 	if len(config.Headers) > 0 {

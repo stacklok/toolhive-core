@@ -27,6 +27,7 @@ func createHTTPLogExporter(ctx context.Context, config Config) (sdklog.Exporter,
 	host, basePath := splitEndpointPath(config.Endpoint)
 	opts := []otlploghttp.Option{
 		otlploghttp.WithEndpoint(host),
+		otlploghttp.WithTimeout(config.exportTimeoutFor(logsTimeoutEnv)),
 	}
 
 	if basePath != "" {
@@ -63,6 +64,7 @@ func createGRPCLogExporter(ctx context.Context, config Config) (sdklog.Exporter,
 	host, _ := splitEndpointPath(config.Endpoint)
 	opts := []otlploggrpc.Option{
 		otlploggrpc.WithEndpoint(host),
+		otlploggrpc.WithTimeout(config.exportTimeoutFor(logsTimeoutEnv)),
 	}
 
 	if len(config.Headers) > 0 {
@@ -112,7 +114,10 @@ func NewLoggerProviderWithShutdown(
 	}
 
 	provider := sdklog.NewLoggerProvider(
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter)),
+		// Same budget as the exporter, deliberately — see NewMetricReader.
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(exporter,
+			sdklog.WithExportTimeout(config.exportTimeoutFor(logsTimeoutEnv)),
+		)),
 		sdklog.WithResource(res),
 	)
 	return provider, provider.Shutdown, nil

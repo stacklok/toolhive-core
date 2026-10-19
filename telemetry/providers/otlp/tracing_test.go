@@ -5,14 +5,23 @@ package otlp
 
 import (
 	"context"
+	"encoding/pem"
 	"fmt"
+	"net"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // traceExporterClientTypeName returns the concrete type name of the unexported
@@ -275,4 +284,392 @@ func TestNewTracerProviderWithShutdown(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCreateTraceExporter_AppliesExportTimeout(t *testing.T) {
+	t.Parallel()
+
+	// A boundary pair against ONE ingest: the only difference between the two
+	// runs is ExportTimeout, so an outcome that flips can only be attributed to
+	// it. The permissive run also proves the endpoint is sound, so the strict
+	// run's failure is not a dial or handshake error wearing the right costume.
+	const answersIn = 400 * time.Millisecond
+
+	t.Run("a timeout under the ingest's response time abandons the export", func(t *testing.T) {
+		t.Parallel()
+
+		srv := delayedOTLPIngest(t, answersIn)
+		exporter, err := createTraceExporter(t.Context(), Config{
+			Endpoint:      srv.Listener.Addr().String(),
+			Insecure:      true,
+			ExportTimeout: 100 * time.Millisecond,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = exporter.Shutdown(context.Background()) })
+
+		// Bounds the exporter's retry backoff, which is otherwise minutes.
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+
+		err = exporter.ExportSpans(ctx, endedSpans(t))
+
+		require.Error(t, err, "an ingest answering in %s must not satisfy a 100ms timeout — "+
+			"it would under the SDK's own 10s default", answersIn)
+		var netErr net.Error
+		require.ErrorAs(t, err, &netErr, "export failed for some reason other than a deadline: %v", err)
+		assert.True(t, netErr.Timeout(), "export failed on %v, not on its deadline", netErr)
+	})
+
+	t.Run("a timeout above the ingest's response time lets the export through", func(t *testing.T) {
+		t.Parallel()
+
+		srv := delayedOTLPIngest(t, answersIn)
+		exporter, err := createTraceExporter(t.Context(), Config{
+			Endpoint:      srv.Listener.Addr().String(),
+			Insecure:      true,
+			ExportTimeout: 3 * time.Second,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = exporter.Shutdown(context.Background()) })
+
+		assert.NoError(t, exporter.ExportSpans(t.Context(), endedSpans(t)))
+	})
+}
+
+func TestCreateTraceExporter_GRPCAppliesExportTimeout(t *testing.T) {
+	t.Parallel()
+
+	// Under gRPC the timeout bounds the whole export rather than one request,
+	// so it shows up as how long ExportSpans takes against a peer that accepts
+	// the connection and then says nothing.
+	const exportTimeout = 300 * time.Millisecond
+
+	exporter, err := createTraceExporter(t.Context(), Config{
+		Endpoint:      silentTCPPeer(t),
+		Insecure:      true,
+		Protocol:      ProtocolGRPC,
+		ExportTimeout: exportTimeout,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = exporter.Shutdown(context.Background()) })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err = exporter.ExportSpans(ctx, endedSpans(t))
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Less(t, elapsed, 2*time.Second,
+		"export ran %s against a silent peer — the configured %s is not in force", elapsed, exportTimeout)
+	assert.GreaterOrEqual(t, elapsed, exportTimeout-20*time.Millisecond,
+		"export gave up after %s, before the configured %s", elapsed, exportTimeout)
+}
+
+func TestNewTracerProviderWithShutdown_BatcherBudgetFollowsExportTimeout(t *testing.T) {
+	t.Parallel()
+
+	// Without this the processor keeps its own 30s default, which both caps a
+	// larger ExportTimeout and leaves the HTTP exporter's retry loop room to
+	// re-send a batch the destination already has.
+	srv := delayedOTLPIngest(t, 30*time.Second)
+
+	provider, shutdown, err := NewTracerProviderWithShutdown(t.Context(), Config{
+		Endpoint:      srv.Listener.Addr().String(),
+		Insecure:      true,
+		SamplingRate:  1.0,
+		ExportTimeout: 150 * time.Millisecond,
+	}, resource.Empty())
+	require.NoError(t, err)
+	require.NotNil(t, shutdown)
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+
+	sdkProvider, ok := provider.(*sdktrace.TracerProvider)
+	require.True(t, ok, "expected a real tracer provider, got %T", provider)
+
+	_, span := sdkProvider.Tracer("test").Start(t.Context(), "batch-budget")
+	span.End()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_ = sdkProvider.ForceFlush(ctx)
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, 3*time.Second,
+		"flush against an unresponsive ingest took %s — the processor is still on its own 30s budget "+
+			"rather than the configured 150ms", elapsed)
+}
+
+// silentTCPPeer accepts connections and then says nothing, so a gRPC client
+// stalls in its handshake until its own deadline rather than failing to dial.
+
+// endedSpans returns one ended span in the read-only form an exporter takes.
+func endedSpans(t *testing.T) []sdktrace.ReadOnlySpan {
+	t.Helper()
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	_, span := provider.Tracer("test").Start(t.Context(), "export-timeout")
+	span.End()
+	spans := recorder.Ended()
+	require.Len(t, spans, 1)
+	return spans
+}
+
+func TestNewTracerProviderWithShutdown_Sampler(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		sampler      sdktrace.Sampler
+		samplingRate float64
+		// remoteUnsampled starts the span under a remote parent whose
+		// traceparent says "not sampled", as an edge proxy forwards it.
+		remoteUnsampled bool
+		wantExported    bool
+	}{
+		{
+			name:         "nil sampler keeps the ratio default for a root span",
+			samplingRate: 1.0,
+			wantExported: true,
+		},
+		{
+			name:            "nil sampler keeps following an unsampled remote parent",
+			samplingRate:    1.0,
+			remoteUnsampled: true,
+			wantExported:    false,
+		},
+		{
+			name:         "a never-sample sampler wins over the sampling rate",
+			sampler:      sdktrace.NeverSample(),
+			samplingRate: 1.0,
+			wantExported: false,
+		},
+		{
+			name: "a remote-not-sampled override samples under an unsampled remote parent",
+			sampler: sdktrace.ParentBased(sdktrace.TraceIDRatioBased(1.0),
+				sdktrace.WithRemoteParentNotSampled(sdktrace.TraceIDRatioBased(1.0))),
+			remoteUnsampled: true,
+			wantExported:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv, paths := recordingOTLPIngest(t, httptest.NewServer)
+			provider, shutdown, err := NewTracerProviderWithShutdown(t.Context(), Config{
+				Endpoint:     srv.Listener.Addr().String(),
+				Insecure:     true,
+				SamplingRate: tt.samplingRate,
+				Sampler:      tt.sampler,
+			}, resource.Empty())
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = shutdown(context.Background()) })
+
+			ctx := t.Context()
+			if tt.remoteUnsampled {
+				ctx = trace.ContextWithRemoteSpanContext(ctx, trace.NewSpanContext(trace.SpanContextConfig{
+					TraceID: trace.TraceID{0x01},
+					SpanID:  trace.SpanID{0x01},
+					Remote:  true,
+				}))
+			}
+			_, span := provider.Tracer("test").Start(ctx, "sampler")
+			assert.Equal(t, tt.wantExported, span.SpanContext().IsSampled())
+			span.End()
+
+			sdkProvider, ok := provider.(*sdktrace.TracerProvider)
+			require.True(t, ok, "expected a real tracer provider, got %T", provider)
+			require.NoError(t, sdkProvider.ForceFlush(t.Context()))
+
+			// The batcher only exports a non-empty batch, so any request at all
+			// means the span reached the exporter.
+			if tt.wantExported {
+				assert.Equal(t, []string{otlpTracesPath}, paths())
+			} else {
+				assert.Empty(t, paths())
+			}
+		})
+	}
+}
+
+func TestNewTracerProviderWithShutdown_TracesEndpoint(t *testing.T) {
+	t.Parallel()
+
+	const exactPath = "/v2/telemetry/sink-abc"
+
+	t.Run("posts to the exact URL with no signal suffix", func(t *testing.T) {
+		t.Parallel()
+
+		traceSrv, tracePaths := recordingOTLPIngest(t, httptest.NewServer)
+		collector, collectorPaths := recordingOTLPIngest(t, httptest.NewServer)
+
+		exportOneSpan(t, Config{
+			Endpoint:       collector.Listener.Addr().String() + "/base",
+			TracesEndpoint: traceSrv.URL + exactPath,
+			Insecure:       true,
+			SamplingRate:   1.0,
+		})
+
+		assert.Equal(t, []string{exactPath}, tracePaths())
+		assert.Empty(t, collectorPaths(), "traces also went to Endpoint")
+	})
+
+	t.Run("the request target matches the path as written", func(t *testing.T) {
+		t.Parallel()
+
+		tests := []struct {
+			name, path, want string
+		}{
+			{name: "trailing slash is kept", path: "/v2/telemetry/sink-abc/", want: "/v2/telemetry/sink-abc/"},
+			{name: "an escape the exporter re-creates is kept", path: "/v2/sink%20name", want: "/v2/sink%20name"},
+			{name: "no path targets the root", path: "", want: "/"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				traceSrv, tracePaths := recordingOTLPIngest(t, httptest.NewServer)
+				exportOneSpan(t, Config{TracesEndpoint: traceSrv.URL + tt.path, SamplingRate: 1.0})
+				assert.Equal(t, []string{tt.want}, tracePaths())
+			})
+		}
+	})
+
+	t.Run("works with Endpoint unset and Insecure off when the scheme is http", func(t *testing.T) {
+		t.Parallel()
+
+		traceSrv, tracePaths := recordingOTLPIngest(t, httptest.NewServer)
+
+		exportOneSpan(t, Config{
+			TracesEndpoint: traceSrv.URL + exactPath,
+			SamplingRate:   1.0,
+		})
+
+		assert.Equal(t, []string{exactPath}, tracePaths())
+	})
+
+	t.Run("an https scheme keeps TLS even with Insecure set", func(t *testing.T) {
+		t.Parallel()
+
+		// Insecure describes Endpoint. Were it applied to TracesEndpoint, the
+		// exporter would speak plain HTTP to this TLS server and fail.
+		traceSrv, tracePaths := recordingOTLPIngest(t, httptest.NewTLSServer)
+		caPath := filepath.Join(t.TempDir(), "ca.pem")
+		require.NoError(t, os.WriteFile(caPath,
+			pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: traceSrv.Certificate().Raw}), 0o600))
+
+		exportOneSpan(t, Config{
+			TracesEndpoint: traceSrv.URL + exactPath,
+			Insecure:       true,
+			CACertPath:     caPath,
+			SamplingRate:   1.0,
+		})
+
+		assert.Equal(t, []string{exactPath}, tracePaths())
+	})
+}
+
+func TestCreateTraceExporter_TracesEndpointErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		config  Config
+		wantErr string
+	}{
+		{
+			name:    "grpc protocol",
+			config:  Config{TracesEndpoint: "https://ingest.example.com/SECRET/v2/sink", Protocol: ProtocolGRPC},
+			wantErr: "requires the http/protobuf protocol",
+		},
+		{
+			name:    "missing scheme",
+			config:  Config{TracesEndpoint: "ingest.example.com/SECRET/v2/sink"},
+			wantErr: "scheme must be http or https",
+		},
+		{
+			name:    "unsupported scheme",
+			config:  Config{TracesEndpoint: "grpc://ingest.example.com:4317/SECRET"},
+			wantErr: "scheme must be http or https",
+		},
+		{
+			name:    "missing host",
+			config:  Config{TracesEndpoint: "https:///SECRET/v2/sink"},
+			wantErr: "missing host",
+		},
+		{
+			name:    "userinfo would be dropped by the SDK",
+			config:  Config{TracesEndpoint: "https://user:SECRET@ingest.example.com/v2/sink"},
+			wantErr: "credentials in the URL are not supported",
+		},
+		{
+			name:    "query string would be dropped by the SDK",
+			config:  Config{TracesEndpoint: "https://ingest.example.com/v2/sink?key=SECRET"},
+			wantErr: "query and fragment are not supported",
+		},
+		{
+			name:    "an empty query is rejected too",
+			config:  Config{TracesEndpoint: "https://ingest.example.com/SECRET/v2/sink?"},
+			wantErr: "query and fragment are not supported",
+		},
+		{
+			name:    "an escaped slash would be sent as a real one",
+			config:  Config{TracesEndpoint: "https://ingest.example.com/SECRET%2Fblue/ingest"},
+			wantErr: "path would not be sent as written",
+		},
+		{
+			name:    "an escaped trailing space would be trimmed",
+			config:  Config{TracesEndpoint: "https://ingest.example.com/SECRET/ingest%20"},
+			wantErr: "path would not be sent as written",
+		},
+		{
+			name:    "unparseable URL",
+			config:  Config{TracesEndpoint: "https://ingest.example.com/SECRET/%zz"},
+			wantErr: "not a valid URL",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			exporter, err := createTraceExporter(t.Context(), tt.config)
+			require.ErrorContains(t, err, tt.wantErr)
+			assert.Nil(t, exporter)
+			// Every URL above carries a sentinel credential; errors reach logs,
+			// so none may echo it.
+			assert.NotContains(t, err.Error(), "SECRET")
+
+			// The provider surfaces the same error rather than going no-op.
+			provider, shutdown, err := NewTracerProviderWithShutdown(t.Context(), tt.config, resource.Empty())
+			require.ErrorContains(t, err, tt.wantErr)
+			assert.Nil(t, provider)
+			assert.Nil(t, shutdown)
+		})
+	}
+}
+
+// exportOneSpan builds a tracer provider from config, records one span and
+// flushes it, failing the test if the export does not succeed.
+func exportOneSpan(t *testing.T, config Config) {
+	t.Helper()
+
+	provider, shutdown, err := NewTracerProviderWithShutdown(t.Context(), config, resource.Empty())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+
+	sdkProvider, ok := provider.(*sdktrace.TracerProvider)
+	require.True(t, ok, "expected a real tracer provider, got %T", provider)
+
+	_, span := sdkProvider.Tracer("test").Start(t.Context(), "traces-endpoint")
+	span.End()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, sdkProvider.ForceFlush(ctx))
 }

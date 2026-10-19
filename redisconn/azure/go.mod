@@ -8,8 +8,8 @@ replace github.com/stacklok/toolhive-core/redisconn => ..
 
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.3
-	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.14.1
-	github.com/stacklok/toolhive-core/redisconn v0.0.2
+	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.15.0
+	github.com/stacklok/toolhive-core/redisconn v0.0.4
 )
 
 require (
@@ -20,8 +20,8 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
-	github.com/redis/go-redis/v9 v9.22.0 // indirect
-	go.uber.org/atomic v1.11.0 // indirect
+	github.com/redis/go-redis/v9 v9.23.0 // indirect
+	go.uber.org/atomic v1.12.0 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/net v0.61.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect

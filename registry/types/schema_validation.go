@@ -64,9 +64,14 @@ func (r *UpstreamRegistry) Validate() error {
 	return validateRegistryExtensions(data)
 }
 
-// Validate validates the ServerExtensions against the publisher-provided schema.
+// Validate validates the ServerExtensions against the server_extensions definition
+// of the publisher-provided schema. The extensions are wrapped in the ToolHive
+// namespace under a placeholder identifier, since the schema defines them at that
+// level rather than at its root.
 func (e *ServerExtensions) Validate() error {
-	data, err := json.Marshal(e)
+	data, err := json.Marshal(map[string]any{
+		ToolHivePublisherNamespace: map[string]any{"server": e},
+	})
 	if err != nil {
 		return fmt.Errorf("failed to serialize server extensions: %w", err)
 	}
