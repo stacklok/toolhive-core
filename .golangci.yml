@@ -18,6 +18,7 @@ linters:
     - exhaustive
     - goconst
     - gocyclo
+    - gomoddirectives
     - gosec
     - govet
     - ineffassign
@@ -42,6 +43,16 @@ linters:
               desc: this is deprecated
     gocyclo:
       min-complexity: 15
+    gomoddirectives:
+      # Disallow patch-pinned `go` directives in go.mod (e.g. `go 1.27.2`), but
+      # allow the `.0` form: `go mod tidy` under a Go 1.21+ toolchain
+      # normalizes a bare `go X.Y` to `go X.Y.0` (and dependencies declaring
+      # `go X.Y.0` force it), so rejecting it would fight the toolchain.
+      # Use `go X.Y` or `go X.Y.0`; pin a real patch via `toolchain` if needed.
+      go-version-pattern: '^\d+\.\d+(\.0)?$'
+      # The root go.mod has a development-only local replace for the untagged
+      # nested redisconn module.
+      replace-local: true
     gosec:
       excludes:
         - G601
