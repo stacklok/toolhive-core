@@ -111,23 +111,15 @@ For packages with external dependencies, multiple types, or broader API surface:
 - **Minor (v0.X.0)**: New features, backward-compatible
 - **Patch (v0.0.X)**: Bug fixes, backward-compatible
 
-### Release preflight
+### Releasing
 
-Before creating or pushing a release tag, check out the exact commit to be tagged and run:
+All five Go modules in this repository (the root module, `redisconn`, and `redisconn/aws`, `redisconn/azure`, `redisconn/gcp`) are released together with one version, stored in the `VERSION` file.
 
-```bash
-./scripts/validate-release.sh <intended-tag>
-```
+1. Run the **Create Release PR** workflow from the Actions tab (or `gh workflow run create-release-pr.yml -f bump_type=patch`). It bumps `VERSION` and opens a `Release vX.Y.Z` PR.
+2. Merge that PR. **Create Release Tag** then tags the merged commit as `vX.Y.Z`, `redisconn/vX.Y.Z`, `redisconn/aws/vX.Y.Z`, `redisconn/azure/vX.Y.Z`, and `redisconn/gcp/vX.Y.Z`, and creates the GitHub Release with generated notes.
+3. Publishing the release runs the **Release** workflow, which attaches the registry JSON schemas.
 
-The intended tag must use the module's tag prefix (for example, `v1.2.3`, `redisconn/v1.2.3`, or `redisconn/aws/v1.2.3`). Every required sibling module version must already have an exact module-prefixed release tag available in the local clone; fetch the required previous tags before running the check. The script only inspects local Git state and makes no network calls.
-
-For an auditable preflight result, manually dispatch the **Release** workflow with the same intended tag and the full 40-character lowercase commit SHA that will receive it. The workflow rejects branch names, tag names, abbreviated SHAs, and uppercase SHAs, verifies that the input resolves to a commit, and checks out that exact commit. Create and push the tag only after the local check and, when used, the manual preflight pass against that SHA.
-
-The tag-triggered Release workflow repeats validation after a tag is pushed. This post-tag check is defense in depth; it detects an invalid release but is not the pre-tag control.
-
-### Unresolved release risks
-
-Repository workflows cannot prevent an authorized user from directly pushing a tag without performing the preflight. Access controls and release-operator procedure must enforce the required pre-tag check; the post-tag workflow can only report failure after the tag exists.
+Do not push release tags by hand. If a release includes a breaking change, edit the generated notes to call it out.
 
 ## License
 

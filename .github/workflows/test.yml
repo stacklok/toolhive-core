@@ -48,7 +48,6 @@ jobs:
 
       - name: Check standalone Redis modules
         run: |
-          ./scripts/test-validate-release.sh
           ./scripts/check-redisconn-modules.sh
           for module in redisconn redisconn/aws redisconn/azure redisconn/gcp; do
             (cd "$module" && GOWORK=off go mod tidy && GOWORK=off go mod verify && GOWORK=off go test -race ./... && GOWORK=off go vet ./...)

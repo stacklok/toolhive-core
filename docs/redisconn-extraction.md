@@ -64,17 +64,13 @@ constructor.
 ## Development and release ordering
 
 `go.work` joins the root and four nested modules for repository development.
-Each module also works with `GOWORK=off`; local `replace` directives are used
-only where an untagged sibling module is required. These checked-in replacements
-are development-only: Go ignores a dependency module's `replace` directives in
-downstream builds.
+The modules contain no local `replace` directives, so each module's manifest
+names published versions only. CI tests every nested module with
+`GOWORK=off`, which builds each provider against the `redisconn` version its
+`go.mod` requires: the same code a downstream consumer gets.
 
-The root module does not require any `redisconn` module, so a root `vX.Y.Z`
-tag never needs sibling tags first. Release ordering only applies within the
-`redisconn` modules: when a provider needs a new `redisconn` version, tag
-`redisconn/vX.Y.Z` first, then pin that version in the provider manifests and
-tag `redisconn/aws/vX.Y.Z`, `redisconn/azure/vX.Y.Z`, and
-`redisconn/gcp/vX.Y.Z` as needed. Do not fabricate versions.
-
-Release automation and maintainers must use module-prefixed tags for nested
-modules.
+All five modules are tagged together at one version by the release workflows
+(see the README). Providers keep requiring whichever published `redisconn`
+version they need; they do not have to be bumped for every release. When a
+provider needs a new `redisconn` API, release first, then bump the provider's
+`redisconn` requirement in a follow-up PR.
