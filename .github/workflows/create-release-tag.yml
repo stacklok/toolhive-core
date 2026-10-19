@@ -2,8 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Runs when a release PR (from create-release-pr.yml) changes VERSION on main.
-# Tags the merged commit once per Go module, all with the same version, then
-# creates the GitHub Release. Publishing the release triggers release.yml.
+# Tags the commit that set VERSION once per Go module, all with the same
+# version, then creates the GitHub Release. Publishing the release triggers
+# release.yml.
+#
+# Run it manually (workflow_dispatch) to retry a release that failed after the
+# release PR merged; it always tags the commit that last changed VERSION.
 #
 # The release must be created with the GitHub App token: releases created with
 # GITHUB_TOKEN do not trigger other workflows.
@@ -16,9 +20,11 @@ on:
       - main
     paths:
       - VERSION
+  workflow_dispatch:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   create-tag:
@@ -34,6 +40,7 @@ jobs:
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Read version
@@ -45,26 +52,31 @@ jobs:
             exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          RELEASE_SHA=$(git log -1 --format=%H -- VERSION)
+          echo "sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "v$VERSION was set by $(git log -1 --format='%h %s' "$RELEASE_SHA")"
 
-      # Only a merged release PR may produce a release. Squash merges look like
-      # "Release v1.2.3 (#123)"; merge commits mention the release/v1.2.3 branch.
+      # Only a merged release PR may produce a release. Check the PR the commit
+      # came from rather than the commit message, which depends on how the PR
+      # was merged (squash, rebase) and on repository merge settings.
       - name: Verify release PR
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_SHA: ${{ steps.version.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          COMMIT_MSG=$(git log -1 --pretty=%s)
-          echo "Commit message: $COMMIT_MSG"
-          if [[ "$COMMIT_MSG" =~ ^Release\ v${VERSION//./\\.}([^0-9]|$) ]] || \
-             [[ "$COMMIT_MSG" =~ release/v${VERSION//./\\.}([^0-9]|$) ]]; then
-            echo "Commit is the release PR for v$VERSION"
-          else
-            echo "::error::VERSION changed outside a release PR (expected 'Release v$VERSION'); refusing to release"
+          PR=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_SHA}/pulls" \
+            --jq ".[] | select(.merged_at != null and .base.ref == \"main\" and .head.ref == \"release/v${VERSION}\") | .number" | head -n1)
+          if [ -z "$PR" ]; then
+            echo "::error::VERSION was changed outside a release PR (no merged PR from release/v$VERSION for ${RELEASE_SHA}); refusing to release"
             exit 1
           fi
+          echo "Commit comes from release PR #$PR"
 
       - name: Create module tags
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_SHA: ${{ steps.version.outputs.sha }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           git config user.name "github-actions[bot]"
@@ -76,14 +88,14 @@ jobs:
           for prefix in "" redisconn/ redisconn/aws/ redisconn/azure/ redisconn/gcp/; do
             tag="${prefix}v${VERSION}"
             if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
-              if [ "$(git rev-parse "$tag^{commit}")" != "$(git rev-parse HEAD)" ]; then
+              if [ "$(git rev-parse "$tag^{commit}")" != "$RELEASE_SHA" ]; then
                 echo "::error::$tag already exists on a different commit"
                 exit 1
               fi
-              echo "$tag already exists on this commit; skipping"
+              echo "$tag already exists on the release commit; skipping"
               continue
             fi
-            git tag -a "$tag" -m "Release $tag"
+            git tag -a "$tag" -m "Release $tag" "$RELEASE_SHA"
             tags+=("$tag")
           done
 
