@@ -14,6 +14,8 @@ import (
 	"encoding/pem"
 	"math/big"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -289,6 +291,50 @@ func TestBuildTLSConfig(t *testing.T) {
 				if tt.name == "system roots" && got.RootCAs != nil {
 					t.Fatal("RootCAs is non-nil; nil is required for standard-library system root discovery")
 				}
+			}
+		})
+	}
+}
+
+func TestBuildTLSConfigCACertFile(t *testing.T) {
+	t.Parallel()
+	caPEM, _, _ := testCertificate(t)
+	dir := t.TempDir()
+	write := func(name string, data []byte) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	valid := write("valid.pem", caPEM)
+	tests := []struct {
+		name string
+		cfg  *TLSConfig
+		want string
+	}{
+		{"valid file", &TLSConfig{CACertFile: valid}, ""},
+		{"missing file", &TLSConfig{CACertFile: filepath.Join(dir, "missing.pem")}, "failed to read CA certificate file"},
+		{"empty file", &TLSConfig{CACertFile: write("empty.pem", nil)}, "is empty"},
+		{"malformed file", &TLSConfig{CACertFile: write("bad.pem", []byte("bad"))}, "failed to parse CA"},
+		{"file and bytes", &TLSConfig{CACert: caPEM, CACertFile: valid}, "mutually exclusive"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := BuildTLSConfig(tt.cfg)
+			if tt.want != "" {
+				if err == nil || !contains(err.Error(), tt.want) {
+					t.Fatalf("error = %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.RootCAs == nil {
+				t.Fatal("CA file did not replace system roots")
 			}
 		})
 	}
