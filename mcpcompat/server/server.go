@@ -265,6 +265,14 @@ func (s *MCPServer) clearPendingRequestContext(nonce string) {
 	s.pendingReqCtx.Delete(nonce)
 }
 
+// isNotificationMethod reports whether method is an MCP notification. go-sdk's
+// Request exposes no JSON-RPC ID in middleware, and every MCP notification uses
+// the "notifications/" prefix, so the prefix is the only way to tell a
+// notification from a request there.
+func isNotificationMethod(method string) bool {
+	return strings.HasPrefix(method, "notifications/")
+}
+
 // valueBridgeContext bridges the originating HTTP request's context values into
 // a handler running on go-sdk's session goroutine. Its lifecycle
 // (Deadline/Done/Err) comes from the embedded handler context; Value lookups
@@ -835,10 +843,49 @@ func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server, stateless bool)
 			// headers — so concurrent POSTs on the same session each resolve
 			// their OWN context (issue #156, item U3: per-request, not per
 			// session).
+			//
+			// If the nonce is present but its entry is gone, the POST that
+			// carried this message has already returned (the client
+			// disconnected) and ServeHTTP cleared the entry. A request (as
+			// opposed to a notification) is then refused rather than run; see
+			// the comment on that branch.
 			if re := req.GetExtra(); re != nil {
 				if nonce := re.Header.Get(reqNonceHeader); nonce != "" {
-					if reqCtx := s.pendingRequestContext(nonce); reqCtx != nil {
+					reqCtx := s.pendingRequestContext(nonce)
+					switch {
+					case reqCtx != nil:
 						ctx = &valueBridgeContext{Context: ctx, values: reqCtx}
+					case !isNotificationMethod(method):
+						// The handler context here is the session's base
+						// context, which belongs to another request: the
+						// initialize POST, or the first request that
+						// rehydrated the session. Running the call on it would
+						// use that request's identity, audit and telemetry
+						// values, so refuse instead.
+						//
+						// This deliberately deviates from MCP 2025-11-25,
+						// which says disconnection SHOULD NOT be interpreted as
+						// cancellation. No EventStore is configured, so the
+						// client cannot resume the stream and recover the
+						// result anyway (cf. the go-sdk TODO about cancelling
+						// such requests, streamable.go:1721).
+						//
+						// The nonce cannot be spoofed: ServeHTTP always
+						// overwrites the header. This is unreachable for
+						// initialize: go-sdk closes and drains a session whose
+						// initialize POST returns before initialization.
+						if s.logger != nil {
+							sid := ""
+							if ss != nil {
+								sid = ss.ID()
+							}
+							s.logger.Debug("refusing dispatch of abandoned request: per-request context gone",
+								"method", method, "session_id", sid)
+						}
+						return nil, &jsonrpc.Error{
+							Code:    jsonrpc.CodeInternalError,
+							Message: "request context no longer available",
+						}
 					}
 				}
 			}

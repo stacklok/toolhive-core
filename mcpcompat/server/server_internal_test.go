@@ -8,9 +8,11 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	gosdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -617,5 +619,111 @@ func setCacheScopeForTest(t *testing.T, res gosdk.Result, scope string) {
 		r.CacheScope = scope
 	default:
 		t.Fatalf("setCacheScopeForTest: unsupported result type %T", res)
+	}
+}
+
+const callMethod = string(mcp.MethodToolsCall)
+
+func TestIsNotificationMethod(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		method string
+		want   bool
+	}{
+		{"notifications/initialized", true},
+		{"notifications/cancelled", true},
+		{"notifications/roots/list_changed", true},
+		{callMethod, false},
+		{"initialize", false},
+		{"ping", false},
+		{"", false},
+		{"notificationsX/foo", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, isNotificationMethod(tt.method))
+		})
+	}
+}
+
+type abandonedCtxKey struct{}
+
+func TestSessionDispatchMiddleware_AbandonedRequest(t *testing.T) {
+	t.Parallel()
+	const refusalLog = "refusing dispatch of abandoned request"
+
+	tests := []struct {
+		name        string
+		method      string
+		nonce       string // header value; "" means no header
+		storeNonce  bool
+		wantErr     bool
+		wantNext    bool
+		wantHook    bool
+		wantRefusal bool
+		wantValue   bool
+	}{
+		{name: "request with abandoned nonce is refused", method: callMethod, nonce: "gone",
+			wantErr: true, wantRefusal: true},
+		{name: "notification with abandoned nonce passes through", method: "notifications/initialized",
+			nonce: "gone", wantNext: true},
+		{name: "request without nonce header dispatches", method: callMethod,
+			wantNext: true, wantHook: true},
+		{name: "request with stored nonce bridges context", method: callMethod, nonce: "live",
+			storeNonce: true, wantNext: true, wantHook: true, wantValue: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			hookCalls := 0
+			hooks := &Hooks{}
+			hooks.AddBeforeCallTool(func(_ context.Context, _ any, _ *mcp.CallToolRequest) { hookCalls++ })
+			s := NewMCPServer("abandoned", "1.0.0", WithLogger(logger), WithHooks(hooks))
+			srv, err := s.buildServer(nil, false)
+			require.NoError(t, err)
+
+			nextCalls := 0
+			var sawValue any
+			next := func(ctx context.Context, _ string, _ gosdk.Request) (gosdk.Result, error) {
+				nextCalls++
+				sawValue = ctx.Value(abandonedCtxKey{})
+				return &gosdk.CallToolResult{}, nil
+			}
+			handler := s.sessionDispatchMiddleware(srv, false)(next)
+
+			if tt.storeNonce {
+				s.setPendingRequestContext(context.WithValue(context.Background(), abandonedCtxKey{}, "req-value"), tt.nonce)
+			}
+			h := http.Header{}
+			if tt.nonce != "" {
+				h.Set(reqNonceHeader, tt.nonce)
+			}
+			extra := &gosdk.RequestExtra{Header: h}
+			var req gosdk.Request
+			if strings.HasPrefix(tt.method, "notifications/") {
+				req = &gosdk.InitializedRequest{Extra: extra}
+			} else {
+				req = &gosdk.CallToolRequest{Extra: extra, Params: &gosdk.CallToolParamsRaw{Name: "t"}}
+			}
+
+			_, err = handler(context.Background(), tt.method, req)
+
+			if tt.wantErr {
+				var je *jsonrpc.Error
+				require.ErrorAs(t, err, &je)
+				assert.EqualValues(t, jsonrpc.CodeInternalError, je.Code)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantNext, nextCalls == 1, "next call count %d", nextCalls)
+			assert.Equal(t, tt.wantHook, hookCalls == 1, "hook call count %d", hookCalls)
+			assert.Equal(t, tt.wantRefusal, strings.Contains(buf.String(), refusalLog))
+			if tt.wantValue {
+				assert.Equal(t, "req-value", sawValue)
+			}
+		})
 	}
 }
