@@ -68,9 +68,6 @@ func newAbandonedFixture(t *testing.T) *abandonedFixture {
 	releaseCh := make(chan struct{})
 	var once sync.Once
 	f.release = func() { once.Do(func() { close(releaseCh) }) }
-	// Registered before anything can block: session close waits for in-flight
-	// requests, so a failed assertion would otherwise hang the test.
-	t.Cleanup(f.release)
 
 	sidCh := make(chan string, 1)
 	hooks := &server.Hooks{}
@@ -95,7 +92,13 @@ func newAbandonedFixture(t *testing.T) *abandonedFixture {
 
 	f.httpSrv = server.NewStreamableHTTPServer(srv)
 	ts := httptest.NewServer(f.httpSrv)
-	t.Cleanup(ts.Close)
+	// Release the hook before closing the server: Close waits for active
+	// requests, and the initialize POST stays active while the hook blocks, so
+	// a failed assertion would otherwise stall cleanup.
+	t.Cleanup(func() {
+		f.release()
+		ts.Close()
+	})
 	f.url = ts.URL
 
 	// Send initialize from a goroutine; it blocks inside the hook.

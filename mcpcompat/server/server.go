@@ -147,8 +147,10 @@ type MCPServer struct {
 	logger  *slog.Logger
 	hooks   *Hooks
 
-	// testReceivingMiddleware is a test-only seam: buildServer installs these
-	// after the dispatch middleware. Nothing in production code sets it.
+	// testReceivingMiddleware is a test-only seam: buildServer adds these after
+	// the dispatch middleware, so they wrap it and run before it (without the
+	// bridged request context or session binding). Nothing in production code
+	// sets it.
 	testReceivingMiddleware []gosdk.Middleware
 
 	// Capability flags set via WithToolCapabilities/WithResourceCapabilities/
@@ -875,7 +877,7 @@ func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server, stateless bool)
 						// cancellation. No EventStore is configured, so the
 						// client cannot resume the stream and recover the
 						// result anyway (cf. the go-sdk TODO about cancelling
-						// such requests, streamable.go:1721).
+						// such requests, streamable.go:1722).
 						//
 						// The nonce cannot be spoofed: ServeHTTP always
 						// overwrites the header. This is unreachable for

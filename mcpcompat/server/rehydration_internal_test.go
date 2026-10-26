@@ -116,12 +116,9 @@ func TestAbandonedRequest_RehydratedSession_Refused(t *testing.T) {
 	tsA := httptest.NewServer(NewStreamableHTTPServer(srvA, WithSessionIdManager(mgr)))
 	t.Cleanup(tsA.Close)
 
-	// Registered before anything can block: session close waits for in-flight
-	// requests, so a failed assertion would otherwise hang the test.
 	releaseCh := make(chan struct{})
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(releaseCh) }) }
-	t.Cleanup(release)
 	entered := make(chan struct{}, 1)
 
 	var toolCalls, hookCalls atomic.Int32
@@ -152,7 +149,13 @@ func TestAbandonedRequest_RehydratedSession_Refused(t *testing.T) {
 	}
 	httpB := NewStreamableHTTPServer(srvB, WithSessionIdManager(mgr))
 	tsB := httptest.NewServer(httpB)
-	t.Cleanup(tsB.Close)
+	// Release the middleware before closing the server: session close waits
+	// for in-flight requests, so a failed assertion would otherwise stall
+	// cleanup on the blocked notification.
+	t.Cleanup(func() {
+		release()
+		tsB.Close()
+	})
 
 	// Initialize on A.
 	status, out := rehydrationPost(t, tsA.URL, "",
