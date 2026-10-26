@@ -147,6 +147,10 @@ type MCPServer struct {
 	logger  *slog.Logger
 	hooks   *Hooks
 
+	// testReceivingMiddleware is a test-only seam: buildServer installs these
+	// after the dispatch middleware. Nothing in production code sets it.
+	testReceivingMiddleware []gosdk.Middleware
+
 	// Capability flags set via WithToolCapabilities/WithResourceCapabilities/
 	// WithPromptCapabilities. These are wired into the go-sdk ServerOptions in
 	// buildServer (see ServerOptions.Capabilities): go-sdk otherwise infers
@@ -648,6 +652,9 @@ func (s *MCPServer) buildServer(genSessionID func() string, stateless bool) (*go
 	}
 
 	srv.AddReceivingMiddleware(s.sessionDispatchMiddleware(srv, stateless))
+	if len(s.testReceivingMiddleware) > 0 {
+		srv.AddReceivingMiddleware(s.testReceivingMiddleware...)
+	}
 	return srv, nil
 }
 
