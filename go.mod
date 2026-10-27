@@ -24,7 +24,7 @@ require (
 	github.com/lestrrat-go/httprc/v3 v3.0.6
 	github.com/lestrrat-go/jwx/v4 v4.6.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
-	github.com/modelcontextprotocol/registry v1.8.5
+	github.com/modelcontextprotocol/registry v1.8.6
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/prometheus/client_golang v1.25.0
