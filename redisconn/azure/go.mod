@@ -5,7 +5,7 @@ go 1.27
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.3
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.15.0
-	github.com/stacklok/toolhive-core/redisconn v0.0.57
+	github.com/stacklok/toolhive-core/redisconn v0.0.58
 )
 
 require (
