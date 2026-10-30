@@ -35,6 +35,7 @@ import (
 	gosdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/stacklok/toolhive-core/mcpcompat/client/transport"
+	"github.com/stacklok/toolhive-core/mcpcompat/internal/rawmsg"
 	mcp "github.com/stacklok/toolhive-core/mcpcompat/mcp"
 )
 
@@ -655,6 +656,53 @@ func (c *Client) Complete(ctx context.Context, request mcp.CompleteRequest) (*mc
 	return convertResult[mcp.CompleteResult](res)
 }
 
+// CallCustomMethod sends a custom (non-standard) JSON-RPC request, such as a
+// method an MCP extension defines (for example skills/list), and returns its
+// result object undecoded. mcp-go has no equivalent; it exists so a proxy can
+// forward an extension's methods without the shim modeling their shapes.
+//
+// params must be a JSON object, or nil to send no params. On a 2026-07-28
+// session go-sdk adds its request _meta members to params, as it does for the
+// standard methods; every other member is sent unchanged.
+//
+// A JSON-RPC error from the server is returned as the go-sdk *jsonrpc.Error,
+// so the caller can relay the server's code. On a resumed session (see
+// resume.go) the error carries the server's message only, as for the other
+// methods. method must not name a standard MCP method; use the dedicated
+// method for those.
+//
+// Check that the server declares the extension (the initialize result's
+// Capabilities.Extensions) before calling: a go-sdk server answers a method it
+// does not serve with HTTP 400 rather than a JSON-RPC method-not-found, so the
+// error alone does not say the method is absent.
+func (c *Client) CallCustomMethod(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+	ctx = withErrCapture(ctx)
+	if c.isResume() {
+		var out json.RawMessage
+		var p any
+		if len(params) > 0 {
+			p = params
+		}
+		return out, c.resumeCall(ctx, method, p, &out)
+	}
+	s, gc, err := c.sessionAndClient()
+	if err != nil {
+		return nil, err
+	}
+	if err := gosdk.AddSendingCustomMethod[*rawmsg.Params, *rawmsg.Result](gc, method); err != nil {
+		return nil, err
+	}
+	p, err := rawmsg.NewParams(params)
+	if err != nil {
+		return nil, fmt.Errorf("custom method %q params: %w", method, err)
+	}
+	res, err := gosdk.CallCustomMethod[*rawmsg.Params, *rawmsg.Result](ctx, s, method, p)
+	if err != nil {
+		return nil, mapCallError(ctx, err)
+	}
+	return res.Raw()
+}
+
 // OnNotification registers a handler invoked for server-initiated notifications.
 // Handlers must be registered before Initialize so they can be wired into the
 // underlying go-sdk client. The go-sdk exposes typed notification handlers
@@ -948,6 +996,17 @@ func (c *Client) sessionFor() (*gosdk.ClientSession, error) {
 		return nil, fmt.Errorf("client not initialized: call Initialize first")
 	}
 	return c.session, nil
+}
+
+// sessionAndClient returns the initialized session together with the go-sdk
+// client it belongs to, which custom-method registration needs.
+func (c *Client) sessionAndClient() (*gosdk.ClientSession, *gosdk.Client, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.session == nil {
+		return nil, nil, fmt.Errorf("client not initialized: call Initialize first")
+	}
+	return c.session, c.client, nil
 }
 
 // --- helpers ---------------------------------------------------------------
