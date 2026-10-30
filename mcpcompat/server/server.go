@@ -16,8 +16,10 @@
 //
 // The global registration path (AddTool/AddResource/AddResourceTemplate/
 // AddPrompt served over the stdio and HTTP transports), the completion handler
-// (WithCompletionHandler) and the resource subscribe/unsubscribe handlers
-// (WithSubscribeHandlers) are functional and tested. The per-session interfaces
+// (WithCompletionHandler), the resource subscribe/unsubscribe handlers
+// (WithSubscribeHandlers) and MCP extensions with their custom methods
+// (WithExtension, WithCustomMethod; mcp-go has no equivalent) are functional
+// and tested. The per-session interfaces
 // (SessionWithTools, SessionWithResources, SessionWithResourceTemplates,
 // SessionWithPrompts, SessionWithElicitation, SessionIdManager) and the Hooks
 // type are implemented and wired: per-session
@@ -183,6 +185,13 @@ type MCPServer struct {
 	// option requires both together (see WithSubscribeHandlers).
 	subscribeHandler   SubscribeHandlerFunc
 	unsubscribeHandler SubscribeHandlerFunc
+
+	// extensions holds the MCP extensions declared via WithExtension, keyed by
+	// extension name, and customMethods the custom JSON-RPC methods registered
+	// via WithCustomMethod, keyed by method name. Both are set only by options
+	// and read-only afterwards.
+	extensions    map[string]map[string]any
+	customMethods map[string]CustomMethodHandlerFunc
 
 	mu                sync.RWMutex
 	tools             map[string]ServerTool
@@ -615,6 +624,7 @@ func (s *MCPServer) buildServer(genSessionID func() string, stateless bool) (*go
 	// it to be advertised regardless of registered features; a nil entry leaves
 	// go-sdk's inference (from registered features) in place.
 	opts.Capabilities = s.serverCapabilities()
+	s.addExtensions(opts.Capabilities)
 	// Wire the completion handler. go-sdk auto-advertises the completions
 	// capability when ServerOptions.CompletionHandler is non-nil; the shim
 	// converts the go-sdk request/result to and from the mcp-go-shaped types.
@@ -636,6 +646,9 @@ func (s *MCPServer) buildServer(genSessionID func() string, stateless bool) (*go
 	srv = gosdk.NewServer(impl, opts)
 
 	if err := s.registerGlobalFeatures(srv, tools, resources, prompts, resourceTemplates); err != nil {
+		return nil, err
+	}
+	if err := s.registerCustomMethods(srv); err != nil {
 		return nil, err
 	}
 
