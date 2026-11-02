@@ -86,27 +86,38 @@ func callProbe(t *testing.T, url, sessionID string) {
 	require.Nil(t, r.Error, "tools/call probe should not error")
 }
 
+// formElicitationSupported applies the rule documented on
+// SessionWithClientCapabilities.DeclaredClientCapabilities: an elicitation
+// capability with neither form nor url set means form-only support.
+func formElicitationSupported(c mcp.ClientCapabilities) bool {
+	return c.Elicitation != nil && (c.Elicitation.Form != nil || c.Elicitation.URL == nil)
+}
+
 func TestClientSession_DeclaredCapabilities(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name            string
-		capsJSON        string
-		wantElicitation bool
-		wantForm        bool
-		wantURL         bool
-		wantRoots       bool
-		wantListChanged bool
-		wantSampling    bool
+		name              string
+		capsJSON          string
+		wantElicitation   bool
+		wantForm          bool
+		wantURL           bool
+		wantFormSupported bool
+		wantRoots         bool
+		wantListChanged   bool
+		wantSampling      bool
 	}{
 		{
 			name:     "no elicitation",
 			capsJSON: `{}`,
 		},
 		{
-			name:            "empty elicitation object",
-			capsJSON:        `{"elicitation":{}}`,
-			wantElicitation: true,
+			// An empty elicitation object means form-only support, though
+			// neither form nor url is present.
+			name:              "empty elicitation object",
+			capsJSON:          `{"elicitation":{}}`,
+			wantElicitation:   true,
+			wantFormSupported: true,
 		},
 		{
 			name:            "url elicitation",
@@ -115,11 +126,19 @@ func TestClientSession_DeclaredCapabilities(t *testing.T) {
 			wantURL:         true,
 		},
 		{
-			name:            "form and url elicitation",
-			capsJSON:        `{"elicitation":{"form":{},"url":{}}}`,
-			wantElicitation: true,
-			wantForm:        true,
-			wantURL:         true,
+			name:              "form elicitation",
+			capsJSON:          `{"elicitation":{"form":{}}}`,
+			wantElicitation:   true,
+			wantForm:          true,
+			wantFormSupported: true,
+		},
+		{
+			name:              "form and url elicitation",
+			capsJSON:          `{"elicitation":{"form":{},"url":{}}}`,
+			wantElicitation:   true,
+			wantForm:          true,
+			wantURL:           true,
+			wantFormSupported: true,
 		},
 		{
 			name:      "roots without listChanged",
@@ -157,6 +176,7 @@ func TestClientSession_DeclaredCapabilities(t *testing.T) {
 				assert.Equal(t, tc.wantForm, el.Form != nil, "elicitation.form presence")
 				assert.Equal(t, tc.wantURL, el.URL != nil, "elicitation.url presence")
 			}
+			assert.Equal(t, tc.wantFormSupported, formElicitationSupported(obs.caps), "form elicitation support")
 			assert.Equal(t, tc.wantRoots, obs.caps.Roots != nil, "roots presence")
 			if tc.wantRoots && obs.caps.Roots != nil {
 				assert.Equal(t, tc.wantListChanged, obs.caps.Roots.ListChanged, "roots.listChanged")
