@@ -41,6 +41,22 @@ type SessionWithClientCapabilities interface {
 	//     never registered as having seen initialize;
 	//   - before initialize has completed.
 	//
+	// Only the capabilities declared in the initialize handshake are read.
+	// Under protocol version 2026-07-28 a client sends its capabilities with
+	// each request, in _meta ("io.modelcontextprotocol/clientCapabilities"),
+	// and those are not reflected here, so known=false does not mean the
+	// client lacks a capability.
+	//
+	// An elicitation capability with neither Form nor URL set
+	// ({"elicitation":{}}) means form-only support, per the MCP spec. To
+	// check for form support, use
+	// Elicitation != nil && (Elicitation.Form != nil || Elicitation.URL == nil),
+	// not Elicitation.Form != nil alone. URL-mode support is
+	// Elicitation != nil && Elicitation.URL != nil.
+	//
+	// Tasks is always nil, because go-sdk does not carry it, so nil means
+	// "not reported" rather than "not declared".
+	//
 	// The returned Experimental and Extensions maps are copies, but their
 	// nested values are shared with the session's state and must be treated
 	// as read-only.
