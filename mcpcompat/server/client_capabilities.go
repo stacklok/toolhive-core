@@ -19,6 +19,12 @@ import (
 // sending a server->client request. For example, it can confirm the client
 // declared elicitation.url before sending a URL-mode elicitation, which the
 // MCP spec forbids for clients that did not declare it.
+//
+// This is a shim-only extension with no mcp-go counterpart of the same shape.
+// The closest mcp-go interface is server.SessionWithClientInfo, whose
+// GetClientCapabilities has no way to say the capabilities are unknown, and
+// which also has setters. This interface is read-only and returns an explicit
+// known flag, so a caller can tell "declared nothing" from "not observed".
 type SessionWithClientCapabilities interface {
 	ClientSession
 	// DeclaredClientCapabilities returns the capabilities the client declared
@@ -26,20 +32,29 @@ type SessionWithClientCapabilities interface {
 	//
 	// known is false when the declared capabilities are not available, and
 	// the returned capabilities are then the zero value. Callers must treat
-	// that as "unknown", not as "declared nothing". This happens in three
-	// cases: on a session rehydrated from another replica, whose
-	// initialize-time state is reconstructed and seeded rather than declared;
-	// on a stateless request, which has no initialize handshake; and before
-	// initialize has completed.
+	// that as "unknown", not as "declared nothing". This happens:
+	//   - on a rehydrated session, reconstructed from shared state either on
+	//     another replica or after this instance reaped the original, whose
+	//     initialize-time state is seeded rather than declared;
+	//   - on a stateless request, which has no initialize handshake;
+	//   - on every SSE and stdio session, which have no session ID and so are
+	//     never registered as having seen initialize;
+	//   - before initialize has completed.
+	//
+	// The returned Experimental and Extensions maps are copies, but their
+	// nested values are shared with the session's state and must be treated
+	// as read-only.
 	DeclaredClientCapabilities() (caps mcp.ClientCapabilities, known bool)
 }
 
 // DeclaredClientCapabilities implements SessionWithClientCapabilities. It
 // reads the bound go-sdk session's InitializeParams, but only if that session
 // is the one this instance saw initialize on (initializedOn). A rehydrated
-// session's InitializeParams are seeded by StreamableHTTPServer.rehydrate,
-// including a placeholder elicitation capability. Reporting them as declared
-// would lead consumers to send elicitation modes the client never declared.
+// session, whether it came from another replica or from this instance after
+// it reaped the original, has InitializeParams seeded by
+// StreamableHTTPServer.rehydrate, including a placeholder elicitation
+// capability. Reporting them as declared would lead consumers to send
+// elicitation modes the client never declared.
 func (c *clientSession) DeclaredClientCapabilities() (mcp.ClientCapabilities, bool) {
 	ss := c.goSession.Load()
 	if ss == nil || c.initializedOn.Load() != ss {
@@ -73,12 +88,14 @@ func fromGoSDKClientCapabilities(in *gosdk.ClientCapabilities) mcp.ClientCapabil
 			ListChanged bool `json:"listChanged,omitempty"`
 		}{ListChanged: in.RootsV2.ListChanged}
 	}
-	if in.Sampling != nil { //nolint:staticcheck // deprecated in go-sdk but still part of the declared capabilities
+	// Sampling (like RootsV2) is deprecated in go-sdk but still carries what
+	// the client declared.
+	if in.Sampling != nil {
 		out.Sampling = &mcp.SamplingCapability{}
-		if in.Sampling.Context != nil { //nolint:staticcheck // see above
+		if in.Sampling.Context != nil {
 			out.Sampling.Context = &struct{}{}
 		}
-		if in.Sampling.Tools != nil { //nolint:staticcheck // see above
+		if in.Sampling.Tools != nil {
 			out.Sampling.Tools = &struct{}{}
 		}
 	}
