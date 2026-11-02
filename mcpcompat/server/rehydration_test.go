@@ -139,18 +139,7 @@ func readFirstResult(t *testing.T, resp *http.Response) rpcResult {
 // the assigned session ID.
 func initSession(t *testing.T, url string) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}`
-	resp := postRPC(ctx, t, url, "", body)
-	sid := resp.Header.Get("Mcp-Session-Id")
-	_ = readFirstResult(t, resp)
-	require.NotEmpty(t, sid, "initialize must assign a session ID")
-	// Send notifications/initialized to complete the handshake.
-	notif := `{"jsonrpc":"2.0","method":"notifications/initialized"}`
-	nresp := postRPC(ctx, t, url, sid, notif)
-	_ = nresp.Body.Close()
-	return sid
+	return initSessionWithCaps(t, url, "{}")
 }
 
 // listToolNames issues tools/list against url (optionally with a session ID) and
