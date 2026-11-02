@@ -17,6 +17,12 @@ import (
 
 const queryProp = "query"
 
+func TestMetaKeyServerInfo(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, gosdk.MetaKeyServerInfo, mcp.MetaKeyServerInfo)
+}
+
 // TestWireFormat_GoldenJSON pins the exact JSON wire shape of the re-exported
 // types and constructors. These goldens are the equivalence spec: when the
 // aliases in alias.go are later replaced by standalone definitions to drop the
