@@ -10,14 +10,12 @@ import (
 	"net/http"
 )
 
-// go-sdk's Streamable HTTP client reports a non-2xx response using only
-// http.StatusText(code) (e.g. "403 Forbidden") and discards the response body.
-// mcp-go instead included the body ("request failed with status N: <body>"),
-// which is where servers put actionable detail — e.g. ToolHive's authorization
-// middleware writes "Unauthorized" into a 403 body. To preserve that, the client
-// installs a RoundTripper that captures the body of a non-2xx response into a
-// per-call holder carried on the request context, and the error mappers
-// re-attach it to the returned error.
+// go-sdk v1.8 decodes JSON-RPC error bodies from non-2xx responses, but for
+// plain-text bodies it reports only http.StatusText(code). The shim still needs
+// those bodies for mcp-go-compatible actionable detail, the numeric HTTP status
+// for error classification, and WWW-Authenticate headers for RFC 9728 discovery.
+// The client installs a RoundTripper that captures these into a per-call holder
+// carried on the request context, and the error mappers enrich the returned error.
 
 // maxCapturedErrBody bounds how much of an error response body we read.
 const maxCapturedErrBody = 8 << 10 // 8 KiB
