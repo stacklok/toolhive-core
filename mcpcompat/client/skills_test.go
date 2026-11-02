@@ -18,8 +18,8 @@ import (
 	"github.com/stacklok/toolhive-core/mcpcompat/server"
 )
 
-// TestSkills_ResumedSession checks ListSkills and GetSkill over the client's
-// resume path (a session resumed by ID without Initialize).
+// TestSkills_ResumedSession checks ListSkills, GetSkill and ReadDirectory over
+// the client's resume path (a session resumed by ID without Initialize).
 //
 // It resumes on the replica that initialized the session. A session
 // rehydrated on ANOTHER replica cannot serve the skills methods with go-sdk
@@ -45,6 +45,13 @@ func TestSkills_ResumedSession(t *testing.T) {
 						URI:         req.Params.URI,
 						Frontmatter: map[string]any{"name": "notes", "description": name},
 						Resources:   mcp.SkillResources{Dynamic: true},
+					}}, nil
+				},
+			),
+			server.WithDirectoryReadHandler(
+				func(_ context.Context, req mcp.ReadDirectoryRequest) (*mcp.ReadDirectoryResult, error) {
+					return &mcp.ReadDirectoryResult{Resources: []mcp.Resource{
+						{URI: req.Params.URI + "/" + name, Name: name, MIMEType: mcp.MIMETypeDirectory},
 					}}, nil
 				},
 			),
@@ -83,6 +90,11 @@ func TestSkills_ResumedSession(t *testing.T) {
 	assert.Equal(t, uri, got.Skill.URI)
 	assert.True(t, got.Skill.Resources.Dynamic)
 
+	dir, err := resumed.ReadDirectory(ctx, mcp.ReadDirectoryRequest{Params: mcp.ReadDirectoryParams{URI: "skill://notes"}})
+	require.NoError(t, err)
+	require.Len(t, dir.Resources, 1)
+	assert.Equal(t, "skill://notes/A", dir.Resources[0].URI)
+
 	// Known go-sdk v1.8.0 limitation, see the doc comment above.
 	rehydrated, err := mcpclient.NewStreamableHttpClient(tsB.URL, transport.WithSession(sid))
 	require.NoError(t, err)
@@ -102,5 +114,7 @@ func TestSkills_NotInitialized(t *testing.T) {
 	_, err = c.ListSkills(context.Background(), mcp.ListSkillsRequest{})
 	require.ErrorContains(t, err, "not initialized")
 	_, err = c.GetSkill(context.Background(), mcp.GetSkillRequest{})
+	require.ErrorContains(t, err, "not initialized")
+	_, err = c.ReadDirectory(context.Background(), mcp.ReadDirectoryRequest{})
 	require.ErrorContains(t, err, "not initialized")
 }

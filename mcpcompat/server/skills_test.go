@@ -43,11 +43,12 @@ func pdfSkill() mcp.Skill {
 	}
 }
 
-// skillsServer returns a server serving pdfSkill. skills/list reports the
-// caller found in ctx as its cursor, so a test can see the request context;
-// skills/get answers -32602 for any other URI, as the extension requires.
-func skillsServer() *server.MCPServer {
-	return server.NewMCPServer("compat-server", "1.2.3",
+// skillsServer returns a server serving pdfSkill, plus opts. skills/list
+// reports the caller found in ctx as its cursor, so a test can see the request
+// context; skills/get answers -32602 for any other URI, as the extension
+// requires.
+func skillsServer(opts ...server.ServerOption) *server.MCPServer {
+	return server.NewMCPServer("compat-server", "1.2.3", append([]server.ServerOption{
 		server.WithResourceCapabilities(false, false),
 		server.WithSkillsHandlers(
 			func(ctx context.Context, req mcp.ListSkillsRequest) (*mcp.ListSkillsResult, error) {
@@ -63,7 +64,25 @@ func skillsServer() *server.MCPServer {
 				return &mcp.GetSkillResult{Skill: pdfSkill()}, nil
 			},
 		),
-	)
+	}, opts...)...)
+}
+
+// pdfTemplatesURI is the one directory readTemplates serves.
+const pdfTemplatesURI = "skill://pdf-processing/templates"
+
+// readTemplates is a resources/directory/read handler serving
+// pdfTemplatesURI, echoing the request cursor as nextCursor; any other URI
+// answers -32602, as the extension requires.
+func readTemplates(_ context.Context, req mcp.ReadDirectoryRequest) (*mcp.ReadDirectoryResult, error) {
+	if req.Params.URI != pdfTemplatesURI {
+		return nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "not a directory"}
+	}
+	res := &mcp.ReadDirectoryResult{Resources: []mcp.Resource{
+		{URI: pdfTemplatesURI + "/invoice.md", Name: "invoice.md", MIMEType: "text/markdown"},
+		{URI: pdfTemplatesURI + "/regional", Name: "regional", MIMEType: mcp.MIMETypeDirectory},
+	}}
+	res.NextCursor = req.Params.Cursor
+	return res, nil
 }
 
 // startSkillsServer serves srv over Streamable HTTP with a context func that
@@ -166,6 +185,71 @@ func TestSkills_MissingHandlerFailsBuild(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestSkills_DirectoryReadEndToEnd serves the optional
+// resources/directory/read method alongside the skills methods: directoryRead
+// is declared, children round-trip with the directory MIME type, the cursor
+// reaches the handler, and a non-directory reaches the client as -32602.
+func TestSkills_DirectoryReadEndToEnd(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	c, initRes := startSkillsServer(t, skillsServer(server.WithDirectoryReadHandler(readTemplates)))
+	assert.Equal(t, map[string]any{mcp.SkillsSettingDirectoryRead: true},
+		initRes.Capabilities.Extensions[mcp.ExtensionSkills])
+
+	got, err := c.ReadDirectory(ctx, mcp.ReadDirectoryRequest{
+		Params: mcp.ReadDirectoryParams{URI: pdfTemplatesURI, Cursor: "p2"},
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Resources, 2)
+	assert.Equal(t, "invoice.md", got.Resources[0].Name)
+	assert.Equal(t, mcp.MIMETypeDirectory, got.Resources[1].MIMEType)
+	assert.Equal(t, mcp.Cursor("p2"), got.NextCursor)
+
+	_, err = c.ReadDirectory(ctx, mcp.ReadDirectoryRequest{Params: mcp.ReadDirectoryParams{URI: pdfSkillURI}})
+	var wireErr *jsonrpc.Error
+	require.True(t, errors.As(err, &wireErr), "got %T: %v", err, err)
+	assert.Equal(t, int64(jsonrpc.CodeInvalidParams), wireErr.Code)
+
+	// The skills methods are unaffected by the optional one.
+	_, err = c.ListSkills(ctx, mcp.ListSkillsRequest{})
+	require.NoError(t, err)
+}
+
+// TestSkills_DirectoryReadMisconfiguredFailsBuild checks that directory reads
+// without the Skills extension that declares them, or without a handler, fail
+// the server build.
+func TestSkills_DirectoryReadMisconfiguredFailsBuild(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		srv  *server.MCPServer
+	}{
+		{
+			name: "without WithSkillsHandlers",
+			srv:  server.NewMCPServer("compat-server", "1.2.3", server.WithDirectoryReadHandler(readTemplates)),
+		},
+		{
+			name: "nil handler",
+			srv:  skillsServer(server.WithDirectoryReadHandler(nil)),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ts := httptest.NewServer(server.NewStreamableHTTPServer(tc.srv))
+			t.Cleanup(ts.Close)
+
+			c, err := client.NewStreamableHttpClient(ts.URL)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = c.Close() })
+			_, err = c.Initialize(context.Background(), mcp.InitializeRequest{})
+			require.Error(t, err)
+		})
+	}
+}
+
 // TestSkills_StdioHandleMessage checks the stdio HandleMessage bridge, which
 // dispatches without a go-sdk server.
 func TestSkills_StdioHandleMessage(t *testing.T) {
@@ -196,7 +280,21 @@ func TestSkills_StdioHandleMessage(t *testing.T) {
 		`{"jsonrpc":"2.0","id":3,"method":"skills/get","params":{"uri":"skill://missing/SKILL.md"}}`)))
 	assert.Equal(t, float64(jsonrpc.CodeInvalidParams), get["error"].(map[string]any)["code"])
 
+	// Without WithDirectoryReadHandler the optional method is not served.
+	noDir := decode(t, srv.HandleMessage(ctx, json.RawMessage(
+		`{"jsonrpc":"2.0","id":4,"method":"resources/directory/read","params":{"uri":"skill://pdf-processing/templates"}}`)))
+	assert.Equal(t, float64(mcp.METHOD_NOT_FOUND), noDir["error"].(map[string]any)["code"])
+
+	withDir := skillsServer(server.WithDirectoryReadHandler(readTemplates))
+	init = decode(t, withDir.HandleMessage(ctx, json.RawMessage(`{"jsonrpc":"2.0","id":5,"method":"initialize","params":{}}`)))
+	caps = init["result"].(map[string]any)["capabilities"].(map[string]any)
+	assert.Equal(t, map[string]any{mcp.ExtensionSkills: map[string]any{mcp.SkillsSettingDirectoryRead: true}},
+		caps["extensions"])
+	dir := decode(t, withDir.HandleMessage(ctx, json.RawMessage(
+		`{"jsonrpc":"2.0","id":6,"method":"resources/directory/read","params":{"uri":"skill://pdf-processing/templates"}}`)))
+	require.Len(t, dir["result"].(map[string]any)["resources"], 2)
+
 	plain := server.NewMCPServer("compat-server", "1.2.3")
-	unserved := decode(t, plain.HandleMessage(ctx, json.RawMessage(`{"jsonrpc":"2.0","id":4,"method":"skills/list"}`)))
+	unserved := decode(t, plain.HandleMessage(ctx, json.RawMessage(`{"jsonrpc":"2.0","id":7,"method":"skills/list"}`)))
 	assert.Equal(t, float64(mcp.METHOD_NOT_FOUND), unserved["error"].(map[string]any)["code"])
 }

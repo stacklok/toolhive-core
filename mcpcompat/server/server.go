@@ -187,10 +187,14 @@ type MCPServer struct {
 
 	// skillsDeclared records that WithSkillsHandlers was invoked, which
 	// declares the Skills extension; listSkills/getSkill answer skills/list
-	// and skills/get. buildServer fails if either handler is nil.
-	skillsDeclared bool
-	listSkills     ListSkillsHandlerFunc
-	getSkill       GetSkillHandlerFunc
+	// and skills/get. directoryReadDeclared records WithDirectoryReadHandler,
+	// which adds directoryRead and answers resources/directory/read with
+	// readDirectory. buildServer fails on a missing handler (validateSkills).
+	skillsDeclared        bool
+	listSkills            ListSkillsHandlerFunc
+	getSkill              GetSkillHandlerFunc
+	directoryReadDeclared bool
+	readDirectory         ReadDirectoryHandlerFunc
 
 	mu                sync.RWMutex
 	tools             map[string]ServerTool

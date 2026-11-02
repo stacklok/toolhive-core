@@ -11,9 +11,12 @@ import (
 
 // The Skills extension (SEP-2640) serves Agent Skills over MCP: each file of a
 // skill is a resource, skills/list enumerates the skills a server serves and
-// skills/get returns one skill's entry by URI. mcp-go has no equivalent; the
-// shim models the two methods so a server can serve them and a client, such
-// as a proxy, can call them. See
+// skills/get returns one skill's entry by URI. Both are required of a server
+// declaring the extension. The optional resources/directory/read lists the
+// direct children of a directory resource; a server serves it only when it
+// declares the directoryRead setting. mcp-go has no equivalent; the shim
+// models all three methods so a server can serve them and a client, such as a
+// proxy, can call them. See
 // https://modelcontextprotocol.io/seps/2640-skills-extension.
 const (
 	// ExtensionSkills is the name a server declares the Skills extension under,
@@ -25,6 +28,18 @@ const (
 
 	// MethodSkillsGet returns the entry for a single skill by URI.
 	MethodSkillsGet MCPMethod = "skills/get"
+
+	// MethodResourcesDirectoryRead lists the direct children of a directory
+	// resource. It is optional, gated by SkillsSettingDirectoryRead.
+	MethodResourcesDirectoryRead MCPMethod = "resources/directory/read"
+
+	// SkillsSettingDirectoryRead is the Skills extension setting a server
+	// declares, as true, when it serves resources/directory/read.
+	SkillsSettingDirectoryRead = "directoryRead"
+
+	// MIMETypeDirectory is the MIME type of a directory resource, as listed by
+	// resources/directory/read.
+	MIMETypeDirectory = "inode/directory"
 
 	// SkillResourcesDynamic is the wire value of a skill's resources when its
 	// content is generated dynamically and cannot carry stable digests.
@@ -66,6 +81,35 @@ type GetSkillParams struct {
 type GetSkillResult struct {
 	Result
 	Skill Skill `json:"skill"`
+}
+
+// ReadDirectoryRequest is a resources/directory/read request.
+type ReadDirectoryRequest struct {
+	Request
+	Params ReadDirectoryParams `json:"params"`
+}
+
+// ReadDirectoryParams names the directory to list.
+type ReadDirectoryParams struct {
+	// URI is the directory resource's URI, written without a trailing slash.
+	URI string `json:"uri"`
+	// Cursor continues a paginated listing, as for resources/list.
+	Cursor Cursor `json:"cursor,omitempty"`
+	// Meta carries protocol-level metadata. ReadDirectoryRequest shadows
+	// Request's Params with this type, so Meta must be declared here to be
+	// marshaled.
+	Meta *Meta `json:"_meta,omitempty"`
+}
+
+// ReadDirectoryResult is the server's response to a resources/directory/read
+// request: the resource metadata of the directory's direct children, files
+// with their ordinary metadata and subdirectories with MIMEType
+// MIMETypeDirectory. The listing is not recursive. A server answers a URI
+// that does not exist, or is not a directory, with JSON-RPC error -32602
+// (INVALID_PARAMS).
+type ReadDirectoryResult struct {
+	PaginatedResult
+	Resources []Resource `json:"resources"`
 }
 
 // Skill is a skill entry, as skills/list and skills/get return it.

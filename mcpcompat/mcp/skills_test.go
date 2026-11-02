@@ -97,3 +97,26 @@ func TestSkill_JSONMatchesSpecExample(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, wire, string(out))
 }
+
+func TestReadDirectoryResult_JSONMatchesSpecExample(t *testing.T) {
+	t.Parallel()
+
+	// The resources/directory/read result from SEP-2640, trimmed to two
+	// children, plus a nextCursor.
+	const wire = `{
+		"resources": [
+			{"uri": "skill://pdf-processing/templates/invoice.md", "name": "invoice.md", "mimeType": "text/markdown"},
+			{"uri": "skill://pdf-processing/templates/regional", "name": "regional", "mimeType": "inode/directory"}
+		],
+		"nextCursor": "n"
+	}`
+	var res ReadDirectoryResult
+	require.NoError(t, json.Unmarshal([]byte(wire), &res))
+	require.Len(t, res.Resources, 2)
+	assert.Equal(t, MIMETypeDirectory, res.Resources[1].MIMEType)
+	assert.Equal(t, Cursor("n"), res.NextCursor)
+
+	out, err := json.Marshal(res)
+	require.NoError(t, err)
+	assert.JSONEq(t, wire, string(out))
+}
