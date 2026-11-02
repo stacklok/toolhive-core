@@ -101,6 +101,11 @@ type clientSession struct {
 	// first forgetSession closes it.
 	notifClose sync.Once
 	goSession  atomic.Pointer[gosdk.ServerSession]
+	// initializedOn is the go-sdk session on which this instance observed the
+	// client's initialize handshake (set by registerAndSync). The declared
+	// client capabilities are reported as known only while it is the session
+	// currently bound in goSession; see DeclaredClientCapabilities.
+	initializedOn atomic.Pointer[gosdk.ServerSession]
 
 	// owner and boundServer are set when the session's go-sdk server is bound
 	// (at registration). They let SetSessionTools/SetSessionResources/
@@ -384,6 +389,10 @@ func (s *MCPServer) registerAndSync(ctx context.Context, ss *gosdk.ServerSession
 	cs := s.bindSession(ss.ID(), ss)
 	cs.owner.Store(s)
 	cs.boundServer.Store(srv)
+	// Record that this instance saw the client's initialize on ss, so ss's
+	// InitializeParams carry capabilities the client actually declared (unlike
+	// a rehydrated session's seeded state). See DeclaredClientCapabilities.
+	cs.initializedOn.Store(ss)
 	// Mark the session local: it was initialized on this instance, so the go-sdk
 	// StreamableHTTPHandler owns it and subsequent requests must route there
 	// rather than through the cross-replica rehydration path.
