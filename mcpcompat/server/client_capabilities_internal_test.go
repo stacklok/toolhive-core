@@ -49,6 +49,15 @@ func TestFromGoSDKClientCapabilities(t *testing.T) {
 			}{ListChanged: true}},
 		},
 		{
+			// Presence keys on the RootsV2 pointer, not on ListChanged: a
+			// client that sent "roots":{} still declared roots.
+			name: "roots via RootsV2 without listChanged",
+			in:   &gosdk.ClientCapabilities{RootsV2: &gosdk.RootCapabilities{}},
+			want: mcp.ClientCapabilities{Roots: &struct {
+				ListChanged bool `json:"listChanged,omitempty"`
+			}{}},
+		},
+		{
 			name: "sampling with context and tools",
 			in: &gosdk.ClientCapabilities{Sampling: &gosdk.SamplingCapabilities{
 				Context: &gosdk.SamplingContextCapabilities{},
@@ -96,11 +105,36 @@ func TestFromGoSDKClientCapabilities(t *testing.T) {
 	}
 }
 
+// TestFromGoSDKClientCapabilities_ClonesMaps checks that the returned
+// Experimental and Extensions maps are independent top-level copies, so a
+// caller adding or deleting keys does not change the go-sdk session's state.
+// Nested values are shared by design (the clone is shallow).
+func TestFromGoSDKClientCapabilities_ClonesMaps(t *testing.T) {
+	t.Parallel()
+
+	in := &gosdk.ClientCapabilities{
+		Experimental: map[string]any{"x": "1"},
+		Extensions:   map[string]any{"ext": "2"},
+	}
+	out := fromGoSDKClientCapabilities(in)
+
+	out.Experimental["added"] = true
+	delete(out.Experimental, "x")
+	out.Extensions["added"] = true
+	delete(out.Extensions, "ext")
+
+	assert.Equal(t, map[string]any{"x": "1"}, in.Experimental)
+	assert.Equal(t, map[string]any{"ext": "2"}, in.Extensions)
+}
+
 // TestDeclaredClientCapabilities_UnknownStates covers the known=false paths
-// that do not need a live transport: no bound go-sdk session, and a bound
-// session that differs from the one initialize was observed on.
+// that do not need a live transport: no bound go-sdk session, a bound
+// session that differs from the one initialize was observed on, and a
+// matching session whose InitializeParams are not set.
 func TestDeclaredClientCapabilities_UnknownStates(t *testing.T) {
 	t.Parallel()
+
+	sameSession := &gosdk.ServerSession{}
 
 	tests := []struct {
 		name   string
@@ -110,6 +144,7 @@ func TestDeclaredClientCapabilities_UnknownStates(t *testing.T) {
 		{name: "no bound session"},
 		{name: "initialize observed on a different session", bound: &gosdk.ServerSession{}, initOn: &gosdk.ServerSession{}},
 		{name: "bound session never observed initialize", bound: &gosdk.ServerSession{}},
+		{name: "initialize observed but params missing", bound: sameSession, initOn: sameSession},
 	}
 
 	for _, tc := range tests {

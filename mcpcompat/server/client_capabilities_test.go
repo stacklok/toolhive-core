@@ -96,6 +96,7 @@ func TestClientSession_DeclaredCapabilities(t *testing.T) {
 		wantForm        bool
 		wantURL         bool
 		wantRoots       bool
+		wantListChanged bool
 		wantSampling    bool
 	}{
 		{
@@ -121,10 +122,16 @@ func TestClientSession_DeclaredCapabilities(t *testing.T) {
 			wantURL:         true,
 		},
 		{
-			name:         "roots and sampling without elicitation",
-			capsJSON:     `{"roots":{"listChanged":true},"sampling":{}}`,
-			wantRoots:    true,
-			wantSampling: true,
+			name:      "roots without listChanged",
+			capsJSON:  `{"roots":{}}`,
+			wantRoots: true,
+		},
+		{
+			name:            "roots and sampling without elicitation",
+			capsJSON:        `{"roots":{"listChanged":true},"sampling":{}}`,
+			wantRoots:       true,
+			wantListChanged: true,
+			wantSampling:    true,
 		},
 	}
 
@@ -151,8 +158,8 @@ func TestClientSession_DeclaredCapabilities(t *testing.T) {
 				assert.Equal(t, tc.wantURL, el.URL != nil, "elicitation.url presence")
 			}
 			assert.Equal(t, tc.wantRoots, obs.caps.Roots != nil, "roots presence")
-			if tc.wantRoots {
-				assert.True(t, obs.caps.Roots.ListChanged, "roots.listChanged")
+			if tc.wantRoots && obs.caps.Roots != nil {
+				assert.Equal(t, tc.wantListChanged, obs.caps.Roots.ListChanged, "roots.listChanged")
 			}
 			assert.Equal(t, tc.wantSampling, obs.caps.Sampling != nil, "sampling presence")
 		})
