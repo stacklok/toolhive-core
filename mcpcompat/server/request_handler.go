@@ -30,8 +30,8 @@ func (*MCPServer) WithContext(ctx context.Context, session ClientSession) contex
 // registration state the go-sdk server is built from — so behavior matches
 // mcp-go for the methods ToolHive exercises: initialize, ping, tools/list,
 // tools/call, resources/list, resources/templates/list, resources/read,
-// prompts/list and prompts/get, plus notifications (which return nil) and any
-// custom methods registered via WithCustomMethod.
+// prompts/list and prompts/get, plus notifications (which return nil) and,
+// when declared via WithSkillsHandlers, skills/list and skills/get.
 // Capability-gated extras that ToolHive does not use over this path (logging
 // setLevel, subscribe/unsubscribe, completion, tasks) return METHOD_NOT_FOUND.
 func (s *MCPServer) HandleMessage(ctx context.Context, message json.RawMessage) mcp.JSONRPCMessage {
@@ -79,10 +79,11 @@ func (s *MCPServer) dispatch(ctx context.Context, method string, id any, message
 		return successResponse(id, s.handleListPrompts())
 	case string(mcp.MethodPromptsGet):
 		return s.handleGetPrompt(ctx, id, message)
+	case string(mcp.MethodSkillsList):
+		return s.handleListSkills(ctx, id, message)
+	case string(mcp.MethodSkillsGet):
+		return s.handleGetSkill(ctx, id, message)
 	default:
-		if resp, ok := s.handleCustomMethod(ctx, method, id, message); ok {
-			return resp
-		}
 		return errorResponse(id, mcp.METHOD_NOT_FOUND, fmt.Sprintf("Method %s not found", method))
 	}
 }
@@ -121,15 +122,8 @@ func (s *MCPServer) buildCapabilities() mcp.ServerCapabilities {
 	if s.logging {
 		caps["logging"] = map[string]any{}
 	}
-	if len(s.extensions) > 0 {
-		extensions := make(map[string]any, len(s.extensions))
-		for name, settings := range s.extensions {
-			if settings == nil {
-				settings = map[string]any{}
-			}
-			extensions[name] = settings
-		}
-		caps["extensions"] = extensions
+	if settings, ok := s.skillsExtension(); ok {
+		caps["extensions"] = map[string]any{mcp.ExtensionSkills: settings}
 	}
 
 	var out mcp.ServerCapabilities
