@@ -293,6 +293,9 @@ func (c *Client) Initialize(ctx context.Context, request mcp.InitializeRequest) 
 	}
 
 	gc := gosdk.NewClient(impl, opts)
+	if err := registerSkillsMethods(gc); err != nil {
+		return nil, err
+	}
 
 	tr, err := c.buildTransport()
 	if err != nil {

@@ -17,7 +17,8 @@
 // The global registration path (AddTool/AddResource/AddResourceTemplate/
 // AddPrompt served over the stdio and HTTP transports), the completion handler
 // (WithCompletionHandler) and the resource subscribe/unsubscribe handlers
-// (WithSubscribeHandlers) are functional and tested. The per-session interfaces
+// (WithSubscribeHandlers) and the Skills extension (WithSkillsHandlers; mcp-go
+// has no equivalent) are functional and tested. The per-session interfaces
 // (SessionWithTools, SessionWithResources, SessionWithResourceTemplates,
 // SessionWithPrompts, SessionWithElicitation, SessionIdManager) and the Hooks
 // type are implemented and wired: per-session
@@ -184,6 +185,17 @@ type MCPServer struct {
 	subscribeHandler   SubscribeHandlerFunc
 	unsubscribeHandler SubscribeHandlerFunc
 
+	// skillsDeclared records that WithSkillsHandlers was invoked, which
+	// declares the Skills extension; listSkills/getSkill answer skills/list
+	// and skills/get. directoryReadDeclared records WithDirectoryReadHandler,
+	// which adds directoryRead and answers resources/directory/read with
+	// readDirectory. buildServer fails on a missing handler (validateSkills).
+	skillsDeclared        bool
+	listSkills            ListSkillsHandlerFunc
+	getSkill              GetSkillHandlerFunc
+	directoryReadDeclared bool
+	readDirectory         ReadDirectoryHandlerFunc
+
 	mu                sync.RWMutex
 	tools             map[string]ServerTool
 	resources         map[string]ServerResource
@@ -326,6 +338,9 @@ func (s *MCPServer) serverCapabilities() *gosdk.ServerCapabilities {
 	}
 	if s.logging {
 		caps.Logging = &gosdk.LoggingCapabilities{}
+	}
+	if settings, ok := s.skillsExtension(); ok {
+		caps.AddExtension(mcp.ExtensionSkills, settings)
 	}
 	return caps
 }
@@ -636,6 +651,9 @@ func (s *MCPServer) buildServer(genSessionID func() string, stateless bool) (*go
 	srv = gosdk.NewServer(impl, opts)
 
 	if err := s.registerGlobalFeatures(srv, tools, resources, prompts, resourceTemplates); err != nil {
+		return nil, err
+	}
+	if err := s.registerSkills(srv); err != nil {
 		return nil, err
 	}
 

@@ -30,7 +30,9 @@ func (*MCPServer) WithContext(ctx context.Context, session ClientSession) contex
 // registration state the go-sdk server is built from — so behavior matches
 // mcp-go for the methods ToolHive exercises: initialize, ping, tools/list,
 // tools/call, resources/list, resources/templates/list, resources/read,
-// prompts/list and prompts/get, plus notifications (which return nil).
+// prompts/list and prompts/get, plus notifications (which return nil) and,
+// when declared via WithSkillsHandlers, skills/list and skills/get (and
+// resources/directory/read with WithDirectoryReadHandler).
 // Capability-gated extras that ToolHive does not use over this path (logging
 // setLevel, subscribe/unsubscribe, completion, tasks) return METHOD_NOT_FOUND.
 func (s *MCPServer) HandleMessage(ctx context.Context, message json.RawMessage) mcp.JSONRPCMessage {
@@ -79,6 +81,9 @@ func (s *MCPServer) dispatch(ctx context.Context, method string, id any, message
 	case string(mcp.MethodPromptsGet):
 		return s.handleGetPrompt(ctx, id, message)
 	default:
+		if resp, ok := s.dispatchSkills(ctx, method, id, message); ok {
+			return resp
+		}
 		return errorResponse(id, mcp.METHOD_NOT_FOUND, fmt.Sprintf("Method %s not found", method))
 	}
 }
@@ -105,7 +110,7 @@ func (s *MCPServer) buildCapabilities() mcp.ServerCapabilities {
 	if nTools > 0 || s.toolListChanged {
 		caps["tools"] = map[string]any{listChangedKey: s.toolListChanged}
 	}
-	if nResources > 0 || s.resourceListChanged || s.resourceSubscribe {
+	if nResources > 0 || s.resourcesDeclared || s.resourceListChanged || s.resourceSubscribe {
 		caps["resources"] = map[string]any{
 			listChangedKey: s.resourceListChanged,
 			"subscribe":    s.resourceSubscribe,
@@ -116,6 +121,9 @@ func (s *MCPServer) buildCapabilities() mcp.ServerCapabilities {
 	}
 	if s.logging {
 		caps["logging"] = map[string]any{}
+	}
+	if settings, ok := s.skillsExtension(); ok {
+		caps["extensions"] = map[string]any{mcp.ExtensionSkills: settings}
 	}
 
 	var out mcp.ServerCapabilities
