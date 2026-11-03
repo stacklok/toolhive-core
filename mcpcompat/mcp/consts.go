@@ -3,6 +3,11 @@
 
 package mcp
 
+import gosdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+// MetaKeyServerInfo is the metadata key for server implementation information.
+const MetaKeyServerInfo = gosdk.MetaKeyServerInfo
+
 // MCPMethod is the type of MCP method-name constants.
 // MCPMethod is the type of MCP method-name constants.
 //

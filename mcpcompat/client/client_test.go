@@ -292,7 +292,7 @@ func TestInitialize_StatefulServerNegotiatesLegacyProtocolVersion(t *testing.T) 
 		},
 	})
 	require.NoError(t, err)
-	// go-sdk v1.7's discover-first Connect must still fall back to the legacy
+	// go-sdk's discover-first Connect must still fall back to the legacy
 	// handshake and negotiate the shim-owned 2025-11-25 constant against a
 	// stateful server.
 	assert.Equal(t, mcp.LATEST_PROTOCOL_VERSION, initRes.ProtocolVersion)

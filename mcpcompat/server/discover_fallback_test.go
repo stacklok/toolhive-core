@@ -137,7 +137,7 @@ func TestDiscoverFallback_ExtraSessionOnStatefulServer(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Despite go-sdk v1.7 defaulting to the discover-first Connect, a stateful
+	// Despite go-sdk defaulting to the discover-first Connect, a stateful
 	// server must still negotiate down to the shim-owned legacy constant.
 	assert.Equal(t, mcp.LATEST_PROTOCOL_VERSION, initRes.ProtocolVersion)
 
@@ -170,7 +170,7 @@ func TestDiscoverFallback_ExtraSessionOnStatefulServer(t *testing.T) {
 	// either side (go-sdk's own session AND this shim's placeholder record
 	// for it) — that is the orphan this test guards against.
 	assert.EqualValues(t, 2, mgr.generateCalls.Load(),
-		"go-sdk v1.7's discover-then-fallback Connect must mint exactly two session IDs "+
+		"go-sdk's discover-then-fallback Connect must mint exactly two session IDs "+
 			"against a stateful server: one abandoned by the failed discover probe, "+
 			"one for the legacy initialize that actually succeeds")
 	assert.EqualValues(t, 1, mgr.terminateCalls.Load(),
