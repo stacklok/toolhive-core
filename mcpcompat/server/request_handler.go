@@ -63,7 +63,7 @@ func (s *MCPServer) HandleMessage(ctx context.Context, message json.RawMessage) 
 func (s *MCPServer) dispatch(ctx context.Context, method string, id any, message json.RawMessage) mcp.JSONRPCMessage {
 	switch method {
 	case string(mcp.MethodInitialize):
-		return successResponse(id, s.handleInitialize())
+		return successResponse(id, s.handleInitialize(ctx))
 	case string(mcp.MethodPing):
 		return successResponse(id, mcp.EmptyResult{})
 	case string(mcp.MethodToolsList):
@@ -88,11 +88,12 @@ func (s *MCPServer) dispatch(ctx context.Context, method string, id any, message
 	}
 }
 
-func (s *MCPServer) handleInitialize() mcp.InitializeResult {
+func (s *MCPServer) handleInitialize(ctx context.Context) mcp.InitializeResult {
 	return mcp.InitializeResult{
 		ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
 		ServerInfo:      mcp.Implementation{Name: s.name, Version: s.version},
 		Capabilities:    s.buildCapabilities(),
+		Instructions:    s.instructionsFor(ctx),
 	}
 }
 
