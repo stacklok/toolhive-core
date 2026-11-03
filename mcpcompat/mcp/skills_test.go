@@ -120,3 +120,38 @@ func TestReadDirectoryResult_JSONMatchesSpecExample(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, wire, string(out))
 }
+
+func TestSkillsResults_EmptyListsEncodeAsArrays(t *testing.T) {
+	t.Parallel()
+
+	// The extension defines both as arrays; a nil slice must not encode as
+	// null. Pagination and _meta are unaffected.
+	list, err := json.Marshal(ListSkillsResult{})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"skills":[]}`, string(list))
+
+	page := ListSkillsResult{}
+	page.NextCursor = "n"
+	list, err = json.Marshal(page)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"skills":[],"nextCursor":"n"}`, string(list))
+
+	dir, err := json.Marshal(ReadDirectoryResult{})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"resources":[]}`, string(dir))
+}
+
+func TestSkillFrontmatter_KeepsNumberPrecision(t *testing.T) {
+	t.Parallel()
+
+	// 2^53 + 1 cannot be represented as a float64; decoding into map[string]any
+	// without json.Number would round it to 9007199254740992.
+	const wire = `{"name":"n","description":"d","metadata":{"build":9007199254740993,"ratio":0.1}}`
+	var fm SkillFrontmatter
+	require.NoError(t, json.Unmarshal([]byte(wire), &fm))
+
+	out, err := json.Marshal(fm)
+	require.NoError(t, err)
+	assert.JSONEq(t, wire, string(out))
+	assert.Contains(t, string(out), "9007199254740993")
+}

@@ -250,6 +250,63 @@ func TestSkills_DirectoryReadMisconfiguredFailsBuild(t *testing.T) {
 	}
 }
 
+// TestSkills_StdioEdgeCases checks that the stdio bridge answers as the
+// go-sdk path does for a misconfigured extension, an empty listing, a handler
+// returning (nil, nil) and a panicking handler.
+func TestSkills_StdioEdgeCases(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	decode := func(t *testing.T, msg mcp.JSONRPCMessage) map[string]any {
+		t.Helper()
+		b, err := json.Marshal(msg)
+		require.NoError(t, err)
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(b, &out))
+		return out
+	}
+	const initialize = `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`
+
+	// A misconfigured extension is not advertised: the bridge has no build
+	// step to fail, so it must not declare methods it will not answer.
+	misconfigured := server.NewMCPServer("compat-server", "1.2.3", server.WithSkillsHandlers(
+		func(context.Context, mcp.ListSkillsRequest) (*mcp.ListSkillsResult, error) {
+			return &mcp.ListSkillsResult{}, nil
+		},
+		nil,
+	))
+	init := decode(t, misconfigured.HandleMessage(ctx, json.RawMessage(initialize)))
+	assert.NotContains(t, init["result"].(map[string]any)["capabilities"], "extensions")
+
+	srv := server.NewMCPServer("compat-server", "1.2.3",
+		server.WithResourceCapabilities(false, false),
+		server.WithSkillsHandlers(
+			func(context.Context, mcp.ListSkillsRequest) (*mcp.ListSkillsResult, error) {
+				return &mcp.ListSkillsResult{}, nil
+			},
+			func(context.Context, mcp.GetSkillRequest) (*mcp.GetSkillResult, error) {
+				return nil, nil
+			},
+		),
+		server.WithDirectoryReadHandler(func(context.Context, mcp.ReadDirectoryRequest) (*mcp.ReadDirectoryResult, error) {
+			panic("boom")
+		}),
+	)
+
+	// An empty listing encodes as an empty array, not null.
+	b, err := json.Marshal(srv.HandleMessage(ctx, json.RawMessage(`{"jsonrpc":"2.0","id":2,"method":"skills/list"}`)))
+	require.NoError(t, err)
+	assert.Contains(t, string(b), `"skills":[]`)
+
+	nilResult := decode(t, srv.HandleMessage(ctx, json.RawMessage(
+		`{"jsonrpc":"2.0","id":3,"method":"skills/get","params":{"uri":"skill://a/SKILL.md"}}`)))
+	assert.Equal(t, float64(mcp.INTERNAL_ERROR), nilResult["error"].(map[string]any)["code"])
+
+	panicked := decode(t, srv.HandleMessage(ctx, json.RawMessage(
+		`{"jsonrpc":"2.0","id":4,"method":"resources/directory/read","params":{"uri":"skill://a"}}`)))
+	assert.Equal(t, float64(mcp.INTERNAL_ERROR), panicked["error"].(map[string]any)["code"])
+}
+
 // TestSkills_StdioHandleMessage checks the stdio HandleMessage bridge, which
 // dispatches without a go-sdk server.
 func TestSkills_StdioHandleMessage(t *testing.T) {
@@ -269,6 +326,9 @@ func TestSkills_StdioHandleMessage(t *testing.T) {
 	init := decode(t, srv.HandleMessage(ctx, json.RawMessage(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)))
 	caps := init["result"].(map[string]any)["capabilities"].(map[string]any)
 	assert.Equal(t, map[string]any{mcp.ExtensionSkills: map[string]any{}}, caps["extensions"])
+	// The extension requires Resources. skillsServer declares them with
+	// WithResourceCapabilities but registers none, as the go-sdk path allows.
+	assert.Contains(t, caps, "resources")
 
 	list := decode(t, srv.HandleMessage(ctx, json.RawMessage(
 		`{"jsonrpc":"2.0","id":2,"method":"skills/list","params":{"cursor":"x"}}`)))

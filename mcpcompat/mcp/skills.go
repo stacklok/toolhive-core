@@ -60,6 +60,17 @@ type ListSkillsResult struct {
 	Skills []Skill `json:"skills"`
 }
 
+// MarshalJSON encodes a nil Skills as an empty array: the extension defines
+// skills as an array, and a handler with nothing to list naturally returns a
+// nil slice.
+func (r ListSkillsResult) MarshalJSON() ([]byte, error) {
+	type plain ListSkillsResult
+	if r.Skills == nil {
+		r.Skills = []Skill{}
+	}
+	return json.Marshal(plain(r))
+}
+
 // GetSkillRequest is a skills/get request.
 type GetSkillRequest struct {
 	Request
@@ -112,17 +123,45 @@ type ReadDirectoryResult struct {
 	Resources []Resource `json:"resources"`
 }
 
+// MarshalJSON encodes a nil Resources as an empty array: the extension
+// requires an empty directory to yield an empty resources array.
+func (r ReadDirectoryResult) MarshalJSON() ([]byte, error) {
+	type plain ReadDirectoryResult
+	if r.Resources == nil {
+		r.Resources = []Resource{}
+	}
+	return json.Marshal(plain(r))
+}
+
 // Skill is a skill entry, as skills/list and skills/get return it.
 type Skill struct {
 	// URI is the resource URI of the skill's SKILL.md. Its final path segment
 	// before SKILL.md equals Frontmatter["name"].
 	URI string `json:"uri"`
-	// Frontmatter is the SKILL.md YAML frontmatter rendered as JSON, verbatim.
-	// It always holds name and description; every other field the author
-	// wrote passes through.
-	Frontmatter map[string]any `json:"frontmatter"`
+	// Frontmatter is the SKILL.md YAML frontmatter rendered as JSON.
+	Frontmatter SkillFrontmatter `json:"frontmatter"`
 	// Resources lists the skill's files, or marks its content as dynamic.
 	Resources SkillResources `json:"resources"`
+}
+
+// SkillFrontmatter is a SKILL.md's YAML frontmatter rendered as a JSON object.
+// The extension requires it to be identical in content to the SKILL.md's
+// frontmatter: it always holds name and description, and every other field
+// the author wrote passes through. Decoding keeps every field and value,
+// decoding numbers as json.Number so none loses precision; the order of keys
+// is not kept, which content identity does not require.
+type SkillFrontmatter map[string]any
+
+// UnmarshalJSON decodes a frontmatter object, keeping numbers as json.Number.
+func (f *SkillFrontmatter) UnmarshalJSON(data []byte) error {
+	var fields map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&fields); err != nil {
+		return fmt.Errorf("skill frontmatter: %w", err)
+	}
+	*f = fields
+	return nil
 }
 
 // SkillResources is the resources member of a skill entry, which is either

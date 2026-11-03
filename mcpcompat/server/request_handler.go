@@ -110,7 +110,7 @@ func (s *MCPServer) buildCapabilities() mcp.ServerCapabilities {
 	if nTools > 0 || s.toolListChanged {
 		caps["tools"] = map[string]any{listChangedKey: s.toolListChanged}
 	}
-	if nResources > 0 || s.resourceListChanged || s.resourceSubscribe {
+	if nResources > 0 || s.resourcesDeclared || s.resourceListChanged || s.resourceSubscribe {
 		caps["resources"] = map[string]any{
 			listChangedKey: s.resourceListChanged,
 			"subscribe":    s.resourceSubscribe,

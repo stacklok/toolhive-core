@@ -119,9 +119,11 @@ type (
 )
 
 // skillsExtension returns the settings the Skills extension is advertised
-// with, and whether it is declared at all.
+// with, and whether it is declared at all. A misconfigured extension (see
+// validateSkills) is not advertised, so the stdio bridge, which has no build
+// step to fail, never declares methods it will not answer.
 func (s *MCPServer) skillsExtension() (map[string]any, bool) {
-	if !s.skillsDeclared {
+	if !s.skillsDeclared || s.validateSkills() != nil {
 		return nil, false
 	}
 	if s.directoryReadDeclared {
@@ -200,12 +202,21 @@ func adaptSkillsMethod[PT any, P interface {
 		if err != nil {
 			return nil, err
 		}
+		if mres == nil {
+			return nil, errNoResult(method)
+		}
 		out := new(RT)
 		if err := jsonConvert(mres, out); err != nil {
 			return nil, fmt.Errorf("converting %s result: %w", method, err)
 		}
 		return out, nil
 	}
+}
+
+// errNoResult reports a handler that returned neither a result nor an error,
+// which no method of the extension allows.
+func errNoResult(method mcp.MCPMethod) error {
+	return fmt.Errorf("%s handler returned no result", method)
 }
 
 // dispatchSkills answers the extension's methods on the stdio HandleMessage
@@ -219,28 +230,39 @@ func (s *MCPServer) dispatchSkills(
 	}
 	switch {
 	case method == string(mcp.MethodSkillsList) && s.skillsDeclared:
-		return handleStdioSkillsMethod(ctx, id, message, s.listSkills), true
+		return handleStdioSkillsMethod(ctx, mcp.MethodSkillsList, id, message, s.listSkills), true
 	case method == string(mcp.MethodSkillsGet) && s.skillsDeclared:
-		return handleStdioSkillsMethod(ctx, id, message, s.getSkill), true
+		return handleStdioSkillsMethod(ctx, mcp.MethodSkillsGet, id, message, s.getSkill), true
 	case method == string(mcp.MethodResourcesDirectoryRead) && s.directoryReadDeclared:
-		return handleStdioSkillsMethod(ctx, id, message, s.readDirectory), true
+		return handleStdioSkillsMethod(ctx, mcp.MethodResourcesDirectoryRead, id, message, s.readDirectory), true
 	default:
 		return nil, false
 	}
 }
 
-// handleStdioSkillsMethod decodes message into the handler's request type,
-// calls it, and mirrors go-sdk's error mapping: a *jsonrpc.Error keeps its
-// code and message, any other error is an internal error carrying the error
-// text.
+// handleStdioSkillsMethod decodes message into the handler's request type and
+// calls it, answering as adaptSkillsMethod does on the go-sdk path: a handler
+// panic or a nil result is an internal error, a *jsonrpc.Error keeps its code
+// and message, and any other error is an internal error carrying the error
+// text. Unlike the bridge's other handlers, it recovers panics, so a
+// panicking skills handler fails the request on both serving paths alike.
 func handleStdioSkillsMethod[MReq, MRes any](
-	ctx context.Context, id any, message json.RawMessage, handler func(context.Context, MReq) (*MRes, error),
-) mcp.JSONRPCMessage {
+	ctx context.Context, method mcp.MCPMethod, id any, message json.RawMessage,
+	handler func(context.Context, MReq) (*MRes, error),
+) (resp mcp.JSONRPCMessage) {
 	var req MReq
 	if err := json.Unmarshal(message, &req); err != nil {
 		return errorResponse(id, mcp.INVALID_PARAMS, err.Error())
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			resp = errorResponse(id, mcp.INTERNAL_ERROR, fmt.Sprintf("panic recovered in %s handler: %v", method, r))
+		}
+	}()
 	res, err := handler(ctx, req)
+	if err == nil && res == nil {
+		err = errNoResult(method)
+	}
 	if err != nil {
 		var wireErr *jsonrpc.Error
 		if errors.As(err, &wireErr) {
