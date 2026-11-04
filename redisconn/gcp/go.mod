@@ -3,7 +3,7 @@ module github.com/stacklok/toolhive-core/redisconn/gcp
 go 1.27
 
 require (
-	github.com/stacklok/toolhive-core/redisconn v0.0.58
+	github.com/stacklok/toolhive-core/redisconn v0.0.59
 	golang.org/x/oauth2 v0.37.0
 )
 
