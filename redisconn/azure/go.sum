@@ -32,8 +32,8 @@ github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c h1:+mdjkGKdHQG3305AYmd
 github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c/go.mod h1:7rwL4CYBLnjLxUqIJNnCWiEdr3bn6IUYi15bNlnbCCU=
 github.com/redis/go-redis/v9 v9.23.0 h1:/TTVdJa8BRNsybwwGGnmiYktHNlUXtbOQxlWpHBPL3s=
 github.com/redis/go-redis/v9 v9.23.0/go.mod h1:EWP2UUk+XDaI1s5nQB5mablZN6vccXlmBQTyfnF87D0=
-github.com/stacklok/toolhive-core/redisconn v0.0.58 h1:Nq2Gx4wY99Ro/9iWhSJoHS3z9vQ872sTN+QjpiurGrI=
-github.com/stacklok/toolhive-core/redisconn v0.0.58/go.mod h1:l0B/VcdUoiaFeVaMWhMTfsiOFmuZAXfUxiHmckjE4wQ=
+github.com/stacklok/toolhive-core/redisconn v0.0.59 h1:R28wdn6gT5+uIF1Gm1lyJbOmvaoTS98gb0TYe9zADfM=
+github.com/stacklok/toolhive-core/redisconn v0.0.59/go.mod h1:l0B/VcdUoiaFeVaMWhMTfsiOFmuZAXfUxiHmckjE4wQ=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
 github.com/yuin/gopher-lua v1.1.2 h1:yF/FjE3hD65tBbt0VXLE13HWS9h34fdzJmrWRXwobGA=
