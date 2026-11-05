@@ -481,9 +481,9 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	// middleware reads it back via req.GetExtra().Header to bridge the values.
 	// Keying by nonce (not session ID) avoids the race where concurrent POSTs
 	// on the same session clobber each other's context (issue #156, item U3).
-	// The initialize POST (no session yet) carries no per-request values the
-	// handler needs; only non-initialize POSTs need bridging, but bridging
-	// initialize is harmless.
+	// The initialize POST (no session yet) is bridged too, and must stay so:
+	// WithInstructionsFunc reads the caller's identity from the bridged
+	// context when it computes the initialize (and server/discover) result.
 	nonce := crand.Text()
 	s.mcp.setPendingRequestContext(r.Context(), nonce)
 	r.Header.Set(reqNonceHeader, nonce)

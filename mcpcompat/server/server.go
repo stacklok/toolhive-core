@@ -196,6 +196,14 @@ type MCPServer struct {
 	directoryReadDeclared bool
 	readDirectory         ReadDirectoryHandlerFunc
 
+	// instructions, set via WithInstructions, is the text advertised to every
+	// client in the initialize and server/discover results (mirrors mcp-go's
+	// WithInstructions). instructionsFunc, set via WithInstructionsFunc,
+	// computes that text per request from the request context instead, and
+	// wins over instructions when both are set.
+	instructions     string
+	instructionsFunc InstructionsFunc
+
 	mu                sync.RWMutex
 	tools             map[string]ServerTool
 	resources         map[string]ServerResource
@@ -439,6 +447,40 @@ func WithPageSize(n int) ServerOption {
 	}
 }
 
+// InstructionsFunc computes the server instructions to advertise for one
+// request. ctx is the request context: on the Streamable HTTP transport it
+// carries whatever WithHTTPContextFunc stored (ToolHive stores the caller's
+// identity there), so the text can differ per caller. An empty result omits
+// the field, exactly as an unset WithInstructions does.
+type InstructionsFunc func(ctx context.Context) string
+
+// WithInstructions sets the server instructions advertised to every client in
+// the initialize and server/discover results (mirrors mcp-go's
+// WithInstructions). The default, an empty string, omits the field.
+func WithInstructions(instructions string) ServerOption {
+	return func(s *MCPServer) { s.instructions = instructions }
+}
+
+// WithInstructionsFunc computes the server instructions per request instead of
+// once at construction. go-sdk copies ServerOptions.Instructions verbatim into
+// every initialize and server/discover result and offers no per-session hook,
+// so the shim overwrites the field on the result after go-sdk built it (see
+// applyInstructionsFunc). An aggregator uses this to advertise only the
+// instructions of the backends the calling identity may reach. When both
+// options are set the func wins; a nil fn leaves WithInstructions in force.
+func WithInstructionsFunc(fn InstructionsFunc) ServerOption {
+	return func(s *MCPServer) { s.instructionsFunc = fn }
+}
+
+// instructionsFor returns the instructions to advertise for ctx: the
+// per-request func when one is set, else the static text.
+func (s *MCPServer) instructionsFor(ctx context.Context) string {
+	if s.instructionsFunc != nil {
+		return s.instructionsFunc(ctx)
+	}
+	return s.instructions
+}
+
 // AddTool registers a tool and its handler.
 func (s *MCPServer) AddTool(tool mcp.Tool, handler ToolHandlerFunc) {
 	s.mu.Lock()
@@ -602,6 +644,9 @@ func (s *MCPServer) buildServer(genSessionID func() string, stateless bool) (*go
 	var srv *gosdk.Server
 	opts := &gosdk.ServerOptions{
 		Logger: s.logger,
+		// The static text; applyInstructionsFunc overrides it per request when
+		// WithInstructionsFunc is set.
+		Instructions: s.instructions,
 		// PageSize configures list pagination. A zero value leaves go-sdk's
 		// DefaultPageSize (1000) in place, preserving the pre-existing behavior
 		// for callers that do not set WithPageSize.
@@ -874,6 +919,7 @@ func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server, stateless bool)
 			// an HTTP Cache-Control header.
 			if err == nil {
 				s.stripPublicCacheScope(res)
+				s.applyInstructionsFunc(ctx, method, res)
 			}
 			if err != nil && method == string(mcp.MethodToolsCall) {
 				err = translateUnknownToolError(err, req)
@@ -890,6 +936,31 @@ func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server, stateless bool)
 				s.registerAndSync(ctx, ss, srv)
 			}
 			return res, err
+		}
+	}
+}
+
+// methodServerDiscover is the SEP-2575 server/discover method. go-sdk keeps
+// its own constant unexported, so name it here.
+const methodServerDiscover = "server/discover"
+
+// applyInstructionsFunc replaces the instructions go-sdk copied from
+// ServerOptions.Instructions on an initialize or server/discover result with
+// the per-request text of WithInstructionsFunc. It is a result rewrite like
+// stripPublicCacheScope, for the same reason: go-sdk exposes no per-session
+// hook for the field. Without a func the static text stays as go-sdk set it.
+func (s *MCPServer) applyInstructionsFunc(ctx context.Context, method string, res gosdk.Result) {
+	if s.instructionsFunc == nil {
+		return
+	}
+	switch r := res.(type) {
+	case *gosdk.InitializeResult:
+		if method == string(mcp.MethodInitialize) && r != nil {
+			r.Instructions = s.instructionsFunc(ctx)
+		}
+	case *gosdk.DiscoverResult:
+		if method == methodServerDiscover && r != nil {
+			r.Instructions = s.instructionsFunc(ctx)
 		}
 	}
 }
