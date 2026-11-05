@@ -203,3 +203,36 @@ func TestClientSession_NegotiatedProtocolVersion_UnknownWhenNotObserved(t *testi
 		assert.Empty(t, obs.version, "an unknown version must be empty")
 	})
 }
+
+// TestClientSession_NegotiatedProtocolVersion_KnownInRegisterHook pins that
+// the version is recorded before OnRegisterSession hooks run, so a hook can
+// read it on the session it is handed.
+func TestClientSession_NegotiatedProtocolVersion_KnownInRegisterHook(t *testing.T) {
+	t.Parallel()
+
+	seen := make(chan versionObservation, 1)
+	hooks := &server.Hooks{}
+	hooks.AddOnRegisterSession(func(_ context.Context, s server.ClientSession) {
+		var obs versionObservation
+		if swv, ok := s.(server.SessionWithProtocolVersion); ok {
+			obs.implements = true
+			obs.version, obs.known = swv.NegotiatedProtocolVersion()
+		}
+		seen <- obs
+	})
+	mcpSrv := server.NewMCPServer("hook", "1.0.0", server.WithHooks(hooks))
+	ts := httptest.NewServer(server.NewStreamableHTTPServer(mcpSrv))
+	defer ts.Close()
+
+	_, answered := initSessionWithVersion(t, ts.URL, "2025-06-18")
+
+	select {
+	case obs := <-seen:
+		require.True(t, obs.implements, "session must implement SessionWithProtocolVersion")
+		require.True(t, obs.known, "the version must be known by the time OnRegisterSession runs")
+		assert.Equal(t, "2025-06-18", obs.version)
+		assert.Equal(t, answered, obs.version, "must match the version the client was told at initialize")
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "OnRegisterSession hook did not run")
+	}
+}
