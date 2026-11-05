@@ -106,6 +106,10 @@ type clientSession struct {
 	// client capabilities are reported as known only while it is the session
 	// currently bound in goSession; see DeclaredClientCapabilities.
 	initializedOn atomic.Pointer[gosdk.ServerSession]
+	// negotiated is the protocol version go-sdk answered this instance's
+	// initialize with, and the go-sdk session that answered it (set by
+	// recordNegotiatedProtocolVersion); see NegotiatedProtocolVersion.
+	negotiated atomic.Pointer[negotiatedProtocolVersion]
 
 	// owner and boundServer are set when the session's go-sdk server is bound
 	// (at registration). They let SetSessionTools/SetSessionResources/
