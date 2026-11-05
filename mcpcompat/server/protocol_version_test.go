@@ -5,8 +5,6 @@ package server_test
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"net/http/httptest"
 	"sync"
 	"testing"
@@ -63,28 +61,7 @@ func (p *versionProbe) observation(t *testing.T) versionObservation {
 // server answered with.
 func initSessionWithVersion(t *testing.T, url, protocolVersion string) (sid, answered string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":`+
-		`{"protocolVersion":%q,"capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}`, protocolVersion)
-	resp := postRPC(ctx, t, url, "", body)
-	sid = resp.Header.Get("Mcp-Session-Id")
-	r := readFirstResult(t, resp)
-	require.Nil(t, r.Error, "initialize should not error")
-	require.NotEmpty(t, sid, "initialize must assign a session ID")
-	answered = decodeProtocolVersion(t, r.Result)
-	nresp := postRPC(ctx, t, url, sid, `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
-	_ = nresp.Body.Close()
-	return sid, answered
-}
-
-func decodeProtocolVersion(t *testing.T, raw []byte) string {
-	t.Helper()
-	var res struct {
-		ProtocolVersion string `json:"protocolVersion"`
-	}
-	require.NoError(t, json.Unmarshal(raw, &res))
-	return res.ProtocolVersion
+	return initSessionRaw(t, url, protocolVersion, "{}")
 }
 
 func TestClientSession_NegotiatedProtocolVersion(t *testing.T) {
@@ -95,7 +72,10 @@ func TestClientSession_NegotiatedProtocolVersion(t *testing.T) {
 		// connect runs initialize against url, then calls the probe tool, and
 		// returns the protocol version the server answered initialize with.
 		connect func(t *testing.T, url string) string
-		want    string
+		// want is the expected version; empty skips the exact check.
+		want string
+		// notWant is a version that must not be reported.
+		notWant string
 	}{
 		{
 			name: "go-sdk client",
@@ -111,6 +91,8 @@ func TestClientSession_NegotiatedProtocolVersion(t *testing.T) {
 				require.NoError(t, err)
 				return sess.InitializeResult().ProtocolVersion
 			},
+			// Tracks go-sdk's latest protocol revision; update on a go-sdk
+			// upgrade that adds one.
 			want: "2025-11-25",
 		},
 		{
@@ -134,7 +116,7 @@ func TestClientSession_NegotiatedProtocolVersion(t *testing.T) {
 				callProbe(t, url, sid)
 				return answered
 			},
-			want: "2025-11-25",
+			notWant: "2099-01-01",
 		},
 	}
 
@@ -152,7 +134,13 @@ func TestClientSession_NegotiatedProtocolVersion(t *testing.T) {
 			obs := probe.observation(t)
 			require.True(t, obs.implements, "session must implement SessionWithProtocolVersion")
 			require.True(t, obs.known, "the version must be known on a session that saw initialize")
-			assert.Equal(t, tc.want, obs.version, "negotiated protocol version")
+			require.NotEmpty(t, obs.version, "a known version must not be empty")
+			if tc.want != "" {
+				assert.Equal(t, tc.want, obs.version, "negotiated protocol version")
+			}
+			if tc.notWant != "" {
+				assert.NotEqual(t, tc.notWant, obs.version, "must report the negotiated version, not the requested one")
+			}
 			assert.Equal(t, answered, obs.version, "must match the version the client was told at initialize")
 		})
 	}

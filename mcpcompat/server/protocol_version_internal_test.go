@@ -44,7 +44,7 @@ func TestNegotiatedProtocolVersion_UnknownStates(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			cs := newClientSession("sid")
+			cs := newClientSession(testSessionID)
 			t.Cleanup(func() { close(cs.notifCh) })
 			if tc.bound != nil {
 				cs.goSession.Store(tc.bound)
