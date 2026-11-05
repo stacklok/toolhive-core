@@ -28,6 +28,7 @@ var (
 	_ SessionWithPrompts            = (*clientSession)(nil)
 	_ SessionWithElicitation        = (*clientSession)(nil)
 	_ SessionWithClientCapabilities = (*clientSession)(nil)
+	_ SessionWithProtocolVersion    = (*clientSession)(nil)
 )
 
 func TestClientSession_Store(t *testing.T) {

@@ -887,6 +887,9 @@ func (s *MCPServer) sessionDispatchMiddleware(srv *gosdk.Server, stateless bool)
 			// dispatch's session into the shared registry, defeating the same
 			// isolation guarantee bindSessionForDispatch enforces below.
 			if err == nil && method == string(mcp.MethodInitialize) && ss != nil && !stateless {
+				// Record the negotiated version before registering, so an
+				// OnRegisterSession hook can already read it.
+				s.recordNegotiatedProtocolVersion(ss, res)
 				s.registerAndSync(ctx, ss, srv)
 			}
 			return res, err

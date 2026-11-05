@@ -5,6 +5,7 @@ package server_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -56,21 +57,35 @@ func (p *capsProbe) observation(t *testing.T) capsObservation {
 	return *p.seen
 }
 
-// initSessionWithCaps runs the initialize handshake against url, declaring
-// capsJSON as the client capabilities, and returns the assigned session ID.
-func initSessionWithCaps(t *testing.T, url, capsJSON string) string {
+// initSessionRaw runs the initialize handshake against url, requesting
+// protocolVersion and declaring capsJSON as the client capabilities, and
+// returns the assigned session ID and the version the server answered with.
+func initSessionRaw(t *testing.T, url, protocolVersion, capsJSON string) (sid, answered string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":`+
-		`{"protocolVersion":"2025-06-18","capabilities":%s,"clientInfo":{"name":"test","version":"1.0"}}}`, capsJSON)
+		`{"protocolVersion":%q,"capabilities":%s,"clientInfo":{"name":"test","version":"1.0"}}}`,
+		protocolVersion, capsJSON)
 	resp := postRPC(ctx, t, url, "", body)
-	sid := resp.Header.Get("Mcp-Session-Id")
+	sid = resp.Header.Get("Mcp-Session-Id")
 	r := readFirstResult(t, resp)
 	require.Nil(t, r.Error, "initialize should not error")
 	require.NotEmpty(t, sid, "initialize must assign a session ID")
+	var res struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	require.NoError(t, json.Unmarshal(r.Result, &res))
 	nresp := postRPC(ctx, t, url, sid, `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
 	_ = nresp.Body.Close()
+	return sid, res.ProtocolVersion
+}
+
+// initSessionWithCaps runs the initialize handshake against url, declaring
+// capsJSON as the client capabilities, and returns the assigned session ID.
+func initSessionWithCaps(t *testing.T, url, capsJSON string) string {
+	t.Helper()
+	sid, _ := initSessionRaw(t, url, "2025-06-18", capsJSON)
 	return sid
 }
 
