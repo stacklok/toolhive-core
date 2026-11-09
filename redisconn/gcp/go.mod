@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/stacklok/toolhive-core/redisconn v0.0.59
-	golang.org/x/oauth2 v0.37.0
+	golang.org/x/oauth2 v0.38.0
 )
 
 require (
