@@ -5,9 +5,11 @@ package postgres
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"time"
 
@@ -118,12 +120,19 @@ func NewPool(ctx context.Context, cfg *Config, opts ...Option) (*pgxpool.Pool, e
 	return pool, nil
 }
 
+// bootHost is the placeholder host of the DSN buildPoolConfig parses before
+// assigning the real target.
+const bootHost = "localhost"
+
 // buildPoolConfig assembles a *pgxpool.Config without exposing
 // caller-controlled fields to URL parsing. SSL configuration is bootstrapped
 // from a minimal DSN — sslmode is the one field that pgx must translate into
 // a *tls.Config — and the connection target is then assigned structurally.
 // This eliminates the DSN-injection paths that would otherwise let a `@` in
 // Host or a `?` in Database shift the authority or query section of the URL.
+//
+// pgx derives the TLS server name and the allow/prefer fallback attempt from
+// the host it parses, so both are pointed at cfg.Host as well.
 func buildPoolConfig(cfg *Config) (*pgxpool.Config, error) {
 	sslMode := cfg.SSLMode
 	if sslMode == "" {
@@ -132,19 +141,42 @@ func buildPoolConfig(cfg *Config) (*pgxpool.Config, error) {
 
 	// SSLMode values are constrained by pgx (disable/allow/prefer/require/
 	// verify-ca/verify-full); url.QueryEscape is belt-and-suspenders.
-	bootDSN := "postgres://localhost?sslmode=" + url.QueryEscape(sslMode)
+	bootDSN := "postgres://" + bootHost + "?sslmode=" + url.QueryEscape(sslMode)
 	pc, err := pgxpool.ParseConfig(bootDSN)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize pool config: %w", err)
 	}
 
+	port := uint16(cfg.Port) //nolint:gosec // G115: Port is bounded by Validate (1..65535).
 	pc.ConnConfig.Host = cfg.Host
-	pc.ConnConfig.Port = uint16(cfg.Port) //nolint:gosec // G115: Port is bounded by Validate (1..65535).
+	pc.ConnConfig.Port = port
 	pc.ConnConfig.User = cfg.User
 	pc.ConnConfig.Password = cfg.Password
 	pc.ConnConfig.Database = cfg.Database
+	retargetTLS(pc.ConnConfig.TLSConfig, cfg.Host)
+	for _, fb := range pc.ConnConfig.Fallbacks {
+		fb.Host = cfg.Host
+		fb.Port = port
+		retargetTLS(fb.TLSConfig, cfg.Host)
+	}
 
 	return pc, nil
+}
+
+// retargetTLS replaces bootHost as the server name of a pgx-built tls.Config
+// with host, by pgx's rules: verify-full (the one mode that keeps
+// InsecureSkipVerify off) checks the certificate against host, and SNI
+// carries host unless it is an IP literal. A config pgx left without a
+// server name (PGSSLSNI=0) is kept as is.
+func retargetTLS(tlsConfig *tls.Config, host string) {
+	if tlsConfig == nil || tlsConfig.ServerName != bootHost {
+		return
+	}
+	if tlsConfig.InsecureSkipVerify && net.ParseIP(host) != nil {
+		tlsConfig.ServerName = ""
+		return
+	}
+	tlsConfig.ServerName = host
 }
 
 // applyPoolTuning copies pool-sizing knobs from cfg onto poolConfig, leaving
