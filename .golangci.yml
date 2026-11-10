@@ -40,6 +40,13 @@ linters:
           deny:
             - pkg: io/ioutil
               desc: this is deprecated
+        archived_yaml:
+          list-mode: lax
+          files:
+            - $all
+          deny:
+            - pkg: gopkg.in/yaml.v3
+              desc: archived; use go.yaml.in/yaml/v3, its maintained continuation
     gocyclo:
       min-complexity: 15
     gosec:
