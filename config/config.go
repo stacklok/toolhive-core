@@ -9,7 +9,7 @@ import (
 	"io"
 	"os"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // BaseConfig holds configuration fields common to every ToolHive-ecosystem
