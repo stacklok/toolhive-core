@@ -12,6 +12,8 @@ const (
 	testCaseMultipleBackend = "dynamic auth with more than one backend"
 	testErrMultipleBackend  = "more than one is set"
 	testSSLModeDisable      = "disable"
+	testSSLModeRequire      = "require"
+	testLoopbackHost        = "127.0.0.1"
 	testErrRegionMissing    = "AWS RDS IAM region is not configured"
 	testErrRegionConfigured = "dynamicAuth.awsRdsIam.region is required"
 	testDatabase            = "appdb"

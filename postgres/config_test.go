@@ -226,7 +226,7 @@ func TestConfig_LogValueRedactsSecrets(t *testing.T) {
 		Password:          "should-not-appear",
 		MigrationPassword: "should-not-appear-either",
 		Database:          "appdb",
-		SSLMode:           "require",
+		SSLMode:           testSSLModeRequire,
 		DynamicAuth:       &DynamicAuthConfig{AWSRDSIAM: &DynamicAuthAWSRDSIAM{Region: testRegion}},
 	}
 
