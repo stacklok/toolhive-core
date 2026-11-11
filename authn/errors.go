@@ -171,6 +171,9 @@ const (
 	// endpoint: its `typ` is on the default deny list, or it carries a `cnf`
 	// claim and Config.AllowCNF is not set.
 	ReasonTokenKind Reason = "token_kind"
+	// ReasonCheck indicates a Check rejected the token, returned an error or
+	// panicked.
+	ReasonCheck Reason = "check"
 	// ReasonScope indicates the token is valid but lacks a required scope;
 	// paired with CodeInsufficientScope.
 	ReasonScope Reason = "scope"
