@@ -14,8 +14,8 @@ github.com/klauspost/cpuid/v2 v2.4.0 h1:S6Hrbc7+ywsr0r+RLapfGBHfyefhCTwEh3A0tV91
 github.com/klauspost/cpuid/v2 v2.4.0/go.mod h1:19jmZ9mjzoF//ddRSUsv0zfBTJWh3QJh9FNxZTMrGxU=
 github.com/redis/go-redis/v9 v9.23.0 h1:/TTVdJa8BRNsybwwGGnmiYktHNlUXtbOQxlWpHBPL3s=
 github.com/redis/go-redis/v9 v9.23.0/go.mod h1:EWP2UUk+XDaI1s5nQB5mablZN6vccXlmBQTyfnF87D0=
-github.com/stacklok/toolhive-core/redisconn v0.0.59 h1:R28wdn6gT5+uIF1Gm1lyJbOmvaoTS98gb0TYe9zADfM=
-github.com/stacklok/toolhive-core/redisconn v0.0.59/go.mod h1:l0B/VcdUoiaFeVaMWhMTfsiOFmuZAXfUxiHmckjE4wQ=
+github.com/stacklok/toolhive-core/redisconn v0.0.60 h1:YXsCaGPxCdI1nYs9RFOsRBMLodFwRHlTPf5g36aphd0=
+github.com/stacklok/toolhive-core/redisconn v0.0.60/go.mod h1:Hzo6kAhpTn7ta5GsX4P+ebXVH0lQPWLIVyD6CHBu7lA=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
 github.com/yuin/gopher-lua v1.1.2 h1:yF/FjE3hD65tBbt0VXLE13HWS9h34fdzJmrWRXwobGA=
