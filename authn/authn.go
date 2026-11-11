@@ -181,6 +181,11 @@ type Config struct {
 	// not verify.
 	AllowCNF bool
 
+	// MaxRemainingLifetime rejects a token whose exp is more than this far
+	// after the time of validation, with ReasonLifetime. Unlike MaxTokenLifetime
+	// it does not need iat. Zero disables it; negative is an error.
+	MaxRemainingLifetime time.Duration
+
 	// MaxTokenLifetime rejects tokens whose exp-iat span exceeds it, when both
 	// claims are present. Negative is an error.
 	//
@@ -511,6 +516,9 @@ func (c *Config) validate() error {
 	// turn an issuer outage into an authentication outage.
 	if c.MaxJWKSStaleness < 0 {
 		return fmt.Errorf("authn: max JWKS staleness must not be negative: %s", c.MaxJWKSStaleness)
+	}
+	if c.MaxRemainingLifetime < 0 {
+		return fmt.Errorf("authn: max remaining lifetime must not be negative: %s", c.MaxRemainingLifetime)
 	}
 	return validateTypeEntries("accepted_token_types", c.AcceptedTokenTypes)
 }
