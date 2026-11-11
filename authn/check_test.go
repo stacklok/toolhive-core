@@ -51,7 +51,7 @@ func TestAcceptChecks(t *testing.T) {
 		claims := jwt.MapClaims{"nested": map[string]any{"a": "b"}}
 		mutate := CheckFunc(func(c map[string]any, got time.Time) error {
 			assert.Equal(t, now, got)
-			c["nested"].(map[string]any)["a"] = "changed"
+			c["nested"].(map[string]any)["a"] = testChanged
 			return nil
 		})
 		verify := CheckFunc(func(c map[string]any, _ time.Time) error {
