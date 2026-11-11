@@ -277,6 +277,8 @@ func TestValidateConfigAgreesWithNewValidator(t *testing.T) {
 		{"negative max JWKS staleness", func(c *Config) { c.MaxJWKSStaleness = -time.Second }},
 		{"empty accepted token type", func(c *Config) { c.AcceptedTokenTypes = []string{" "} }},
 		{"negative max remaining lifetime", func(c *Config) { c.MaxRemainingLifetime = -time.Second }},
+		{"unsupported alg", func(c *Config) { c.Algs = []string{"none"} }},
+		{"duplicate alg", func(c *Config) { c.Algs = []string{testAlgES256, testAlgES256} }},
 		{"nil check", func(c *Config) { c.Checks = []Check{nil} }},
 		{"padded accepted token type", func(c *Config) { c.AcceptedTokenTypes = []string{" at+jwt"} }},
 	}

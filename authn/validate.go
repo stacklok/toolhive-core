@@ -116,14 +116,16 @@ type Principal struct {
 	Subject string
 	// Name is the `name` claim, may be empty.
 	Name string
-	// Claims is the full verified claim set. It is the raw credential (the
-	// serialized token) that is deliberately absent, never claim data. Claims
-	// beyond iss/sub/name — e.g. the `email` claim ToolHive's claimsToIdentity
-	// uses for its display-name fallback, or an IdP-specific claim like Okta's
-	// `tsid` — are read here by consumers; they are intentionally NOT
-	// first-class fields, since the struct carries only what every resource
-	// server needs.
+	// Claims is a deep copy of the verified claim set, holding only
+	// encoding/json types. It shares no memory with the validator or any Check.
 	Claims map[string]any
+	// Scopes are the token's scopes, read from `scope` (else `scp`); nil when
+	// absent or malformed.
+	// It never includes `roles`: a Microsoft Entra app-only token has `roles` and
+	// no `scp`, so its Scopes is nil. Read `roles` from Claims.
+	Scopes []string
+	// Trust identifies the trust that verified the token; zero for a Validator.
+	Trust TrustRef
 }
 
 // ParseBearer extracts the token from an Authorization header value. The
@@ -248,7 +250,7 @@ func (v *Validator) verify(ctx context.Context, token string, now time.Time) (jw
 	if malformedErr != nil {
 		return nil, nil, &Error{Code: CodeInvalidToken, Reason: ReasonMalformed, err: malformedErr}
 	}
-	if !slices.Contains(allowedAlgs, alg) {
+	if !slices.Contains(v.algs, alg) {
 		return nil, nil, &Error{Code: CodeInvalidToken, Reason: ReasonUnsupportedAlg,
 			err: fmt.Errorf("alg %q is not in the allow-list", alg)}
 	}
@@ -313,7 +315,8 @@ func buildPrincipal(claims jwt.MapClaims) Principal {
 		Issuer:  stringClaim(claims, "iss"),
 		Subject: stringClaim(claims, "sub"),
 		Name:    stringClaim(claims, "name"),
-		Claims:  claims,
+		Claims:  deepCopy(map[string]any(claims)).(map[string]any),
+		Scopes:  parseScopes(claims),
 	}
 }
 
@@ -326,7 +329,7 @@ func (v *Validator) parserOptions(now time.Time) []jwt.ParserOption {
 	// the verified path cannot be bypassed by a header that disagrees with
 	// itself, and so the gate cannot be forgotten by a second key path.
 	opts := []jwt.ParserOption{
-		jwt.WithValidMethods(allowedAlgs),
+		jwt.WithValidMethods(v.algs),
 		// Strict base64url, no padding (RFC 7515 §2); padding-allowed decode
 		// is the WithPaddingAllowed escape hatch and is NOT enabled.
 		jwt.WithStrictDecoding(),

@@ -181,6 +181,10 @@ type Config struct {
 	// not verify.
 	AllowCNF bool
 
+	// Algs restricts the accepted signature algorithms to a subset of the
+	// default allowlist (RS/PS/ES 256/384/512). Empty means all of them.
+	Algs []string
+
 	// MaxRemainingLifetime rejects a token whose exp is more than this far
 	// after the time of validation, with ReasonLifetime. Unlike MaxTokenLifetime
 	// it does not need iat. Zero disables it; negative is an error.
@@ -312,6 +316,9 @@ type Validator struct {
 	cfg Config
 	// policy is the post-verification acceptance policy derived from cfg.
 	policy acceptPolicy
+	// algs is the accepted signature algorithms: cfg.Algs, or the default
+	// allowlist when that is empty.
+	algs []string
 	// httpClient is used for discovery and JWKS fetches. Its Transport is a
 	// limitedTransport, so every response body is capped at maxResponseBody.
 	httpClient *http.Client
@@ -386,6 +393,7 @@ func ValidateConfig(cfg Config) (Config, error) {
 	cfg.Audiences = slices.Clone(cfg.Audiences)
 	cfg.AcceptedTokenTypes = slices.Clone(cfg.AcceptedTokenTypes)
 	cfg.Checks = slices.Clone(cfg.Checks)
+	cfg.Algs = slices.Clone(cfg.Algs)
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
@@ -424,12 +432,16 @@ func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
 	v := &Validator{
 		cfg:        cfg,
 		policy:     newAcceptPolicy(cfg),
+		algs:       slices.Clone(cfg.Algs),
 		httpClient: httpClient,
 	}
 	// Deriving the lifetime context before any construction I/O guarantees a
 	// validator that can fail construction never leaks refresh goroutines:
 	// jwkfetch.NewCache starts them, so on failure the fresh cancel runs before
 	// the error return below.
+	if len(v.algs) == 0 {
+		v.algs = slices.Clone(allowedAlgs)
+	}
 	v.ctx, v.cancel = context.WithCancel(ctx)
 
 	// init is handed the LIFETIME context: jwkfetch.NewCache permanently binds the
@@ -522,8 +534,18 @@ func (c *Config) validate() error {
 	if c.MaxJWKSStaleness < 0 {
 		return fmt.Errorf("authn: max JWKS staleness must not be negative: %s", c.MaxJWKSStaleness)
 	}
+	return c.validateAcceptance()
+}
+
+// validateAcceptance checks the settings that feed the acceptance policy.
+func (c *Config) validateAcceptance() error {
 	if c.MaxRemainingLifetime < 0 {
 		return fmt.Errorf("authn: max remaining lifetime must not be negative: %s", c.MaxRemainingLifetime)
+	}
+	for i, alg := range c.Algs {
+		if !slices.Contains(allowedAlgs, alg) || slices.Contains(c.Algs[:i], alg) {
+			return fmt.Errorf("authn: algs[%d] is not a supported algorithm or repeats an earlier entry: %q", i, alg)
+		}
 	}
 	if slices.Contains(c.Checks, nil) {
 		return errors.New("authn: checks must not contain a nil entry")
