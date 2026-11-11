@@ -204,22 +204,38 @@ func ParseBearer(headerValue string) (string, error) {
 // ParseBearer for that) against the validator's issuer/audience policy and
 // JWKS key material, returning the verified Principal.
 //
-// Every failure is a *Error. The verification order is fixed so that nothing
-// touching key material runs before the algorithm gate (RFC 8725 §3.1) and
-// nothing expensive runs before the cheap structural rejects.
+// Every failure is a *Error. It reads the clock once and runs verify
+// (signature and temporal checks), then accept (audience, `typ`, `cnf`).
 func (v *Validator) Validate(ctx context.Context, token string) (Principal, error) {
+	now := time.Now()
+	claims, header, err := v.verify(ctx, token, now)
+	if err != nil {
+		return Principal{}, err
+	}
+	if err := accept(&v.policy, claims, header, now); err != nil {
+		return Principal{}, err
+	}
+	return buildPrincipal(claims), nil
+}
+
+// verify checks that token is a well-formed JWT signed by a trusted key and
+// within its validity window at now, and returns the verified claims and JOSE
+// header. Audience and `typ` are policy, checked by accept afterwards.
+//
+// Nothing touching key material runs before the algorithm gate (RFC 8725 §3.1).
+func (v *Validator) verify(ctx context.Context, token string, now time.Time) (jwt.MapClaims, map[string]any, error) {
 	// A closed validator cannot reach key material, so say so plainly rather
 	// than letting the caller discover it as a context error from deeper down.
 	if v.closed() {
-		return Principal{}, &Error{Code: CodeUnavailable, Reason: ReasonKeysUnavailable,
+		return nil, nil, &Error{Code: CodeUnavailable, Reason: ReasonKeysUnavailable,
 			err: errors.New("validator is closed")}
 	}
 	if token == "" {
-		return Principal{}, &Error{Code: CodeInvalidToken, Reason: ReasonMalformed,
+		return nil, nil, &Error{Code: CodeInvalidToken, Reason: ReasonMalformed,
 			err: errors.New("empty token")}
 	}
 	if len(token) > maxTokenLength {
-		return Principal{}, &Error{Code: CodeInvalidToken, Reason: ReasonMalformed,
+		return nil, nil, &Error{Code: CodeInvalidToken, Reason: ReasonMalformed,
 			err: fmt.Errorf("token length %d exceeds %d byte limit", len(token), maxTokenLength)}
 	}
 
@@ -230,21 +246,23 @@ func (v *Validator) Validate(ctx context.Context, token string) (Principal, erro
 	// and enforces the same allowlist on the verified path below.
 	alg, malformedErr := unverifiedAlg(token)
 	if malformedErr != nil {
-		return Principal{}, &Error{Code: CodeInvalidToken, Reason: ReasonMalformed, err: malformedErr}
+		return nil, nil, &Error{Code: CodeInvalidToken, Reason: ReasonMalformed, err: malformedErr}
 	}
 	if !slices.Contains(allowedAlgs, alg) {
-		return Principal{}, &Error{Code: CodeInvalidToken, Reason: ReasonUnsupportedAlg,
+		return nil, nil, &Error{Code: CodeInvalidToken, Reason: ReasonUnsupportedAlg,
 			err: fmt.Errorf("alg %q is not in the allow-list", alg)}
 	}
 
-	parser := jwt.NewParser(v.parserOptions()...)
+	parser := jwt.NewParser(v.parserOptions(now)...)
 
 	claims := jwt.MapClaims{}
 	// kidSeen records whether the unverified header carried a kid, so the
 	// "no candidate keys" error below can distinguish ReasonUnknownKID (kid
 	// present, not found) from ReasonSignature (kid absent, nothing matched).
 	var kidSeen bool
+	var header map[string]any
 	_, err := parser.ParseWithClaims(token, claims, func(tok *jwt.Token) (any, error) {
+		header = tok.Header
 		// RFC 7515 §4.1.11: we understand NO crit extensions, so any token
 		// whose header carries a `crit` member must be rejected. golang-jwt
 		// v5 does not inspect crit, so this is hand-written.
@@ -261,11 +279,6 @@ func (v *Validator) Validate(ctx context.Context, token string) (Principal, erro
 			return nil, &Error{Code: CodeInvalidToken, Reason: ReasonCriticalHeader,
 				err: fmt.Errorf("token header carries unsupported crit member (%d element(s))", n)}
 		}
-		// typ gate, when configured. Enforced here rather than against the
-		// unverified header so the value checked is one the signature covers.
-		if err := v.checkTokenType(tok.Header); err != nil {
-			return nil, err
-		}
 		var kid string
 		if k, ok := tok.Header["kid"].(string); ok {
 			kid = k
@@ -274,36 +287,41 @@ func (v *Validator) Validate(ctx context.Context, token string) (Principal, erro
 		return v.verificationKeys(ctx, kid, tok.Method.Alg())
 	})
 	if err != nil {
-		return Principal{}, mapParseError(err, kidSeen)
+		return nil, nil, mapParseError(err, kidSeen)
 	}
 
 	// Post-verification hand checks. These read the VERIFIED claims map only.
 	if err := v.checkLifetime(claims); err != nil {
-		return Principal{}, err
+		return nil, nil, err
 	}
 	sub, err := claims.GetSubject()
 	if err != nil || sub == "" {
-		return Principal{}, &Error{Code: CodeInvalidToken, Reason: ReasonSubject,
+		return nil, nil, &Error{Code: CodeInvalidToken, Reason: ReasonSubject,
 			err: errors.New("missing or empty sub claim")}
 	}
 
-	// Issuer comes from the VERIFIED claim rather than from Config: when
-	// Config.Issuer is set the parser has already proven they are byte-equal,
-	// and when it is empty (JWKSURL-only, iss verification disabled) the claim
-	// is the only thing that reports who actually issued the token.
+	return claims, header, nil
+}
+
+// buildPrincipal builds the Principal from verified, accepted claims.
+//
+// Issuer comes from the VERIFIED claim rather than from Config: when
+// Config.Issuer is empty (JWKSURL-only, iss verification disabled) the claim is
+// the only thing that reports who actually issued the token.
+func buildPrincipal(claims jwt.MapClaims) Principal {
 	return Principal{
 		Issuer:  stringClaim(claims, "iss"),
-		Subject: sub,
+		Subject: stringClaim(claims, "sub"),
 		Name:    stringClaim(claims, "name"),
 		Claims:  claims,
-	}, nil
+	}
 }
 
 // parserOptions builds the golang-jwt parser options for the validator's
-// configured policy. Split out of Validate to keep that function's
-// cyclomatic complexity down; the options themselves are as documented
-// inline below.
-func (v *Validator) parserOptions() []jwt.ParserOption {
+// configured policy. The parser's clock is now, so every temporal check in one
+// verification uses the same instant. Audience is not a parser option: accept
+// checks it.
+func (v *Validator) parserOptions(now time.Time) []jwt.ParserOption {
 	// The same allowlist is enforced again by the parser (WithValidMethods) so
 	// the verified path cannot be bypassed by a header that disagrees with
 	// itself, and so the gate cannot be forgotten by a second key path.
@@ -317,6 +335,7 @@ func (v *Validator) parserOptions() []jwt.ParserOption {
 		jwt.WithExpirationRequired(),
 		// iat, when present, must not be in the future beyond leeway.
 		jwt.WithIssuedAt(),
+		jwt.WithTimeFunc(func() time.Time { return now }),
 	}
 	// DisableLeeway expresses zero clock-skew tolerance explicitly: Leeway==0
 	// otherwise defaults to 60s (see Config.Leeway), which cannot itself mean
@@ -326,20 +345,11 @@ func (v *Validator) parserOptions() []jwt.ParserOption {
 	} else {
 		opts = append(opts, jwt.WithLeeway(v.cfg.Leeway))
 	}
-	// The iss and aud options are added only when configured. golang-jwt treats
-	// an empty expected issuer/audience set as "do not check" anyway, but
-	// appending conditionally keeps the disabled case explicit here rather than
-	// depending on that library behavior. Config.validate has already ensured
-	// an empty Audiences was a deliberate AllowAnyAudience choice and that an
-	// empty Issuer came with an explicit JWKSURL.
+	// The iss option is added only when configured; Config.validate has
+	// ensured an empty Issuer came with an explicit JWKSURL or KeyProvider.
 	if v.cfg.Issuer != "" {
 		// iss is compared byte-exact (OIDC Core §3.1.3.2); NO TrimSpace.
 		opts = append(opts, jwt.WithIssuer(v.cfg.Issuer))
-	}
-	if len(v.cfg.Audiences) > 0 {
-		// aud any-match against the configured set (bare string or array on
-		// the wire).
-		opts = append(opts, jwt.WithAudience(v.cfg.Audiences...))
 	}
 	return opts
 }
@@ -405,20 +415,16 @@ func mapParseError(err error, kidSeen bool) error {
 		return &Error{Code: CodeInvalidToken, Reason: ReasonIssuedInFuture, err: err}
 	case errors.Is(err, jwt.ErrTokenRequiredClaimMissing):
 		// golang-jwt raises ErrTokenRequiredClaimMissing (NOT
-		// ErrTokenInvalidIssuer/ErrTokenInvalidAudience) when a required
-		// claim is absent OR has the wrong type — e.g. a non-string/array
-		// aud surfaces as "aud claim is required". The wrapped message names
-		// the claim, which we match to map to a per-claim reason. None of
-		// these may be ReasonMalformed: that pair is the load-bearing
-		// introspection-fallback trigger (errors.go), and a signed JWT
-		// missing iss/aud/exp is a claim-policy failure, not an opaque token
-		// worth introspecting.
+		// ErrTokenInvalidIssuer) when a required claim is absent OR has the
+		// wrong type. The wrapped message names the claim, which we match to
+		// map to a per-claim reason. None of these may be ReasonMalformed:
+		// that pair is the load-bearing introspection-fallback trigger
+		// (errors.go), and a signed JWT missing iss/exp is a claim-policy
+		// failure, not an opaque token worth introspecting.
 		msg := err.Error()
 		switch {
 		case strings.Contains(msg, "iss claim is required"):
 			return &Error{Code: CodeInvalidToken, Reason: ReasonIssuer, err: err}
-		case strings.Contains(msg, "aud claim is required"):
-			return &Error{Code: CodeInvalidToken, Reason: ReasonAudience, err: err}
 		case strings.Contains(msg, "exp claim is required"):
 			return &Error{Code: CodeInvalidToken, Reason: ReasonExpirationMissing, err: err}
 		default:
@@ -426,8 +432,6 @@ func mapParseError(err error, kidSeen bool) error {
 		}
 	case errors.Is(err, jwt.ErrTokenInvalidIssuer):
 		return &Error{Code: CodeInvalidToken, Reason: ReasonIssuer, err: err}
-	case errors.Is(err, jwt.ErrTokenInvalidAudience):
-		return &Error{Code: CodeInvalidToken, Reason: ReasonAudience, err: err}
 	default:
 		// By the time mapParseError runs, unverifiedAlg (see Validate) has
 		// already rejected any structurally-invalid non-JWT BEFORE the parser
@@ -500,42 +504,6 @@ func issuedAt(claims jwt.MapClaims) (time.Time, bool) {
 	default:
 		return time.Time{}, false
 	}
-}
-
-// checkTokenType enforces Config.AcceptedTokenTypes against the token's `typ`
-// header. An empty configuration accepts anything, including a missing typ.
-//
-// A missing or non-string typ is a REJECTION once the gate is configured: the
-// point of the gate is to require a positive statement of token kind, so an
-// absent statement cannot pass it.
-func (v *Validator) checkTokenType(header map[string]any) error {
-	if len(v.cfg.AcceptedTokenTypes) == 0 {
-		return nil
-	}
-	typ, _ := header["typ"].(string)
-	got := normalizeTokenType(typ)
-	if got == "" {
-		return &Error{Code: CodeInvalidToken, Reason: ReasonTokenType,
-			err: fmt.Errorf("token has no usable typ header; %d type(s) accepted", len(v.cfg.AcceptedTokenTypes))}
-	}
-	for _, want := range v.cfg.AcceptedTokenTypes {
-		if got == normalizeTokenType(want) {
-			return nil
-		}
-	}
-	return &Error{Code: CodeInvalidToken, Reason: ReasonTokenType,
-		err: fmt.Errorf("token typ %q is not accepted", typ)}
-}
-
-// normalizeTokenType canonicalizes a JOSE `typ` media type for comparison.
-//
-// RFC 7515 §4.1.9 permits omitting an "application/" prefix when the type
-// contains no "/", and media types are case-insensitive, so "at+jwt",
-// "AT+JWT" and "application/at+jwt" all denote the same thing and must compare
-// equal.
-func normalizeTokenType(typ string) string {
-	t := strings.ToLower(strings.TrimSpace(typ))
-	return strings.TrimPrefix(t, "application/")
 }
 
 // stringClaim extracts a string claim, tolerating a missing or non-string
