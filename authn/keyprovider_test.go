@@ -12,9 +12,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -413,4 +416,86 @@ func TestDiscoveryDoesNotRetryPoisonedDocument(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.Equal(t, 1, attempts, "a poisoned discovery document must not be retried")
+}
+
+// TestProviderOnly covers Config.ProviderOnly: the provider is the only key
+// source, the issuer is never contacted, and iss is still verified.
+func TestProviderOnly(t *testing.T) {
+	t.Parallel()
+
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		http.NotFound(w, nil)
+	}))
+	t.Cleanup(srv.Close)
+
+	key := mintRSA(t, "po-1")
+	kp := &fakeKeyProvider{keys: []PublicKey{{KeyID: "po-1", Key: key.priv.Public()}}}
+	cfg := validConfig()
+	cfg.Issuer = srv.URL
+	cfg.InsecureAllowHTTP = true
+	cfg.KeyProvider = kp
+	cfg.ProviderOnly = true
+
+	v, err := NewValidator(context.Background(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(v.Close)
+	assert.Nil(t, v.httpClient, "a ProviderOnly validator builds no HTTP client")
+
+	p, err := v.Validate(context.Background(), key.mint(t, srv.URL))
+	require.NoError(t, err)
+	assert.Equal(t, testSubject, p.Subject)
+
+	_, err = v.Validate(context.Background(), key.mint(t, srv.URL, withKid("other")))
+	requireAuthnError(t, err, CodeInvalidToken, ReasonUnknownKID)
+
+	_, err = v.Validate(context.Background(), key.mint(t, "https://elsewhere.example.com"))
+	requireAuthnError(t, err, CodeInvalidToken, ReasonIssuer)
+
+	assert.Zero(t, hits.Load(), "a ProviderOnly validator must never contact the issuer")
+}
+
+func TestProviderOnlyValidation(t *testing.T) {
+	t.Parallel()
+
+	kp := &fakeKeyProvider{}
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string // empty means the config is valid
+	}{
+		{"valid", func(*Config) {}, ""},
+		{"no provider", func(c *Config) { c.KeyProvider = nil }, "requires a key provider"},
+		{"no issuer", func(c *Config) { c.Issuer = "" }, "requires an issuer"},
+		{"jwks_url", func(c *Config) { c.JWKSURL = "https://keys.example.com/jwks" }, "jwks_url must not be set"},
+		{"http client", func(c *Config) { c.HTTPClient = &http.Client{} }, "http_client must not be set"},
+		{"ca cert path", func(c *Config) { c.CACertPath = "/etc/ca.pem" }, "ca_cert_path must not be set"},
+		{"auth token file", func(c *Config) { c.AuthTokenFile = "/var/run/token" }, "auth_token_file must not be set"},
+		{"allow private ip", func(c *Config) { c.AllowPrivateIP = true }, "allow_private_ip must not be set"},
+		{"max jwks staleness", func(c *Config) { c.MaxJWKSStaleness = time.Minute }, "max_jwks_staleness must not be set"},
+		{"several fetch settings", func(c *Config) {
+			c.JWKSURL = "https://keys.example.com/jwks"
+			c.AllowPrivateIP = true
+		}, "jwks_url, allow_private_ip must not be set"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validConfig()
+			cfg.KeyProvider, cfg.ProviderOnly = kp, true
+			tt.mutate(&cfg)
+
+			_, err := ValidateConfig(cfg)
+			v, nvErr := NewValidator(context.Background(), cfg)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				require.NoError(t, nvErr)
+				v.Close()
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErr)
+			require.ErrorContains(t, nvErr, tt.wantErr, "NewValidator must agree with ValidateConfig")
+		})
+	}
 }
