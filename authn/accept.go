@@ -45,6 +45,10 @@ type acceptPolicy struct {
 	allowAnyAudience bool
 	types            typePolicy
 	allowCNF         bool
+	maxRemaining     time.Duration
+	checks           []Check
+	// profile and trustID label Check failures in the error detail.
+	profile, trustID string
 }
 
 func newAcceptPolicy(cfg Config) acceptPolicy {
@@ -53,6 +57,8 @@ func newAcceptPolicy(cfg Config) acceptPolicy {
 		allowAnyAudience: cfg.AllowAnyAudience,
 		types:            typePolicy{allow: cfg.AcceptedTokenTypes},
 		allowCNF:         cfg.AllowCNF,
+		maxRemaining:     cfg.MaxRemainingLifetime,
+		checks:           cfg.Checks,
 	}
 }
 
@@ -71,11 +77,8 @@ func validateTypeEntries(field string, entries []string) error {
 }
 
 // accept applies p to claims and header that verify has authenticated:
-// audience, then `typ`, then `cnf`.
-//
-// now is the instant verify used for its temporal checks. It is unused here and
-// reserved for the remaining-lifetime and Check rules added later in the stack.
-func accept(p *acceptPolicy, claims jwt.MapClaims, header map[string]any, _ time.Time) error {
+// audience, then `typ`, then `cnf`, then the remaining lifetime, then the Checks.
+func accept(p *acceptPolicy, claims jwt.MapClaims, header map[string]any, now time.Time) error {
 	if !p.allowAnyAudience {
 		if err := checkAudience(claims["aud"], p.audiences); err != nil {
 			return err
@@ -88,7 +91,11 @@ func accept(p *acceptPolicy, claims jwt.MapClaims, header map[string]any, _ time
 		return &Error{Code: CodeInvalidToken, Reason: ReasonTokenKind,
 			err: errors.New("token carries a cnf claim")}
 	}
-	return nil
+	if exp, _ := claims.GetExpirationTime(); p.maxRemaining > 0 && exp != nil && exp.Sub(now) > p.maxRemaining {
+		return &Error{Code: CodeInvalidToken, Reason: ReasonLifetime,
+			err: fmt.Errorf("token has %s left, more than the maximum %s", exp.Sub(now), p.maxRemaining)}
+	}
+	return p.runChecks(claims, now)
 }
 
 // checkAudience accepts a string or a non-empty array of non-empty strings, and

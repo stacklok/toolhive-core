@@ -181,6 +181,15 @@ type Config struct {
 	// not verify.
 	AllowCNF bool
 
+	// MaxRemainingLifetime rejects a token whose exp is more than this far
+	// after the time of validation, with ReasonLifetime. Unlike MaxTokenLifetime
+	// it does not need iat. Zero disables it; negative is an error.
+	MaxRemainingLifetime time.Duration
+
+	// Checks are extra rules over the verified claims, run after every
+	// built-in check, in order; all must pass. A nil entry is an error.
+	Checks []Check
+
 	// MaxTokenLifetime rejects tokens whose exp-iat span exceeds it, when both
 	// claims are present. Negative is an error.
 	//
@@ -376,6 +385,7 @@ func ValidateConfig(cfg Config) (Config, error) {
 	// cloning first is equivalent to cloning after, and safer to keep that way.
 	cfg.Audiences = slices.Clone(cfg.Audiences)
 	cfg.AcceptedTokenTypes = slices.Clone(cfg.AcceptedTokenTypes)
+	cfg.Checks = slices.Clone(cfg.Checks)
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
@@ -511,6 +521,12 @@ func (c *Config) validate() error {
 	// turn an issuer outage into an authentication outage.
 	if c.MaxJWKSStaleness < 0 {
 		return fmt.Errorf("authn: max JWKS staleness must not be negative: %s", c.MaxJWKSStaleness)
+	}
+	if c.MaxRemainingLifetime < 0 {
+		return fmt.Errorf("authn: max remaining lifetime must not be negative: %s", c.MaxRemainingLifetime)
+	}
+	if slices.Contains(c.Checks, nil) {
+		return errors.New("authn: checks must not contain a nil entry")
 	}
 	return validateTypeEntries("accepted_token_types", c.AcceptedTokenTypes)
 }
