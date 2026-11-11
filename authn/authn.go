@@ -764,10 +764,10 @@ func (v *Validator) init(ctx context.Context) error {
 	// Attempt the first fetch regardless of whether a KeyProvider is set; only
 	// whether a FAILURE is fatal differs.
 	refreshErr := func() error {
-		if _, err := v.jwksCache.Refresh(fetchCtx, v.jwksURL); err != nil {
+		if err := v.refreshJWKS(fetchCtx); err != nil {
 			return fmt.Errorf("authn: failed to fetch JWKS from %s: %w", v.jwksURL, err)
 		}
-		if _, err := v.jwksCache.Lookup(fetchCtx, v.jwksURL); err != nil {
+		if _, err := v.lookupJWKS(fetchCtx); err != nil {
 			return fmt.Errorf("authn: JWKS from %s unavailable after fetch: %w", v.jwksURL, err)
 		}
 		return nil
