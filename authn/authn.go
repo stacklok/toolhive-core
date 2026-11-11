@@ -156,9 +156,13 @@ type Config struct {
 	// AcceptedTokenTypes, when non-empty, requires the token's `typ` header to
 	// match one of these media types. Comparison is case-insensitive and an
 	// `application/` prefix is optional on both sides (RFC 7515 §4.1.9), so
-	// "at+jwt" matches a token carrying "application/at+JWT".
+	// "at+jwt" matches a token carrying "application/at+JWT". Whitespace is not
+	// trimmed from either side: a padded entry is a configuration error, and a
+	// padded `typ` never matches.
 	//
-	// Empty (the default) accepts any `typ`, including none. It cannot default
+	// Empty (the default) accepts any `typ`, including none, except ID-JAG,
+	// logout, security event, DPoP and token introspection JWTs, which are
+	// refused with ReasonTokenKind unless listed here. It cannot default
 	// to requiring RFC 9068's "at+jwt": that is a SHOULD, and many IdPs emit
 	// "JWT" or omit the header entirely, so a default would reject conformant
 	// tokens.
@@ -171,6 +175,11 @@ type Config struct {
 	// resource audience, because in those cases the audience check cannot tell
 	// the two kinds of token apart.
 	AcceptedTokenTypes []string
+
+	// AllowCNF accepts tokens that carry a `cnf` claim. By default they are
+	// refused with ReasonTokenKind: they are bound to a key this package does
+	// not verify.
+	AllowCNF bool
 
 	// MaxTokenLifetime rejects tokens whose exp-iat span exceeds it, when both
 	// claims are present. Negative is an error.
@@ -292,6 +301,8 @@ type Config struct {
 type Validator struct {
 	// cfg is the validated, default-filled configuration.
 	cfg Config
+	// policy is the post-verification acceptance policy derived from cfg.
+	policy acceptPolicy
 	// httpClient is used for discovery and JWKS fetches. Its Transport is a
 	// limitedTransport, so every response body is capped at maxResponseBody.
 	httpClient *http.Client
@@ -402,6 +413,7 @@ func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
 
 	v := &Validator{
 		cfg:        cfg,
+		policy:     newAcceptPolicy(cfg),
 		httpClient: httpClient,
 	}
 	// Deriving the lifetime context before any construction I/O guarantees a
@@ -500,13 +512,7 @@ func (c *Config) validate() error {
 	if c.MaxJWKSStaleness < 0 {
 		return fmt.Errorf("authn: max JWKS staleness must not be negative: %s", c.MaxJWKSStaleness)
 	}
-	for i, tt := range c.AcceptedTokenTypes {
-		if normalizeTokenType(tt) == "" {
-			return fmt.Errorf("authn: accepted_token_types[%d] must not be empty", i)
-		}
-	}
-
-	return nil
+	return validateTypeEntries("accepted_token_types", c.AcceptedTokenTypes)
 }
 
 // validateLeeway checks the clock-skew tolerance policy and fills in the

@@ -918,9 +918,8 @@ func TestValidateRequiredClaimMissing(t *testing.T) {
 			wantReason: ReasonExpirationMissing,
 		},
 		{
-			// golang-jwt surfaces a wrong-type aud as "aud claim is required"
-			// (ErrTokenRequiredClaimMissing), so it maps to ReasonAudience,
-			// not ReasonMalformed.
+			// accept refuses a wrong-type aud as ReasonAudience, not
+			// ReasonMalformed.
 			name:       "wrong-type aud (number) maps to ReasonAudience",
 			mutate:     func(s *mintSpec) { s.claims[claimAud] = 12345 },
 			wantReason: ReasonAudience,
