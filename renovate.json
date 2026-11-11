@@ -21,6 +21,13 @@
       "matchPackageNames": ["github.com/cenkalti/backoff/v5", "github.com/theupdateframework/go-tuf"],
       "matchUpdateTypes": ["major"],
       "enabled": false
+    },
+    {
+      "description": "yaml v4 is a new import path: a go.mod-only bump adds an unused require next to v3; moving to v4 needs import/API work",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["go.yaml.in/yaml/v3"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
     }
   ]
 }
