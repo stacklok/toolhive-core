@@ -432,6 +432,12 @@ func ValidateConfig(cfg Config) (Config, error) {
 // Errors returned here are ordinary construction errors, not the *Error type:
 // *Error is reserved for Validate/ParseBearer runtime failures.
 func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
+	return newValidator(ctx, nil, cfg)
+}
+
+// newValidator is NewValidator with an optional buildCtx that also bounds the
+// construction network I/O. The validator's lifetime is still ctx.
+func newValidator(ctx, buildCtx context.Context, cfg Config) (*Validator, error) {
 	// Validation, defaulting and the defensive slice cloning all live in
 	// ValidateConfig, which is exported for callers that need to reject a
 	// misconfiguration before committing to construction. Routing through it here
@@ -472,7 +478,7 @@ func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
 	// short-lived construction context. Per-operation construction network I/O
 	// (Step 2 Register fetch, Step 3 discovery) is bounded separately with
 	// constructionTimeout inside init; that bound must NOT reach NewCache.
-	if err := v.init(v.ctx); err != nil {
+	if err := v.init(v.ctx, buildCtx); err != nil {
 		v.cancel()
 		return nil, err
 	}
@@ -721,9 +727,21 @@ func validateHTTPSURI(field, raw string, insecureAllowHTTP bool) error {
 // the discovery fetch and the first JWKS fetch inside Register/Refresh — runs
 // under a context derived from ctx with constructionTimeout; that bound must
 // NOT reach jwkfetch.NewCache.
-func (v *Validator) init(ctx context.Context) error {
+func (v *Validator) init(ctx, buildCtx context.Context) error {
 	if v.cfg.ProviderOnly {
 		return nil
+	}
+	// Construction I/O also stops when buildCtx is done. Only the lifetime ctx
+	// reaches jwkfetch.NewCache.
+	ioCtx := ctx
+	if buildCtx != nil {
+		var cancel context.CancelFunc
+		ioCtx, cancel = context.WithCancel(ctx)
+		stop := context.AfterFunc(buildCtx, cancel)
+		defer func() {
+			stop()
+			cancel()
+		}()
 	}
 	// Resolve the JWKS URL first: either the explicit Config.JWKSURL or the
 	// jwks_uri discovered from the issuer's OIDC metadata.
@@ -734,7 +752,7 @@ func (v *Validator) init(ctx context.Context) error {
 		//
 		// Bound the discovery fetch so an unresponsive issuer cannot hang
 		// NewValidator past constructionTimeout.
-		discCtx, cancel := context.WithTimeout(ctx, constructionTimeout)
+		discCtx, cancel := context.WithTimeout(ioCtx, constructionTimeout)
 		jwksURI, err := v.discoverWithRetry(discCtx, v.cfg.Issuer)
 		cancel()
 		switch {
@@ -808,7 +826,7 @@ func (v *Validator) init(ctx context.Context) error {
 
 	// The first fetch is construction I/O only; bound it so an unresponsive
 	// JWKS endpoint cannot hang NewValidator past constructionTimeout.
-	fetchCtx, cancel := context.WithTimeout(ctx, constructionTimeout)
+	fetchCtx, cancel := context.WithTimeout(ioCtx, constructionTimeout)
 	defer cancel()
 
 	// WithConstantInterval pins the refresh cadence: the issuer's
