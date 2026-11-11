@@ -31,6 +31,7 @@ The ToolHive ecosystem spans multiple Go repositories, and several of these proj
 | `oci/skills` | Alpha | OCI artifact types, media types, and registry operations for skills |
 | `oci/plugins` | Alpha | OCI artifact types, media types, and registry operations for plugins |
 | `authn` | Alpha | Inbound OIDC/JWT bearer-token validation for resource servers |
+| `jose` | Alpha | JOSE `typ` header values and `IsJOSEType` comparison |
 | `networking` | Alpha | Outbound HTTP client construction with SSRF egress policy: private-IP/link-local dial blocking, redirect policy, body-capped JSON fetch, endpoint/issuer URL + private-IP validation helpers, and port allocation/validation utilities |
 | `postgres` | Alpha | PostgreSQL connection pool with optional cloud IAM dynamic auth |
 | `redisconn` | Alpha | Lean Redis/Valkey client construction for standalone, cluster, and Sentinel deployments |

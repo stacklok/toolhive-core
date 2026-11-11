@@ -1171,8 +1171,10 @@ func TestParseBearer(t *testing.T) {
 		{name: "extra whitespace segment", in: "Bearer abc def", wantReason: ReasonMalformed},
 		{name: "tab separator", in: "Bearer\tabc.def.ghi", wantReason: ReasonMalformed},
 		{name: "leading whitespace", in: " Bearer abc.def.ghi", wantReason: ReasonMalformed},
-		{name: "wrong scheme", in: "Basic abc.def.ghi", wantReason: ReasonMalformed},
-		{name: "digest scheme", in: "Digest abc.def.ghi", wantReason: ReasonMalformed},
+		{name: "wrong scheme", in: "Basic abc.def.ghi", wantReason: ReasonUnsupportedScheme},
+		{name: "wrong scheme lowercase", in: "basic abc", wantReason: ReasonUnsupportedScheme},
+		{name: "negotiate scheme", in: "Negotiate x", wantReason: ReasonUnsupportedScheme},
+		{name: "digest scheme", in: "Digest abc.def.ghi", wantReason: ReasonUnsupportedScheme},
 		{
 			name:       "token at max length",
 			in:         "Bearer " + strings.Repeat("a", maxTokenLength),
