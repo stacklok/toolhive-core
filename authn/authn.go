@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 	"unicode"
@@ -303,7 +304,24 @@ type Config struct {
 	//
 	// With no KeyProvider, construction stays fail-closed: discovery and the
 	// first JWKS fetch must both succeed or NewValidator returns an error.
+	//
+	// Set ProviderOnly to drop the discovery and JWKS fallback entirely.
 	KeyProvider KeyProvider
+
+	// ProviderOnly makes KeyProvider the only key source: there is no OIDC
+	// discovery and no JWKS, so the validator makes no network requests and
+	// starts no background refresh. A kid the provider does not offer is
+	// ReasonUnknownKID. Issuer is still required and still verified.
+	//
+	// KeyProvider.PublicKeys is called on every validation, so "no network
+	// requests" holds only if the provider itself serves from memory.
+	//
+	// Use it when another component already fetches and caches the issuer's
+	// keys, for example keys taken from a directory service, so that the
+	// issuer URL is never contacted. It requires KeyProvider, and the settings
+	// that only configure fetching (JWKSURL, HTTPClient, CACertPath,
+	// AuthTokenFile, AllowPrivateIP and MaxJWKSStaleness) must be unset.
+	ProviderOnly bool
 }
 
 // Validator verifies inbound JWT bearer tokens against the configured issuer
@@ -424,9 +442,13 @@ func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
 		return nil, err
 	}
 
-	httpClient, err := newHTTPClient(cfg.HTTPClient, cfg.AllowPrivateIP, cfg.CACertPath, cfg.AuthTokenFile)
-	if err != nil {
-		return nil, err
+	// A ProviderOnly validator never fetches, so it gets no client.
+	var httpClient *http.Client
+	if !cfg.ProviderOnly {
+		httpClient, err = newHTTPClient(cfg.HTTPClient, cfg.AllowPrivateIP, cfg.CACertPath, cfg.AuthTokenFile)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	v := &Validator{
@@ -496,6 +518,12 @@ func (v *Validator) closed() bool {
 
 // validate checks cfg and fills in defaults, performing no I/O.
 func (c *Config) validate() error {
+	// ProviderOnly has its own key-source rules, so check it first: the generic
+	// check below would otherwise suggest setting jwks_url, which ProviderOnly
+	// forbids.
+	if err := c.validateProviderOnly(); err != nil {
+		return err
+	}
 	// At least one of Issuer/JWKSURL is required: the issuer is what discovery
 	// resolves the JWKS URL from, so with neither there is no key material to
 	// reach. An Issuer-less config is permitted (and skips iss verification) so
@@ -535,6 +563,41 @@ func (c *Config) validate() error {
 		return fmt.Errorf("authn: max JWKS staleness must not be negative: %s", c.MaxJWKSStaleness)
 	}
 	return c.validateAcceptance()
+}
+
+// validateProviderOnly checks that a ProviderOnly config has a provider and an
+// issuer, and sets nothing that only configures fetching, which would
+// otherwise be silently ignored.
+func (c *Config) validateProviderOnly() error {
+	if !c.ProviderOnly {
+		return nil
+	}
+	if c.KeyProvider == nil {
+		return errors.New("authn: provider_only requires a key provider")
+	}
+	if c.Issuer == "" {
+		return errors.New("authn: provider_only requires an issuer")
+	}
+	var set []string
+	for _, f := range []struct {
+		name string
+		set  bool
+	}{
+		{"jwks_url", c.JWKSURL != ""},
+		{"http_client", c.HTTPClient != nil},
+		{"ca_cert_path", c.CACertPath != ""},
+		{"auth_token_file", c.AuthTokenFile != ""},
+		{"allow_private_ip", c.AllowPrivateIP},
+		{"max_jwks_staleness", c.MaxJWKSStaleness != 0},
+	} {
+		if f.set {
+			set = append(set, f.name)
+		}
+	}
+	if len(set) > 0 {
+		return fmt.Errorf("authn: provider_only fetches no keys, so %s must not be set", strings.Join(set, ", "))
+	}
+	return nil
 }
 
 // validateAcceptance checks the settings that feed the acceptance policy.
@@ -659,6 +722,9 @@ func validateHTTPSURI(field, raw string, insecureAllowHTTP bool) error {
 // under a context derived from ctx with constructionTimeout; that bound must
 // NOT reach jwkfetch.NewCache.
 func (v *Validator) init(ctx context.Context) error {
+	if v.cfg.ProviderOnly {
+		return nil
+	}
 	// Resolve the JWKS URL first: either the explicit Config.JWKSURL or the
 	// jwks_uri discovered from the issuer's OIDC metadata.
 	v.jwksURL = v.cfg.JWKSURL
