@@ -174,6 +174,12 @@ const (
 	// ReasonCheck indicates a Check rejected the token, returned an error or
 	// panicked.
 	ReasonCheck Reason = "check"
+	// ReasonUnknownIssuer indicates a TrustSet has no trust for the token's
+	// `iss` claim, or the token carries no string `iss`. No key was tried.
+	ReasonUnknownIssuer Reason = "unknown_issuer"
+	// ReasonTrustStale indicates the TrustSet trust for the token's issuer is
+	// past its NotAfter; paired with CodeUnavailable.
+	ReasonTrustStale Reason = "trust_stale"
 	// ReasonScope indicates the token is valid but lacks a required scope;
 	// paired with CodeInsufficientScope.
 	ReasonScope Reason = "scope"

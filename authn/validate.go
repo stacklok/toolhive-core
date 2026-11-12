@@ -209,7 +209,12 @@ func ParseBearer(headerValue string) (string, error) {
 // Every failure is a *Error. It reads the clock once and runs verify
 // (signature and temporal checks), then accept (audience, `typ`, `cnf`).
 func (v *Validator) Validate(ctx context.Context, token string) (Principal, error) {
-	now := time.Now()
+	return v.validateAt(ctx, token, time.Now())
+}
+
+// validateAt is Validate with the clock reading supplied, so a TrustSet can
+// use one reading for its own checks and the validator's.
+func (v *Validator) validateAt(ctx context.Context, token string, now time.Time) (Principal, error) {
 	claims, header, err := v.verify(ctx, token, now)
 	if err != nil {
 		return Principal{}, err
