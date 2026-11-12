@@ -216,6 +216,83 @@ func TestNewTrustSetRefusesTrusts(t *testing.T) {
 	}
 }
 
+func TestNewTrustSetGuards(t *testing.T) {
+	t.Parallel()
+
+	const (
+		idp   = "https://idp.example.com"
+		other = "https://other.example.com"
+	)
+	key := mintRSA(t, "k1")
+	pt := func(id, iss string) Trust { return providerTrust(id, iss, key) }
+	jwks := newTSIssuer(t)
+	shared := pt("p", jwks.url())
+	shared.Config.InsecureAllowHTTP = true
+	const (
+		reserved = "is reserved"
+		pOnly    = "only ProviderOnly"
+	)
+	tests := []struct {
+		name   string
+		trusts []Trust
+		opts   []SetOption
+		bad    []string
+		routed []string
+		// wantErr maps each refused trust ID to the text its error must carry.
+		wantErr map[string]string
+	}{
+		{"reserved exact match", []Trust{pt("a", idp), pt("b", other)},
+			[]SetOption{WithReservedIssuers(idp)}, []string{"a"}, []string{other},
+			map[string]string{"a": reserved}},
+		{"reserved with slash, trust without", []Trust{pt("a", idp)},
+			[]SetOption{WithReservedIssuers(idp + "/")}, []string{"a"}, nil,
+			map[string]string{"a": reserved}},
+		{"reserved without slash, trust with", []Trust{pt("a", idp+"//")},
+			[]SetOption{WithReservedIssuers(idp)}, []string{"a"}, nil,
+			map[string]string{"a": reserved}},
+		{"case difference is not matched", []Trust{pt("a", "https://IDP.example.com")},
+			[]SetOption{WithReservedIssuers(idp)}, nil, []string{"https://IDP.example.com"}, nil},
+		{"calls accumulate", []Trust{pt("a", idp), pt("b", other), pt("c", "https://third.example.com")},
+			[]SetOption{WithReservedIssuers(idp), WithReservedIssuers(other)}, []string{"a", "b"},
+			[]string{"https://third.example.com"}, map[string]string{"a": reserved, "b": reserved}},
+		{"reserved-refused trust does not refuse one sharing its ID", []Trust{pt("x", idp), pt("x", other)},
+			[]SetOption{WithReservedIssuers(idp)}, []string{"x"}, []string{other},
+			map[string]string{"x": reserved}},
+		{"reserved refuses two trusts that also share an issuer",
+			[]Trust{pt("a", idp), pt("b", idp+"/"), pt("c", other)},
+			[]SetOption{WithReservedIssuers(idp)}, []string{"a", "b"}, []string{other},
+			map[string]string{"a": reserved, "b": reserved}},
+		{"provider-only refuses a JWKS trust", []Trust{jwks.trust("j"), pt("p", idp)},
+			[]SetOption{WithProviderOnly()}, []string{"j"}, []string{idp},
+			map[string]string{"j": pOnly}},
+		{"provider-only-refused trust does not refuse one sharing its issuer", []Trust{jwks.trust("j"), shared},
+			[]SetOption{WithProviderOnly()}, []string{"j"}, []string{jwks.url()},
+			map[string]string{"j": pOnly}},
+		{"both options", []Trust{jwks.trust("j"), pt("r", idp), pt("p", other)},
+			[]SetOption{WithProviderOnly(), WithReservedIssuers(idp)}, []string{"j", "r"}, []string{other},
+			map[string]string{"j": pOnly, "r": reserved}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s, errs := NewTrustSet(context.Background(), tt.trusts, tt.opts...)
+			t.Cleanup(s.Close)
+			var ids []string
+			for _, e := range errs {
+				ids = append(ids, e.ID)
+				assert.ErrorContains(t, &e, tt.wantErr[e.ID])
+				assert.NotContains(t, e.Error(), "more than one trust")
+			}
+			assert.Equal(t, tt.bad, ids)
+			var routed []string
+			for iss := range s.routes {
+				routed = append(routed, iss)
+			}
+			assert.ElementsMatch(t, tt.routed, routed)
+		})
+	}
+}
+
 func TestTrustSetNotAfter(t *testing.T) {
 	t.Parallel()
 
