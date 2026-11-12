@@ -265,6 +265,8 @@ func TestValidateConfigAgreesWithNewValidator(t *testing.T) {
 	}{
 		{"no issuer and no jwks_url", func(c *Config) { c.Issuer = ""; c.JWKSURL = "" }},
 		{"non-https issuer", func(c *Config) { c.Issuer = "http://issuer.example.com" }},
+		{"templated issuer", func(c *Config) { c.Issuer = templatedIssuer }},
+		{"percent-encoded templated issuer", func(c *Config) { c.Issuer = "https://issuer.example.com/%7Btenant%7D" }},
 		{"no audience and no AllowAnyAudience", func(c *Config) { c.Audiences = nil }},
 		{"audiences together with AllowAnyAudience", func(c *Config) { c.AllowAnyAudience = true }},
 		{"negative leeway", func(c *Config) { c.Leeway = -time.Second }},
@@ -825,6 +827,38 @@ func TestLastSuccessStampedWithKeyProvider(t *testing.T) {
 
 	assert.Less(t, v.staleness(), time.Minute,
 		"a successful construction fetch must stamp lastSuccess even with a KeyProvider configured")
+}
+
+// templatedIssuer is an issuer copied from a multi-tenant discovery document.
+const templatedIssuer = "https://login.microsoftonline.com/{tenantid}/v2.0"
+
+func TestValidateIssuerForm(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		issuer  string
+		wantErr bool
+	}{
+		{"tenant issuer", "https://login.microsoftonline.com/0f1e2d3c-0000-0000-0000-000000000000/v2.0", false},
+		{"generic", bigBodyIssuer, false},
+		{"template braces", templatedIssuer, true},
+		{"template braces, any host", "https://issuer.example.com/{tenant}", true},
+		{"lone closing brace", "https://issuer.example.com/tenant}", true},
+		{"encoded braces", "https://issuer.example.com/%7Btenant%7D", true},
+		{"encoded braces, lower case", "https://issuer.example.com/%7btenant%7d", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateIssuerForm(tt.issuer)
+			if tt.wantErr {
+				assert.ErrorContains(t, err, "template placeholder")
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
 }
 
 // TestValidateHTTPSURISchemeAllowlist covers the MEDIUM finding that

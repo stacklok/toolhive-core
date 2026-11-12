@@ -541,6 +541,9 @@ func (c *Config) validate() error {
 		if err := validateHTTPSURI("issuer", c.Issuer, c.InsecureAllowHTTP); err != nil {
 			return err
 		}
+		if err := validateIssuerForm(c.Issuer); err != nil {
+			return err
+		}
 	}
 
 	if err := c.validateAudiences(); err != nil {
@@ -715,6 +718,18 @@ func validateHTTPSURI(field, raw string, insecureAllowHTTP bool) error {
 		}
 	}
 	return fmt.Errorf("authn: %s must use https scheme (set InsecureAllowHTTP for dev only): %s", field, raw)
+}
+
+// validateIssuerForm rejects an issuer with a template placeholder, such as
+// the {tenantid} in a multi-tenant discovery document. No token carries one
+// in its iss. Percent-encoded braces are rejected too.
+func validateIssuerForm(issuer string) error {
+	lower := strings.ToLower(issuer)
+	if strings.ContainsAny(issuer, "{}") || strings.Contains(lower, "%7b") || strings.Contains(lower, "%7d") {
+		return errors.New("authn: issuer contains a template placeholder such as {tenantid}, " +
+			"which no token carries: configure one issuer per tenant")
+	}
+	return nil
 }
 
 // init resolves the JWKS URL, starts the jwx cache, and registers the URL with
