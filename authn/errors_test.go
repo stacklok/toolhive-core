@@ -6,7 +6,9 @@ package authn
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -82,6 +84,78 @@ func TestPossiblyOpaque(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			assert.Equal(t, tt.want, PossiblyOpaque(tt.err))
+		})
+	}
+}
+
+func TestCodeHTTPStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		code Code
+		want int
+	}{
+		{CodeInvalidRequest, http.StatusBadRequest},
+		{CodeInvalidToken, http.StatusUnauthorized},
+		{CodeInsufficientScope, http.StatusForbidden},
+		{CodeUnavailable, http.StatusServiceUnavailable},
+		{Code("other"), http.StatusUnauthorized},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.code), func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, tt.code.HTTPStatus())
+		})
+	}
+}
+
+func TestErrorRetryAfterAndScopes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		err        *Error
+		wantRetry  time.Duration
+		wantScopes []string
+	}{
+		{"nil", nil, 0, nil},
+		{"unavailable default", &Error{Code: CodeUnavailable}, defaultRetryAfter, nil},
+		{"unavailable explicit", &Error{Code: CodeUnavailable, retryAfter: time.Minute}, time.Minute, nil},
+		{"retry ignored for other codes", &Error{Code: CodeInvalidToken, retryAfter: time.Minute}, 0, nil},
+		{"scopes", &Error{Code: CodeInsufficientScope, scopes: []string{"a", "b"}}, 0, []string{"a", "b"}},
+		{"scopes ignored for other codes", &Error{Code: CodeInvalidToken, scopes: []string{"a"}}, 0, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.wantRetry, tt.err.RetryAfter())
+			assert.Equal(t, tt.wantScopes, tt.err.RequiredScopes())
+		})
+	}
+}
+
+func TestErrorMissingCredentialsAndHTTPStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		err         *Error
+		wantMissing bool
+		wantStatus  int
+	}{
+		{"missing header", &Error{Code: CodeInvalidRequest, Reason: ReasonMissingHeader}, true, http.StatusUnauthorized},
+		{"unsupported scheme", &Error{Code: CodeInvalidRequest, Reason: ReasonUnsupportedScheme}, true, http.StatusUnauthorized},
+		{"malformed header", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed}, false, http.StatusBadRequest},
+		{"invalid token", &Error{Code: CodeInvalidToken, Reason: ReasonSignature}, false, http.StatusUnauthorized},
+		{"insufficient scope", &Error{Code: CodeInsufficientScope, Reason: ReasonScope}, false, http.StatusForbidden},
+		{"unavailable", &Error{Code: CodeUnavailable, Reason: ReasonKeysUnavailable}, false, http.StatusServiceUnavailable},
+		{"nil", nil, false, http.StatusUnauthorized},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.wantMissing, tt.err.MissingCredentials())
+			assert.Equal(t, tt.wantStatus, tt.err.HTTPStatus())
 		})
 	}
 }
