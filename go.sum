@@ -331,8 +331,8 @@ github.com/shirou/gopsutil/v4 v4.26.10 h1:MJN6euesJx53MVEjscYeyRSRcrdIcy3sz5k9no
 github.com/shirou/gopsutil/v4 v4.26.10/go.mod h1:XpkIrcUMQhwte/dGxu57KtnMMFsbKelI7PP23zweKBk=
 github.com/sigstore/protobuf-specs v0.5.2 h1:RSWWUY8QrVTxbYH00jY/jg2e7YnjzrpwP+PeHTMll0E=
 github.com/sigstore/protobuf-specs v0.5.2/go.mod h1:DRBzpFuE+LnvQMN10/dU6nBeKwVLGEQ6o2FovN2Rats=
-github.com/sigstore/rekor v1.6.0 h1:xr8y7lyDgVftnniMem+734HZ0LvBB/KkS6Fxfdi4bCk=
-github.com/sigstore/rekor v1.6.0/go.mod h1:JTZYcdkYReTReOTMyyFaAToFcFrXy+zOfa/csix8jgM=
+github.com/sigstore/rekor v1.6.1 h1:0qndwuY1mrrNGN9JvAtPbcMqL42YXnYgFr6a/4wS7U0=
+github.com/sigstore/rekor v1.6.1/go.mod h1:JTZYcdkYReTReOTMyyFaAToFcFrXy+zOfa/csix8jgM=
 github.com/sigstore/rekor-tiles/v2 v2.3.0 h1:HhMgH61UP0t899V8Fjt7pz1YdgOBptbaQdnCF+79cdc=
 github.com/sigstore/rekor-tiles/v2 v2.3.0/go.mod h1:DEFiKSyQ4nF75QRVNdOPaIH3cmvMkO2B6xDZjNYngPc=
 github.com/sigstore/sigstore v1.11.3 h1:gPjEXTOfVNDFQgkEjyLUo+DDh6EA+iklLp1t5slnuGs=
