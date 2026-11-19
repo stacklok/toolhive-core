@@ -86,6 +86,7 @@ task license-fix   # Add missing license headers
 | `redisconn` | Redis/Valkey client construction (standalone/cluster/sentinel); separate nested module (Alpha) |
 | `redisconn/aws`, `redisconn/azure`, `redisconn/gcp` | AWS ElastiCache/MemoryDB IAM, Azure Entra ID, and GCP Memorystore IAM credentials for `redisconn`; each a separate nested module (Alpha) |
 | `recovery` | HTTP panic recovery middleware (Beta) |
+| `jose` | JOSE `typ` header values and `IsJOSEType` comparison, stdlib only (Alpha) |
 | `validation/http` | RFC 7230/8707 compliant HTTP header and URI validation |
 | `validation/group` | Group name validation (lowercase alphanumeric, underscore, dash, space) |
 | `registry/types` | Skill/Server/Plugin catalog types + JSON-schema validation (Alpha) |

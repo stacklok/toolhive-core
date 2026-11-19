@@ -6,6 +6,9 @@ package authn
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"slices"
+	"time"
 )
 
 // Code is the OAuth2 error code, safe to send to a client.
@@ -31,7 +34,34 @@ const (
 	// discriminator: map it to a plain HTTP 503 and do not emit it as an
 	// OAuth2 error= parameter.
 	CodeUnavailable Code = "unavailable" // 503 — key material unreachable
+	// CodeInsufficientScope is the OAuth2 "insufficient_scope" code (HTTP 403).
+	// Validate never returns it.
+	CodeInsufficientScope Code = "insufficient_scope" // 403
 )
+
+// HTTPStatus returns the HTTP status for a Code; an unknown Code maps to 401.
+//
+// It maps by Code alone, so it cannot tell missing credentials (which RFC 6750
+// §3.1 answers with 401) from a malformed request (400): both are
+// CodeInvalidRequest. For an *Error use (*Error).HTTPStatus instead.
+func (c Code) HTTPStatus() int {
+	switch c {
+	case CodeInvalidRequest:
+		return http.StatusBadRequest
+	case CodeInsufficientScope:
+		return http.StatusForbidden
+	case CodeUnavailable:
+		return http.StatusServiceUnavailable
+	case CodeInvalidToken:
+		return http.StatusUnauthorized
+	default:
+		return http.StatusUnauthorized
+	}
+}
+
+// defaultRetryAfter is the Retry-After hint for a CodeUnavailable error that
+// carries none.
+const defaultRetryAfter = 5 * time.Second
 
 // Reason is a finer-grained, client-safe failure cause.
 //
@@ -40,9 +70,13 @@ const (
 type Reason string
 
 const (
-	// ReasonMissingHeader indicates no Authorization header (or no Bearer
-	// scheme) was present in the request.
+	// ReasonMissingHeader indicates no Authorization header was present in the
+	// request.
 	ReasonMissingHeader Reason = "missing_header"
+	// ReasonUnsupportedScheme indicates the Authorization header uses a scheme
+	// other than Bearer. It is treated as missing credentials (RFC 6750 §3.1):
+	// see (*Error).MissingCredentials.
+	ReasonUnsupportedScheme Reason = "unsupported_scheme"
 	// ReasonMalformed indicates the token could not be parsed as a
 	// structurally valid JWT. From Validate, this pairs with CodeInvalidToken
 	// and means the token may be an opaque token worth validating via RFC
@@ -132,6 +166,9 @@ const (
 	// Error), and a token that parsed as a JWT is not an opaque token worth
 	// introspecting, no matter which claim check subsequently failed it.
 	ReasonInvalidClaims Reason = "invalid_claims"
+	// ReasonScope indicates the token is valid but lacks a required scope;
+	// paired with CodeInsufficientScope.
+	ReasonScope Reason = "scope"
 )
 
 // Error is the only error type Validate and ParseBearer return.
@@ -163,6 +200,53 @@ type Error struct {
 	Reason Reason
 	// err is the unexported wrapped detail; never sent to a client.
 	err error
+	// retryAfter is the Retry-After hint; zero means defaultRetryAfter.
+	retryAfter time.Duration
+	// scopes are the scopes a CodeInsufficientScope error requires.
+	scopes []string
+}
+
+// RetryAfter returns how long a client should wait before retrying. It is
+// positive only for CodeUnavailable.
+func (e *Error) RetryAfter() time.Duration {
+	if e == nil || e.Code != CodeUnavailable {
+		return 0
+	}
+	if e.retryAfter > 0 {
+		return e.retryAfter
+	}
+	return defaultRetryAfter
+}
+
+// MissingCredentials reports whether the request carried no usable
+// credentials: Reason is ReasonMissingHeader or ReasonUnsupportedScheme. Answer
+// with 401 and a bare "WWW-Authenticate: Bearer" challenge, with no error,
+// error_description or scope parameter (RFC 6750 §3.1). A nil *Error reports
+// false.
+func (e *Error) MissingCredentials() bool {
+	if e == nil {
+		return false
+	}
+	return e.Reason == ReasonMissingHeader || e.Reason == ReasonUnsupportedScheme
+}
+
+// HTTPStatus returns the HTTP status to answer with: 401 when
+// MissingCredentials, otherwise Code.HTTPStatus. A nil *Error returns 401, as
+// does an unknown Code. Prefer this over Code.HTTPStatus.
+func (e *Error) HTTPStatus() int {
+	if e == nil || e.MissingCredentials() {
+		return http.StatusUnauthorized
+	}
+	return e.Code.HTTPStatus()
+}
+
+// RequiredScopes returns the scopes a CodeInsufficientScope error requires, or
+// nil for other codes.
+func (e *Error) RequiredScopes() []string {
+	if e == nil || e.Code != CodeInsufficientScope {
+		return nil
+	}
+	return slices.Clone(e.scopes)
 }
 
 // Error returns a human-readable message that combines the Reason with the

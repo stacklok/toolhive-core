@@ -135,7 +135,10 @@ type Principal struct {
 // credentials" (error="invalid_request", 400): an empty value yields
 // ReasonMissingHeader; anything else malformed — not exactly `Bearer
 // <token>`, extra whitespace segments, an empty token part, or a token
-// longer than maxTokenLength — yields ReasonMalformed.
+// longer than maxTokenLength — yields ReasonMalformed. A header whose scheme
+// is present but not Bearer (e.g. "Basic ...") yields ReasonUnsupportedScheme,
+// which RFC 6750 §3.1 treats as missing credentials; see
+// (*Error).MissingCredentials and (*Error).HTTPStatus.
 //
 // All ParseBearer failures use Code CodeInvalidRequest (400), including
 // ReasonMalformed. The ReasonMalformed value here is a malformed *header*, not
@@ -166,7 +169,7 @@ func ParseBearer(headerValue string) (string, error) {
 	if !strings.EqualFold(scheme, "Bearer") {
 		// The scheme is not echoed either: on a header with no separator the
 		// whole credential can land in this position.
-		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonMalformed,
+		return "", &Error{Code: CodeInvalidRequest, Reason: ReasonUnsupportedScheme,
 			err: errors.New("unsupported auth scheme: expected Bearer")}
 	}
 	token := strings.TrimLeft(rest, " ")
