@@ -156,7 +156,8 @@ const (
 	ReasonKeysStale Reason = "keys_stale"
 	// ReasonTokenType indicates the "typ" header does not match any entry in
 	// Config.AcceptedTokenTypes (e.g. an ID token presented as an access
-	// token).
+	// token), or is present but not a string. The non-string case applies even
+	// when AcceptedTokenTypes is empty.
 	ReasonTokenType Reason = "token_type"
 	// ReasonInvalidClaims indicates the token parsed as a structurally valid
 	// JWT but its claim set was rejected by golang-jwt for a reason this
@@ -166,6 +167,10 @@ const (
 	// Error), and a token that parsed as a JWT is not an opaque token worth
 	// introspecting, no matter which claim check subsequently failed it.
 	ReasonInvalidClaims Reason = "invalid_claims"
+	// ReasonTokenKind indicates the token is not an access token for this
+	// endpoint: its `typ` is on the default deny list, or it carries a `cnf`
+	// claim and Config.AllowCNF is not set.
+	ReasonTokenKind Reason = "token_kind"
 	// ReasonScope indicates the token is valid but lacks a required scope;
 	// paired with CodeInsufficientScope.
 	ReasonScope Reason = "scope"

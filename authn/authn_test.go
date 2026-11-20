@@ -276,6 +276,7 @@ func TestValidateConfigAgreesWithNewValidator(t *testing.T) {
 		{"negative max token lifetime", func(c *Config) { c.MaxTokenLifetime = -time.Second }},
 		{"negative max JWKS staleness", func(c *Config) { c.MaxJWKSStaleness = -time.Second }},
 		{"empty accepted token type", func(c *Config) { c.AcceptedTokenTypes = []string{" "} }},
+		{"padded accepted token type", func(c *Config) { c.AcceptedTokenTypes = []string{" at+jwt"} }},
 	}
 
 	for _, tt := range tests {
@@ -331,7 +332,7 @@ func TestValidateConfigNormalizesWithoutTouchingTheCaller(t *testing.T) {
 	t.Run("caller slice mutations cannot rewrite the returned policy", func(t *testing.T) {
 		t.Parallel()
 		cfg := validConfig()
-		cfg.AcceptedTokenTypes = []string{"at+jwt"}
+		cfg.AcceptedTokenTypes = []string{typAccessToken}
 		got, err := ValidateConfig(cfg)
 		require.NoError(t, err)
 
@@ -342,7 +343,7 @@ func TestValidateConfigNormalizesWithoutTouchingTheCaller(t *testing.T) {
 		cfg.AcceptedTokenTypes[0] = idTokenJWT
 
 		assert.Equal(t, []string{"https://api.example.com"}, got.Audiences)
-		assert.Equal(t, []string{"at+jwt"}, got.AcceptedTokenTypes)
+		assert.Equal(t, []string{typAccessToken}, got.AcceptedTokenTypes)
 	})
 }
 
