@@ -90,38 +90,63 @@ func TestProtocolStatus_TransientStatusBodyStillReachesCaller(t *testing.T) {
 	requireUsable(t, c, "after-503")
 }
 
-// TestProtocolStatus_Bare404WithJSONRPCBody pins the CURRENT precedence: the
-// MCP spec reserves HTTP 404 for a terminated session, so the shim reports
-// ErrSessionTerminated for any 404 except one carrying JSON-RPC method-not-found.
-// The decoded JSON-RPC error stays reachable through errors.As.
-//
-// KNOWN GAP: this classification is too coarse. A 404 that carries a decoded
-// JSON-RPC error matching the request ID means the server answered on a live
-// session; go-sdk keeps the connection open, and the follow-up call below
-// succeeds. A caller reacting to ErrSessionTerminated would needlessly tear
-// down and re-initialize a healthy session. If mapStatusError is changed to
-// treat such a 404 as an application error, flip the ErrSessionTerminated
-// assertion here rather than treating its failure as a regression.
-func TestProtocolStatus_Bare404WithJSONRPCBody(t *testing.T) {
+// TestProtocolStatus_404WithJSONRPCBody separates a 404 that answers the call
+// from a 404 that reports a terminated session. The MCP spec reserves 404 for
+// terminated sessions, but go-sdk servers on newer protocol versions also use
+// it for application errors on a live session. The JSON-RPC ID decides: an
+// error carrying this request's ID was produced by handling the request, while
+// the session-not-found 404s of other SDKs use a null ID (TypeScript) or a
+// fixed placeholder ID (Python).
+func TestProtocolStatus_404WithJSONRPCBody(t *testing.T) {
 	t.Parallel()
-	arm := armed()
-	ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, call rpcCall) {
-		writeRPCError(w, http.StatusNotFound, call.ID, -32002, "resource gone", nil)
-	}))
-	c := newInitializedClient(t, ss.URL)
 
-	ctx, cancel := context.WithTimeout(context.Background(), statusTestTimeout)
-	defer cancel()
-	_, err := callEcho(ctx, c, "x")
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, transport.ErrSessionTerminated), "got %v", err)
-	assert.False(t, errors.Is(err, mcp.ErrMethodNotFound), "got %v", err)
-	var wire *jsonrpc.Error
-	require.True(t, errors.As(err, &wire), "JSON-RPC error must stay reachable: %v", err)
-	assert.Equal(t, int64(-32002), wire.Code)
-	assert.Equal(t, "resource gone", wire.Message)
+	t.Run("error answering the call keeps the session", func(t *testing.T) {
+		t.Parallel()
+		arm := armed()
+		ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, call rpcCall) {
+			writeRPCError(w, http.StatusNotFound, call.ID, -32002, "resource gone", nil)
+		}))
+		c := newInitializedClient(t, ss.URL)
 
-	requireUsable(t, c, "after-404-json-rpc")
+		ctx, cancel := context.WithTimeout(context.Background(), statusTestTimeout)
+		defer cancel()
+		_, err := callEcho(ctx, c, "x")
+		require.Error(t, err)
+		assert.False(t, errors.Is(err, transport.ErrSessionTerminated), "got %v", err)
+		assert.False(t, errors.Is(err, mcp.ErrMethodNotFound), "got %v", err)
+		var wire *jsonrpc.Error
+		require.True(t, errors.As(err, &wire), "JSON-RPC error must stay reachable: %v", err)
+		assert.Equal(t, int64(-32002), wire.Code)
+		assert.Equal(t, "resource gone", wire.Message)
+
+		requireUsable(t, c, "after-404-json-rpc")
+	})
+
+	for _, tc := range []struct {
+		name string
+		id   any
+		code int
+		msg  string
+	}{
+		{"TypeScript SDK session not found (null ID)", nil, -32001, "Session not found"},
+		{"Python SDK session terminated (placeholder ID)", "server-error", -32600, "Session has been terminated"},
+	} {
+		t.Run(tc.name+" is a terminated session", func(t *testing.T) {
+			t.Parallel()
+			arm := armed()
+			ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, _ rpcCall) {
+				writeRPCError(w, http.StatusNotFound, tc.id, tc.code, tc.msg, nil)
+			}))
+			c := newInitializedClient(t, ss.URL)
+
+			ctx, cancel := context.WithTimeout(context.Background(), statusTestTimeout)
+			defer cancel()
+			_, err := callEcho(ctx, c, "x")
+			require.Error(t, err)
+			assert.True(t, errors.Is(err, transport.ErrSessionTerminated), "got %v", err)
+			assert.False(t, errors.Is(err, mcp.ErrMethodNotFound), "got %v", err)
+		})
+	}
 }
 
 // TestProtocolStatus_ErrorBodyIsBounded verifies an oversized error body neither

@@ -167,6 +167,13 @@ func mapStatusError(ctx context.Context, err error, h *errBody) (bool, error) {
 			err,
 		))
 	case http.StatusNotFound:
+		if h.answersRequest {
+			// The server answered this very request with a JSON-RPC error, so
+			// the session is live (go-sdk keeps the connection open as well).
+			// Reporting ErrSessionTerminated would make callers tear down and
+			// re-initialize a healthy session; surface the error unchanged.
+			return true, err
+		}
 		return true, transport.NewError(errors.Join(transport.ErrSessionTerminated, err))
 	default:
 		// Other 4xx on a regular call are not legacy-SSE (that classification
