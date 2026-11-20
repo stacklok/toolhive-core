@@ -83,13 +83,38 @@ type trustEntry struct {
 type SetOption func(*setConfig)
 
 type setConfig struct {
-	clock func() time.Time
+	clock        func() time.Time
+	reserved     map[string]bool
+	providerOnly bool
 }
 
 // WithClock sets the clock Verify reads once per token. The default is
 // time.Now.
 func WithClock(clock func() time.Time) SetOption {
 	return func(c *setConfig) { c.clock = clock }
+}
+
+// WithReservedIssuers refuses every trust whose Config.Issuer, with trailing
+// slashes removed, equals one of issuers with trailing slashes removed. The
+// comparison is otherwise exact. Calls accumulate. A set fed from external
+// data uses it with the issuers of another set, so that a trust cannot take
+// over one of them, for example https://idp as https://idp/.
+func WithReservedIssuers(issuers ...string) SetOption {
+	return func(c *setConfig) {
+		if c.reserved == nil {
+			c.reserved = map[string]bool{}
+		}
+		for _, iss := range issuers {
+			c.reserved[strings.TrimRight(iss, "/")] = true
+		}
+	}
+}
+
+// WithProviderOnly refuses every trust whose Config.ProviderOnly is false. A
+// set whose keys are fetched elsewhere uses it to guarantee that no trust in
+// it does discovery or a JWKS fetch.
+func WithProviderOnly() SetOption {
+	return func(c *setConfig) { c.providerOnly = true }
 }
 
 // NewTrustSet validates the trusts, builds a validator for each valid one and
@@ -101,11 +126,13 @@ func WithClock(clock func() time.Time) SetOption {
 // when a trust is missing treats the returned errors as fatal.
 //
 // A trust is refused when its ID is empty, too long or has control
-// characters; when its Config is invalid or has no Issuer; and when its ID, or
-// its issuer with trailing slashes removed, is shared with another trust that
-// was not refused for one of the earlier reasons. A shared ID or issuer refuses
-// every trust that shares it, since there is no rule for which one is meant, so
-// an invalid trust never keeps a valid one of the same issuer out.
+// characters; when its Config is invalid or has no Issuer; when
+// WithReservedIssuers reserves its issuer or WithProviderOnly requires a
+// ProviderOnly Config it lacks; and when its ID, or its issuer with trailing
+// slashes removed, is shared with another trust that was not refused for one
+// of these reasons. A shared ID or issuer refuses every trust that shares it,
+// since there is no rule for which one is meant, so an invalid trust never
+// keeps a valid one of the same issuer out.
 //
 // Routing and the shared-issuer check are byte-exact apart from trailing
 // slashes: there is no case or default-port normalisation. Because every copy
@@ -132,6 +159,9 @@ func NewTrustSet(ctx context.Context, trusts []Trust, opts ...SetOption) (*Trust
 	cfgs := make([]Config, len(trusts))
 	for i, t := range trusts {
 		cfgs[i], errs[i] = validateTrust(t)
+		if errs[i] == nil {
+			errs[i] = sc.refuse(t)
+		}
 	}
 	refuseShared(trusts, errs, "ID", func(t Trust) string { return t.ID })
 	refuseShared(trusts, errs, "issuer", func(t Trust) string { return strings.TrimRight(t.Config.Issuer, "/") })
@@ -166,6 +196,17 @@ func NewTrustSet(ctx context.Context, trusts []Trust, opts ...SetOption) (*Trust
 		}
 	}
 	return s, report
+}
+
+// refuse applies the set's own rules to a trust that passed validateTrust.
+func (c *setConfig) refuse(t Trust) error {
+	if c.reserved[strings.TrimRight(t.Config.Issuer, "/")] {
+		return fmt.Errorf("authn: issuer %s is reserved", quoteUntrusted(t.Config.Issuer))
+	}
+	if c.providerOnly && !t.Config.ProviderOnly {
+		return fmt.Errorf("authn: issuer %s: the set accepts only ProviderOnly trusts", quoteUntrusted(t.Config.Issuer))
+	}
+	return nil
 }
 
 // validateTrust checks one trust without I/O and returns its validated Config.
