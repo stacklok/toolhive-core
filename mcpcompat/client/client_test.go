@@ -36,17 +36,24 @@ const testClientVersion = "1.0.0"
 // testClientName is the shared client name used in InitializeParams across tests.
 const testClientName = "test-client"
 
-// newTestServer stands up a real go-sdk MCP server exposing a single "echo"
-// tool, served over Streamable HTTP via httptest.
-func newTestServer(t *testing.T) *httptest.Server {
-	t.Helper()
-	srv := gosdk.NewServer(&gosdk.Implementation{Name: "testserver", Version: "9.9.9"}, nil)
+// newEchoSDKServer builds a real go-sdk MCP server exposing a single "echo"
+// tool that replies "echo: <message>".
+func newEchoSDKServer(impl *gosdk.Implementation) *gosdk.Server {
+	srv := gosdk.NewServer(impl, nil)
 	gosdk.AddTool(srv, &gosdk.Tool{Name: echoToolName, Description: "echo the message"},
 		func(_ context.Context, _ *gosdk.CallToolRequest, in echoInput) (*gosdk.CallToolResult, any, error) {
 			return &gosdk.CallToolResult{
 				Content: []gosdk.Content{&gosdk.TextContent{Text: "echo: " + in.Message}},
 			}, nil, nil
 		})
+	return srv
+}
+
+// newTestServer stands up a real go-sdk MCP server exposing a single "echo"
+// tool, served over Streamable HTTP via httptest.
+func newTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := newEchoSDKServer(&gosdk.Implementation{Name: "testserver", Version: "9.9.9"})
 	handler := gosdk.NewStreamableHTTPHandler(func(*http.Request) *gosdk.Server { return srv }, nil)
 	ts := httptest.NewServer(handler)
 	t.Cleanup(ts.Close)
