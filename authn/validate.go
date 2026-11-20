@@ -209,7 +209,12 @@ func ParseBearer(headerValue string) (string, error) {
 // Every failure is a *Error. It reads the clock once and runs verify
 // (signature and temporal checks), then accept (audience, `typ`, `cnf`).
 func (v *Validator) Validate(ctx context.Context, token string) (Principal, error) {
-	now := time.Now()
+	return v.validateAt(ctx, token, time.Now())
+}
+
+// validateAt is Validate with the clock reading supplied, so a TrustSet can
+// use one reading for its own checks and the validator's.
+func (v *Validator) validateAt(ctx context.Context, token string, now time.Time) (Principal, error) {
 	claims, header, err := v.verify(ctx, token, now)
 	if err != nil {
 		return Principal{}, err
@@ -642,7 +647,7 @@ func (v *Validator) providerKeySet(ctx context.Context, kid, alg string) (any, b
 // stage is appended to the detail message ("" or " after refresh") so the two
 // call sites stay distinguishable in a log.
 func (v *Validator) lookupCandidates(ctx context.Context, kid, alg, stage string) ([]jwk.Key, error) {
-	set, err := v.jwksCache.Lookup(ctx, v.jwksURL)
+	set, err := v.lookupJWKS(ctx)
 	if err != nil {
 		// "Registered but first fetch pending" is reported distinctly; any
 		// other lookup failure also means key material is unreachable.
@@ -660,6 +665,35 @@ func (v *Validator) lookupCandidates(ctx context.Context, kid, alg, stage string
 			err: fmt.Errorf("no usable key for alg %q%s: %s", alg, stage, why)}
 	}
 	return keys, nil
+}
+
+// lookupJWKS reads the cached JWKS. The jwkfetch cache type-asserts the
+// resource its controller returns, and a controller stopped by Close can hand
+// back a nil one, so a Close that lands while a lookup is in flight panics
+// inside the library. That panic is reported as an error; a panic on a
+// validator that is still open is not this race and is re-raised.
+func (v *Validator) lookupJWKS(ctx context.Context) (set jwk.Set, err error) {
+	defer v.recoverClosed(&err)
+	return v.jwksCache.Lookup(ctx, v.jwksURL)
+}
+
+// refreshJWKS refetches the JWKS. Cache.Refresh ends in the same lookup as
+// lookupJWKS and has the same Close race, so it is guarded the same way.
+func (v *Validator) refreshJWKS(ctx context.Context) (err error) {
+	defer v.recoverClosed(&err)
+	_, err = v.jwksCache.Refresh(ctx, v.jwksURL)
+	return err
+}
+
+// recoverClosed turns a panic into *err only when the validator is closed.
+// Call it directly from a defer.
+func (v *Validator) recoverClosed(err *error) {
+	if r := recover(); r != nil {
+		if !v.closed() {
+			panic(r)
+		}
+		*err = errors.New("validator was closed during the JWKS operation")
+	}
 }
 
 // candidateKeys filters the JWKS set down to the keys eligible to verify a
@@ -864,7 +898,7 @@ func (v *Validator) refreshOnce() (bool, error) {
 	// validator's lifetime context, not the per-request ctx.
 	refreshCtx, cancel := context.WithTimeout(v.ctx, defaultHTTPTimeout)
 	defer cancel()
-	_, err := v.jwksCache.Refresh(refreshCtx, v.jwksURL)
+	err := v.refreshJWKS(refreshCtx)
 	now := time.Now()
 	v.lastRefresh = now
 	if err == nil {

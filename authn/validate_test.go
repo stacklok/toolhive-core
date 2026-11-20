@@ -17,6 +17,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2322,4 +2323,55 @@ func TestKeyRejectionStringsAreSafe(t *testing.T) {
 	}
 	// The zero value must not read as a failure, since it means "eligible".
 	assert.Equal(t, "eligible", rejectNone.String())
+}
+
+// TestValidateSurvivesCloseRace covers a Close landing while Validate is
+// reading the JWKS cache. jwkfetch type-asserts the resource its stopped
+// controller returns, which panicked. Callers validate in a loop until the
+// validator reports it is gone; each call must return a principal or a
+// CodeUnavailable error, and nothing may panic. Run under -race.
+func TestValidateSurvivesCloseRace(t *testing.T) {
+	t.Parallel()
+
+	rsaKey := mintRSA(t, "rsa-1")
+	js := newJWKSServer(t, rsaKey.jwk)
+	token := rsaKey.mint(t, js.srv.URL)
+
+	const iterations, callers = 30, 16
+	for range iterations {
+		v, err := NewValidator(context.Background(), js.configFor())
+		require.NoError(t, err)
+
+		var served atomic.Int32
+		var wg sync.WaitGroup
+		errs := make(chan error, callers)
+		for range callers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					_, err := v.Validate(context.Background(), token)
+					if err != nil {
+						errs <- err
+						return
+					}
+					served.Add(1)
+				}
+			}()
+		}
+		// Close once calls are demonstrably in flight, not before they start.
+		for served.Load() < callers {
+			runtime.Gosched()
+		}
+		v.Close()
+		wg.Wait()
+		close(errs)
+
+		for err := range errs {
+			var authnErr *Error
+			require.ErrorAs(t, err, &authnErr)
+			assert.Equal(t, CodeUnavailable, authnErr.Code)
+			assert.Equal(t, ReasonKeysUnavailable, authnErr.Reason)
+		}
+	}
 }

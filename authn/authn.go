@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 	"unicode"
@@ -303,7 +304,24 @@ type Config struct {
 	//
 	// With no KeyProvider, construction stays fail-closed: discovery and the
 	// first JWKS fetch must both succeed or NewValidator returns an error.
+	//
+	// Set ProviderOnly to drop the discovery and JWKS fallback entirely.
 	KeyProvider KeyProvider
+
+	// ProviderOnly makes KeyProvider the only key source: there is no OIDC
+	// discovery and no JWKS, so the validator makes no network requests and
+	// starts no background refresh. A kid the provider does not offer is
+	// ReasonUnknownKID. Issuer is still required and still verified.
+	//
+	// KeyProvider.PublicKeys is called on every validation, so "no network
+	// requests" holds only if the provider itself serves from memory.
+	//
+	// Use it when another component already fetches and caches the issuer's
+	// keys, for example keys taken from a directory service, so that the
+	// issuer URL is never contacted. It requires KeyProvider, and the settings
+	// that only configure fetching (JWKSURL, HTTPClient, CACertPath,
+	// AuthTokenFile, AllowPrivateIP and MaxJWKSStaleness) must be unset.
+	ProviderOnly bool
 }
 
 // Validator verifies inbound JWT bearer tokens against the configured issuer
@@ -414,6 +432,12 @@ func ValidateConfig(cfg Config) (Config, error) {
 // Errors returned here are ordinary construction errors, not the *Error type:
 // *Error is reserved for Validate/ParseBearer runtime failures.
 func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
+	return newValidator(ctx, nil, cfg)
+}
+
+// newValidator is NewValidator with an optional buildCtx that also bounds the
+// construction network I/O. The validator's lifetime is still ctx.
+func newValidator(ctx, buildCtx context.Context, cfg Config) (*Validator, error) {
 	// Validation, defaulting and the defensive slice cloning all live in
 	// ValidateConfig, which is exported for callers that need to reject a
 	// misconfiguration before committing to construction. Routing through it here
@@ -424,9 +448,13 @@ func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
 		return nil, err
 	}
 
-	httpClient, err := newHTTPClient(cfg.HTTPClient, cfg.AllowPrivateIP, cfg.CACertPath, cfg.AuthTokenFile)
-	if err != nil {
-		return nil, err
+	// A ProviderOnly validator never fetches, so it gets no client.
+	var httpClient *http.Client
+	if !cfg.ProviderOnly {
+		httpClient, err = newHTTPClient(cfg.HTTPClient, cfg.AllowPrivateIP, cfg.CACertPath, cfg.AuthTokenFile)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	v := &Validator{
@@ -450,7 +478,7 @@ func NewValidator(ctx context.Context, cfg Config) (*Validator, error) {
 	// short-lived construction context. Per-operation construction network I/O
 	// (Step 2 Register fetch, Step 3 discovery) is bounded separately with
 	// constructionTimeout inside init; that bound must NOT reach NewCache.
-	if err := v.init(v.ctx); err != nil {
+	if err := v.init(v.ctx, buildCtx); err != nil {
 		v.cancel()
 		return nil, err
 	}
@@ -496,6 +524,12 @@ func (v *Validator) closed() bool {
 
 // validate checks cfg and fills in defaults, performing no I/O.
 func (c *Config) validate() error {
+	// ProviderOnly has its own key-source rules, so check it first: the generic
+	// check below would otherwise suggest setting jwks_url, which ProviderOnly
+	// forbids.
+	if err := c.validateProviderOnly(); err != nil {
+		return err
+	}
 	// At least one of Issuer/JWKSURL is required: the issuer is what discovery
 	// resolves the JWKS URL from, so with neither there is no key material to
 	// reach. An Issuer-less config is permitted (and skips iss verification) so
@@ -505,6 +539,9 @@ func (c *Config) validate() error {
 	}
 	if c.Issuer != "" {
 		if err := validateHTTPSURI("issuer", c.Issuer, c.InsecureAllowHTTP); err != nil {
+			return err
+		}
+		if err := validateIssuerForm(c.Issuer); err != nil {
 			return err
 		}
 	}
@@ -535,6 +572,41 @@ func (c *Config) validate() error {
 		return fmt.Errorf("authn: max JWKS staleness must not be negative: %s", c.MaxJWKSStaleness)
 	}
 	return c.validateAcceptance()
+}
+
+// validateProviderOnly checks that a ProviderOnly config has a provider and an
+// issuer, and sets nothing that only configures fetching, which would
+// otherwise be silently ignored.
+func (c *Config) validateProviderOnly() error {
+	if !c.ProviderOnly {
+		return nil
+	}
+	if c.KeyProvider == nil {
+		return errors.New("authn: provider_only requires a key provider")
+	}
+	if c.Issuer == "" {
+		return errors.New("authn: provider_only requires an issuer")
+	}
+	var set []string
+	for _, f := range []struct {
+		name string
+		set  bool
+	}{
+		{"jwks_url", c.JWKSURL != ""},
+		{"http_client", c.HTTPClient != nil},
+		{"ca_cert_path", c.CACertPath != ""},
+		{"auth_token_file", c.AuthTokenFile != ""},
+		{"allow_private_ip", c.AllowPrivateIP},
+		{"max_jwks_staleness", c.MaxJWKSStaleness != 0},
+	} {
+		if f.set {
+			set = append(set, f.name)
+		}
+	}
+	if len(set) > 0 {
+		return fmt.Errorf("authn: provider_only fetches no keys, so %s must not be set", strings.Join(set, ", "))
+	}
+	return nil
 }
 
 // validateAcceptance checks the settings that feed the acceptance policy.
@@ -648,6 +720,18 @@ func validateHTTPSURI(field, raw string, insecureAllowHTTP bool) error {
 	return fmt.Errorf("authn: %s must use https scheme (set InsecureAllowHTTP for dev only): %s", field, raw)
 }
 
+// validateIssuerForm rejects an issuer with a template placeholder, such as
+// the {tenantid} in a multi-tenant discovery document. No token carries one
+// in its iss. Percent-encoded braces are rejected too.
+func validateIssuerForm(issuer string) error {
+	lower := strings.ToLower(issuer)
+	if strings.ContainsAny(issuer, "{}") || strings.Contains(lower, "%7b") || strings.Contains(lower, "%7d") {
+		return errors.New("authn: issuer contains a template placeholder such as {tenantid}, " +
+			"which no token carries: configure one issuer per tenant")
+	}
+	return nil
+}
+
 // init resolves the JWKS URL, starts the jwx cache, and registers the URL with
 // it. The ctx passed here is the validator's LIFETIME context (v.ctx):
 // jwkfetch.NewCache permanently binds the httprc controller/worker refresh
@@ -658,7 +742,22 @@ func validateHTTPSURI(field, raw string, insecureAllowHTTP bool) error {
 // the discovery fetch and the first JWKS fetch inside Register/Refresh — runs
 // under a context derived from ctx with constructionTimeout; that bound must
 // NOT reach jwkfetch.NewCache.
-func (v *Validator) init(ctx context.Context) error {
+func (v *Validator) init(ctx, buildCtx context.Context) error {
+	if v.cfg.ProviderOnly {
+		return nil
+	}
+	// Construction I/O also stops when buildCtx is done. Only the lifetime ctx
+	// reaches jwkfetch.NewCache.
+	ioCtx := ctx
+	if buildCtx != nil {
+		var cancel context.CancelFunc
+		ioCtx, cancel = context.WithCancel(ctx)
+		stop := context.AfterFunc(buildCtx, cancel)
+		defer func() {
+			stop()
+			cancel()
+		}()
+	}
 	// Resolve the JWKS URL first: either the explicit Config.JWKSURL or the
 	// jwks_uri discovered from the issuer's OIDC metadata.
 	v.jwksURL = v.cfg.JWKSURL
@@ -668,7 +767,7 @@ func (v *Validator) init(ctx context.Context) error {
 		//
 		// Bound the discovery fetch so an unresponsive issuer cannot hang
 		// NewValidator past constructionTimeout.
-		discCtx, cancel := context.WithTimeout(ctx, constructionTimeout)
+		discCtx, cancel := context.WithTimeout(ioCtx, constructionTimeout)
 		jwksURI, err := v.discoverWithRetry(discCtx, v.cfg.Issuer)
 		cancel()
 		switch {
@@ -742,7 +841,7 @@ func (v *Validator) init(ctx context.Context) error {
 
 	// The first fetch is construction I/O only; bound it so an unresponsive
 	// JWKS endpoint cannot hang NewValidator past constructionTimeout.
-	fetchCtx, cancel := context.WithTimeout(ctx, constructionTimeout)
+	fetchCtx, cancel := context.WithTimeout(ioCtx, constructionTimeout)
 	defer cancel()
 
 	// WithConstantInterval pins the refresh cadence: the issuer's
@@ -764,10 +863,10 @@ func (v *Validator) init(ctx context.Context) error {
 	// Attempt the first fetch regardless of whether a KeyProvider is set; only
 	// whether a FAILURE is fatal differs.
 	refreshErr := func() error {
-		if _, err := v.jwksCache.Refresh(fetchCtx, v.jwksURL); err != nil {
+		if err := v.refreshJWKS(fetchCtx); err != nil {
 			return fmt.Errorf("authn: failed to fetch JWKS from %s: %w", v.jwksURL, err)
 		}
-		if _, err := v.jwksCache.Lookup(fetchCtx, v.jwksURL); err != nil {
+		if _, err := v.lookupJWKS(fetchCtx); err != nil {
 			return fmt.Errorf("authn: JWKS from %s unavailable after fetch: %w", v.jwksURL, err)
 		}
 		return nil
