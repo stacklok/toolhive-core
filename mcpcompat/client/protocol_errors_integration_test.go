@@ -90,52 +90,46 @@ func TestProtocolStatus_TransientStatusBodyStillReachesCaller(t *testing.T) {
 	requireUsable(t, c, "after-503")
 }
 
-// TestProtocolStatus_404WithJSONRPCBody separates a 404 that answers the call
-// from a 404 that reports a terminated session. The MCP spec reserves 404 for
-// terminated sessions, but go-sdk servers on newer protocol versions also use
-// it for application errors on a live session. The JSON-RPC ID decides: an
-// error carrying this request's ID was produced by handling the request, while
-// the session-not-found 404s of other SDKs use a null ID (TypeScript) or a
-// fixed placeholder ID (Python).
-func TestProtocolStatus_404WithJSONRPCBody(t *testing.T) {
+// TestProtocolStatus_Bare404WithJSONRPCBody pins the CURRENT precedence: the
+// MCP spec reserves HTTP 404 for a terminated session, so the shim reports
+// ErrSessionTerminated for any 404 except one carrying JSON-RPC method-not-found.
+// The decoded JSON-RPC error stays reachable through errors.As.
+//
+// This broad rule is deliberate. Session-not-found 404s carry JSON-RPC error
+// bodies in practice, and ToolHive's own proxy (pkg/transport/session,
+// WriteNotFound) even echoes the request ID in them, so neither the body nor a
+// matching ID can tell an expired session from an application error. ToolHive's
+// vMCP relies on 404 -> ErrSessionTerminated -> re-initialize; weakening it
+// would leave clients retrying a dead session forever. The cost is an
+// occasional unnecessary re-initialize when a server reports an application
+// error with 404 (go-sdk itself keeps the connection open for those, which is
+// why the session below is still usable).
+func TestProtocolStatus_Bare404WithJSONRPCBody(t *testing.T) {
 	t.Parallel()
 
-	t.Run("error answering the call keeps the session", func(t *testing.T) {
-		t.Parallel()
-		arm := armed()
-		ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, call rpcCall) {
-			writeRPCError(w, http.StatusNotFound, call.ID, -32002, "resource gone", nil)
-		}))
-		c := newInitializedClient(t, ss.URL)
-
-		ctx, cancel := context.WithTimeout(context.Background(), statusTestTimeout)
-		defer cancel()
-		_, err := callEcho(ctx, c, "x")
-		require.Error(t, err)
-		assert.False(t, errors.Is(err, transport.ErrSessionTerminated), "got %v", err)
-		assert.False(t, errors.Is(err, mcp.ErrMethodNotFound), "got %v", err)
-		var wire *jsonrpc.Error
-		require.True(t, errors.As(err, &wire), "JSON-RPC error must stay reachable: %v", err)
-		assert.Equal(t, int64(-32002), wire.Code)
-		assert.Equal(t, "resource gone", wire.Message)
-
-		requireUsable(t, c, "after-404-json-rpc")
-	})
-
+	echoID := func(call rpcCall) any { return call.ID }
 	for _, tc := range []struct {
 		name string
-		id   any
+		id   func(rpcCall) any
 		code int
 		msg  string
+		// sdkKeepsConn is true when go-sdk decodes the body as a JSON-RPC
+		// error and keeps the connection open. It cannot decode a null-ID
+		// response, so it falls back to its own session-missing path and
+		// closes the connection.
+		sdkKeepsConn bool
 	}{
-		{"TypeScript SDK session not found (null ID)", nil, -32001, "Session not found"},
-		{"Python SDK session terminated (placeholder ID)", "server-error", -32600, "Session has been terminated"},
+		{"ToolHive proxy session not found (echoed ID)", echoID, -32001, "Session not found", true},
+		{"TypeScript SDK session not found (null ID)", func(rpcCall) any { return nil }, -32001, "Session not found", false},
+		{"Python SDK session terminated (placeholder ID)",
+			func(rpcCall) any { return "server-error" }, -32600, "Session has been terminated", true},
+		{"application error with echoed ID", echoID, -32002, "resource gone", true},
 	} {
-		t.Run(tc.name+" is a terminated session", func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			arm := armed()
-			ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, _ rpcCall) {
-				writeRPCError(w, http.StatusNotFound, tc.id, tc.code, tc.msg, nil)
+			ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, call rpcCall) {
+				writeRPCError(w, http.StatusNotFound, tc.id(call), tc.code, tc.msg, nil)
 			}))
 			c := newInitializedClient(t, ss.URL)
 
@@ -145,6 +139,11 @@ func TestProtocolStatus_404WithJSONRPCBody(t *testing.T) {
 			require.Error(t, err)
 			assert.True(t, errors.Is(err, transport.ErrSessionTerminated), "got %v", err)
 			assert.False(t, errors.Is(err, mcp.ErrMethodNotFound), "got %v", err)
+			assert.Contains(t, err.Error(), tc.msg, "the server's message must stay visible")
+
+			if tc.sdkKeepsConn {
+				requireUsable(t, c, "after-404-json-rpc")
+			}
 		})
 	}
 }

@@ -6,7 +6,6 @@ package client
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"io"
 	"net/http"
 )
@@ -25,11 +24,6 @@ type errBody struct {
 	status      int
 	body        string
 	wwwAuthHdrs []string // captured WWW-Authenticate header values (RFC 9728)
-	// answersRequest is set for a 404 whose body is a JSON-RPC error response
-	// carrying the request's own ID: the server processed this request on a
-	// live session (go-sdk servers answer unknown methods this way on newer
-	// protocol versions), so the 404 is not a session-termination signal.
-	answersRequest bool
 }
 
 type errBodyKey struct{}
@@ -94,64 +88,5 @@ func captureErrorBody(req *http.Request, resp *http.Response) {
 	resp.Body = io.NopCloser(bytes.NewReader(data))
 	if err == nil {
 		h.body = string(data)
-		if resp.StatusCode == http.StatusNotFound {
-			h.answersRequest = rpcErrorAnswersRequest(req, data)
-		}
-	}
-}
-
-// rpcErrorAnswersRequest reports whether body is a JSON-RPC error response whose
-// ID equals the ID of the JSON-RPC request carried by req.
-//
-// A JSON-RPC error body alone does not prove the session is alive: other SDKs
-// also answer a terminated session with a 404 plus a JSON-RPC error, but with a
-// null ID (TypeScript SDK) or a fixed placeholder ID (Python SDK's
-// "server-error"). Only an ID matching this request shows the server handled
-// it. Anything unparseable (including a body truncated at maxCapturedErrBody),
-// a notification, or a request whose body cannot be re-read returns false, which
-// keeps the safe default of reporting session termination.
-func rpcErrorAnswersRequest(req *http.Request, body []byte) bool {
-	var resp struct {
-		ID    json.RawMessage `json:"id"`
-		Error json.RawMessage `json:"error"`
-	}
-	if json.Unmarshal(body, &resp) != nil || isJSONNull(resp.Error) || isJSONNull(resp.ID) {
-		return false
-	}
-	if req.GetBody == nil {
-		return false
-	}
-	rc, err := req.GetBody()
-	if err != nil {
-		return false
-	}
-	defer func() { _ = rc.Close() }()
-	var call struct {
-		ID json.RawMessage `json:"id"`
-	}
-	if json.NewDecoder(rc).Decode(&call) != nil || isJSONNull(call.ID) {
-		return false
-	}
-	return jsonRPCIDEqual(call.ID, resp.ID)
-}
-
-// isJSONNull reports whether raw is absent or the JSON literal null.
-func isJSONNull(raw json.RawMessage) bool {
-	trimmed := bytes.TrimSpace(raw)
-	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
-}
-
-// jsonRPCIDEqual compares two JSON-RPC IDs by value, so 7 and 7.0 match. Only
-// string and number IDs are valid; anything else never matches.
-func jsonRPCIDEqual(a, b json.RawMessage) bool {
-	var x, y any
-	if json.Unmarshal(a, &x) != nil || json.Unmarshal(b, &y) != nil {
-		return false
-	}
-	switch x.(type) {
-	case string, float64:
-		return x == y
-	default:
-		return false
 	}
 }
