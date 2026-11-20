@@ -186,6 +186,9 @@ func TestNewTrustSetRefusesTrusts(t *testing.T) {
 		{"long ID", []Trust{mod(func(t *Trust) { t.ID = strings.Repeat("a", maxTrustIDLength+1) })},
 			[]string{strings.Repeat("a", maxTrustIDLength+1)}},
 		{"no issuer", []Trust{mod(func(t *Trust) { t.Config.Issuer = "" })}, []string{bad}},
+		{"templated issuer", []Trust{mod(func(t *Trust) {
+			t.Config.Issuer = templatedIssuer
+		})}, []string{bad}},
 		{"invalid config", []Trust{mod(func(t *Trust) { t.Config.Audiences = nil })}, []string{bad}},
 		{"unreachable keys", []Trust{mod(func(t *Trust) { t.Config.JWKSURL = unreachableJWKSURL })}, []string{bad}},
 		{"shared ID refuses both", []Trust{a.trust("x"), b.trust("x")}, []string{"x", "x"}},
