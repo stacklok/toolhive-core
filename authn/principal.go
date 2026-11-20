@@ -16,13 +16,13 @@ const (
 	claimSCP   = "scp"
 )
 
-// TrustRef identifies the trust that verified a token: its ID and Revision, the
-// Partition it is installed in and the Route that selected it.
+// TrustRef identifies the TrustSet trust that verified a token: its ID, its
+// issuer and the Tag the caller attached to it.
 type TrustRef struct {
-	ID        string
-	Revision  uint64
-	Partition string
-	Route     string
+	ID     string
+	Issuer string
+	// Tag is Trust.Tag, returned unchanged.
+	Tag any
 }
 
 // RequireScopes returns nil when the principal holds every scope in scopes (and
