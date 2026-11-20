@@ -133,7 +133,6 @@ func TestProtocolStatus_AuthChallengeMidSession(t *testing.T) {
 		t.Parallel()
 		arm := armed()
 		ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, call rpcCall) {
-			arm.Store(false)
 			w.Header().Set("WWW-Authenticate", bearerChallenge)
 			writeRPCError(w, http.StatusUnauthorized, call.ID, -32001, "token expired", nil)
 		}))
@@ -157,7 +156,6 @@ func TestProtocolStatus_AuthChallengeMidSession(t *testing.T) {
 		t.Parallel()
 		arm := armed()
 		ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, _ rpcCall) {
-			arm.Store(false)
 			w.Header().Set("WWW-Authenticate", bearerChallenge)
 			w.WriteHeader(http.StatusUnauthorized)
 		}))
@@ -177,7 +175,6 @@ func TestProtocolStatus_AuthChallengeMidSession(t *testing.T) {
 		t.Parallel()
 		arm := armed()
 		ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, _ rpcCall) {
-			arm.Store(false)
 			http.Error(w, "Unauthorized: denied by policy", http.StatusForbidden)
 		}))
 		c := newInitializedClient(t, ss.URL)

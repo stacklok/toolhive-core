@@ -17,13 +17,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/stacklok/toolhive-core/mcpcompat/client"
 	"github.com/stacklok/toolhive-core/mcpcompat/client/transport"
 	mcp "github.com/stacklok/toolhive-core/mcpcompat/mcp"
 )
 
-// maxCapturedBody mirrors the (unexported) 8 KiB capture limit in errorbody.go.
-// The test asserts behavior at this documented boundary.
-const maxCapturedBody = 8 << 10
+// maxCapturedBody is the real error-body capture limit from errorbody.go,
+// exposed via export_test.go so this test tracks it if it changes.
+const maxCapturedBody = client.MaxCapturedErrBody
 
 // TestProtocolStatus_JSONRPCErrorPreserved verifies that a JSON-RPC error body
 // carried by a non-2xx response reaches the caller intact (go-sdk v1.8 decodes
@@ -40,7 +41,6 @@ func TestProtocolStatus_JSONRPCErrorPreserved(t *testing.T) {
 			t.Parallel()
 			arm := armed()
 			ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, call rpcCall) {
-				arm.Store(false)
 				writeRPCError(w, status, call.ID, code, msg, map[string]any{"field": "arguments"})
 			}))
 			c := newInitializedClient(t, ss.URL)
@@ -73,7 +73,6 @@ func TestProtocolStatus_TransientStatusBodyStillReachesCaller(t *testing.T) {
 	t.Parallel()
 	arm := armed()
 	ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, call rpcCall) {
-		arm.Store(false)
 		writeRPCError(w, http.StatusServiceUnavailable, call.ID, -32000, "backend overloaded", nil)
 	}))
 	c := newInitializedClient(t, ss.URL)
@@ -91,18 +90,22 @@ func TestProtocolStatus_TransientStatusBodyStillReachesCaller(t *testing.T) {
 	requireUsable(t, c, "after-503")
 }
 
-// TestProtocolStatus_Bare404WithJSONRPCBody pins the documented precedence: the
+// TestProtocolStatus_Bare404WithJSONRPCBody pins the CURRENT precedence: the
 // MCP spec reserves HTTP 404 for a terminated session, so the shim reports
 // ErrSessionTerminated for any 404 except one carrying JSON-RPC method-not-found.
-// The decoded JSON-RPC error stays reachable through errors.As. go-sdk itself
-// keeps the connection open for such a response, so the follow-up call works;
-// callers must therefore treat this classification as "re-initialize may be
-// needed", not proof the session is gone.
+// The decoded JSON-RPC error stays reachable through errors.As.
+//
+// KNOWN GAP: this classification is too coarse. A 404 that carries a decoded
+// JSON-RPC error matching the request ID means the server answered on a live
+// session; go-sdk keeps the connection open, and the follow-up call below
+// succeeds. A caller reacting to ErrSessionTerminated would needlessly tear
+// down and re-initialize a healthy session. If mapStatusError is changed to
+// treat such a 404 as an application error, flip the ErrSessionTerminated
+// assertion here rather than treating its failure as a regression.
 func TestProtocolStatus_Bare404WithJSONRPCBody(t *testing.T) {
 	t.Parallel()
 	arm := armed()
 	ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, call rpcCall) {
-		arm.Store(false)
 		writeRPCError(w, http.StatusNotFound, call.ID, -32002, "resource gone", nil)
 	}))
 	c := newInitializedClient(t, ss.URL)
@@ -128,7 +131,6 @@ func TestProtocolStatus_ErrorBodyIsBounded(t *testing.T) {
 	arm := armed()
 	huge := strings.Repeat("A", 8*maxCapturedBody) + "TAIL-MARKER"
 	ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, _ rpcCall) {
-		arm.Store(false)
 		http.Error(w, huge, http.StatusForbidden)
 	}))
 	c := newInitializedClient(t, ss.URL)

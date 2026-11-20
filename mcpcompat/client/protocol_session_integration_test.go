@@ -7,13 +7,11 @@ package client_test
 // deadlines, cancellation and disconnects over a real client.
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -24,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/stacklok/toolhive-core/mcpcompat/client"
 	"github.com/stacklok/toolhive-core/mcpcompat/client/transport"
 	mcp "github.com/stacklok/toolhive-core/mcpcompat/mcp"
 )
@@ -70,7 +69,6 @@ func TestProtocolStatus_MethodNotFoundVersusTerminatedSession(t *testing.T) {
 		// gone", so the JSON-RPC code must win.
 		arm := armed()
 		ss := newStatusServer(t, onMethod("resources/list", arm, func(w http.ResponseWriter, call rpcCall) {
-			arm.Store(false)
 			writeRPCError(w, http.StatusNotFound, call.ID, int(jsonrpc.CodeMethodNotFound), "method not found", nil)
 		}))
 		c := newInitializedClient(t, ss.URL)
@@ -113,40 +111,95 @@ func deleteSession(t *testing.T, url, sessionID string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
 	require.NoError(t, err)
 	req.Header.Set("Mcp-Session-Id", sessionID)
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	defer tr.CloseIdleConnections()
-	resp, err := (&http.Client{Transport: tr}).Do(req)
+	hc, err := isolatedHTTPClient()
+	require.NoError(t, err)
+	defer hc.CloseIdleConnections()
+	resp, err := hc.Do(req)
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	require.Less(t, resp.StatusCode, 300, "session DELETE must succeed")
 }
 
+// isRPCError reports whether err carries a decoded JSON-RPC error with code and
+// was NOT reclassified as an auth or session failure.
+func isRPCError(err error, code int64) bool {
+	var wire *jsonrpc.Error
+	return errors.As(err, &wire) && wire.Code == code &&
+		!errors.Is(err, transport.ErrUnauthorized) &&
+		!errors.Is(err, transport.ErrSessionTerminated)
+}
+
+// isAuthChallenge reports whether err is an auth-required error carrying this
+// suite's RFC 9728 resource_metadata URL.
+func isAuthChallenge(err error) bool {
+	var are *transport.AuthorizationRequiredError
+	return errors.Is(err, transport.ErrUnauthorized) &&
+		errors.As(err, &are) && are.ResourceMetadataURL == resourceMetadataURL
+}
+
 // TestProtocolStatus_RecoveryAfterRecoverableErrors drives several error kinds
-// through ONE client, interleaved with successful calls.
+// through ONE client, interleaved with successful calls, and checks that each
+// failure is classified as its own kind (not as a previous call's error).
 func TestProtocolStatus_RecoveryAfterRecoverableErrors(t *testing.T) {
 	t.Parallel()
+
+	type failure struct {
+		respond func(w http.ResponseWriter, call rpcCall)
+		check   func(err error) bool
+	}
+	failures := map[int32]failure{
+		2: { // JSON-RPC error over HTTP 400
+			respond: func(w http.ResponseWriter, call rpcCall) {
+				writeRPCError(w, http.StatusBadRequest, call.ID, -32602, "invalid params", nil)
+			},
+			check: func(err error) bool { return isRPCError(err, -32602) },
+		},
+		4: { // JSON-RPC error over HTTP 200
+			respond: func(w http.ResponseWriter, call rpcCall) {
+				writeRPCError(w, http.StatusOK, call.ID, -32603, "internal tool failure", nil)
+			},
+			check: func(err error) bool { return isRPCError(err, -32603) },
+		},
+		6: { // transient 503 with a plain-text body
+			respond: func(w http.ResponseWriter, _ rpcCall) {
+				http.Error(w, "try later", http.StatusServiceUnavailable)
+			},
+			check: func(err error) bool {
+				return err != nil &&
+					strings.Contains(err.Error(), "request failed with status 503: try later") &&
+					!errors.Is(err, transport.ErrUnauthorized) &&
+					!errors.Is(err, transport.ErrSessionTerminated)
+			},
+		},
+		8: { // 403 with a JSON-RPC body
+			// Not -32003/-32004/-32005: go-sdk reserves those internally
+			// (client closing, server closing, rejected by transport) and
+			// surfaces a server error with -32003 as "connection closed",
+			// dropping the *jsonrpc.Error.
+			respond: func(w http.ResponseWriter, call rpcCall) {
+				writeRPCError(w, http.StatusForbidden, call.ID, -32010, "forbidden by policy", nil)
+			},
+			check: func(err error) bool { return isRPCError(err, -32010) },
+		},
+		10: { // 401 with JSON-RPC body and challenge
+			respond: func(w http.ResponseWriter, call rpcCall) {
+				w.Header().Set("WWW-Authenticate", bearerChallenge)
+				writeRPCError(w, http.StatusUnauthorized, call.ID, -32001, "expired", nil)
+			},
+			check: isAuthChallenge,
+		},
+	}
 
 	var step atomic.Int32
 	ss := newStatusServer(t, func(w http.ResponseWriter, r *http.Request, call rpcCall) bool {
 		if r.Method != http.MethodPost || call.Method != "tools/call" {
 			return false
 		}
-		switch step.Add(1) {
-		case 2: // JSON-RPC error over HTTP 400
-			writeRPCError(w, http.StatusBadRequest, call.ID, -32602, "invalid params", nil)
-		case 4: // JSON-RPC error over HTTP 200
-			writeRPCError(w, http.StatusOK, call.ID, -32603, "internal tool failure", nil)
-		case 6: // transient 503
-			http.Error(w, "try later", http.StatusServiceUnavailable)
-		case 8: // 403 with a JSON-RPC body
-			writeRPCError(w, http.StatusForbidden, call.ID, -32003, "forbidden by policy", nil)
-		case 10: // 401 with JSON-RPC body and challenge
-			w.Header().Set("WWW-Authenticate", bearerChallenge)
-			writeRPCError(w, http.StatusUnauthorized, call.ID, -32001, "expired", nil)
-		default:
-			return false
+		f, ok := failures[step.Add(1)]
+		if ok {
+			f.respond(w, call)
 		}
-		return true
+		return ok
 	})
 	c := newInitializedClient(t, ss.URL)
 	sessionID := c.GetSessionId()
@@ -154,53 +207,105 @@ func TestProtocolStatus_RecoveryAfterRecoverableErrors(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*statusTestTimeout)
 	defer cancel()
-	for i := 1; i <= 11; i++ {
+	for i := int32(1); i <= 11; i++ {
 		got, err := callEcho(ctx, c, fmt.Sprint(i))
-		if i%2 == 1 {
-			require.NoError(t, err, "call %d should succeed", i)
-			assert.Equal(t, "echo: "+fmt.Sprint(i), got)
+		if f, ok := failures[i]; ok {
+			require.Error(t, err, "call %d should fail", i)
+			assert.True(t, f.check(err), "call %d classified wrongly: %v", i, err)
 			continue
 		}
-		require.Error(t, err, "call %d should fail", i)
-		assert.False(t, errors.Is(err, transport.ErrSessionTerminated), "call %d: %v", i, err)
+		require.NoError(t, err, "call %d should succeed", i)
+		assert.Equal(t, "echo: "+fmt.Sprint(i), got)
 	}
 	assert.Equal(t, sessionID, c.GetSessionId(), "the session must not have been replaced")
 	assert.True(t, c.IsInitialized())
 }
 
+// triggerFault fails a tools/call according to its echo message: "401" gets an
+// auth challenge with a JSON-RPC body, "400" a JSON-RPC invalid-params error.
+// Any other message is served by the real server.
+func triggerFault(w http.ResponseWriter, r *http.Request, call rpcCall) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	switch call.echoMessage() {
+	case "401":
+		w.Header().Set("WWW-Authenticate", bearerChallenge)
+		writeRPCError(w, http.StatusUnauthorized, call.ID, -32001, "expired", nil)
+		return true
+	case "400":
+		writeRPCError(w, http.StatusBadRequest, call.ID, -32602, "invalid", nil)
+		return true
+	}
+	return false
+}
+
+// checkTriggeredCall sends trigger through callEcho and verifies the result
+// matches what triggerFault does for it. It returns an error instead of using
+// t so it is safe to call from goroutines.
+func checkTriggeredCall(ctx context.Context, c *client.Client, trigger string) error {
+	got, err := callEcho(ctx, c, trigger)
+	switch trigger {
+	case "401":
+		if !isAuthChallenge(err) {
+			return fmt.Errorf("%s: want auth challenge, got %v", trigger, err)
+		}
+	case "400":
+		if !isRPCError(err, -32602) {
+			return fmt.Errorf("%s: want JSON-RPC -32602 only, got %v", trigger, err)
+		}
+	default:
+		if err != nil || got != "echo: "+trigger {
+			return fmt.Errorf("%s: want success, got %q %v", trigger, got, err)
+		}
+	}
+	return nil
+}
+
+// TestProtocolStatus_ConcurrentCallsOnOneClient fires failing and succeeding
+// calls in parallel on ONE client. Error capture is scoped to each call's
+// context, but every call goes through the same client RoundTripper, so this
+// is where a leak between calls would show: one call's 401 challenge attached
+// to another call's 400, or a successful call reporting an error.
+func TestProtocolStatus_ConcurrentCallsOnOneClient(t *testing.T) {
+	t.Parallel()
+	const calls = 24
+	triggers := []string{"401", "400", "ok"}
+
+	ss := newStatusServer(t, triggerFault)
+	c := newInitializedClient(t, ss.URL)
+	sessionID := c.GetSessionId()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*statusTestTimeout)
+	defer cancel()
+	var wg sync.WaitGroup
+	errs := make(chan error, calls)
+	for i := 0; i < calls; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := checkTriggeredCall(ctx, c, triggers[i%len(triggers)]); err != nil {
+				errs <- fmt.Errorf("call %d: %w", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		assert.NoError(t, err)
+	}
+	assert.Equal(t, sessionID, c.GetSessionId(), "the session must not have been replaced")
+	requireUsable(t, c, "after-concurrent-calls")
+}
+
 // TestProtocolStatus_ConcurrentIndependentClients checks per-call capture state
-// does not leak between clients or between concurrent calls on one process.
+// does not leak between separate clients running at the same time.
 func TestProtocolStatus_ConcurrentIndependentClients(t *testing.T) {
 	t.Parallel()
 	const clients = 8
 
-	ss := newStatusServer(t, func(w http.ResponseWriter, r *http.Request, call rpcCall) bool {
-		if r.Method != http.MethodPost || call.Method != "tools/call" {
-			return false
-		}
-		// Each client tags its calls with its index in the tool arguments; make
-		// even-indexed clients see a 401 challenge, odd ones a JSON-RPC 400.
-		var env struct {
-			Params struct {
-				Arguments struct {
-					Message string `json:"message"`
-				} `json:"arguments"`
-			} `json:"params"`
-		}
-		body, _ := io.ReadAll(r.Body)
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		_ = json.Unmarshal(body, &env)
-		switch env.Params.Arguments.Message {
-		case "401":
-			w.Header().Set("WWW-Authenticate", bearerChallenge)
-			writeRPCError(w, http.StatusUnauthorized, call.ID, -32001, "expired", nil)
-			return true
-		case "400":
-			writeRPCError(w, http.StatusBadRequest, call.ID, -32602, "invalid", nil)
-			return true
-		}
-		return false
-	})
+	// Even-indexed clients trigger a 401 challenge, odd ones a JSON-RPC 400.
+	ss := newStatusServer(t, triggerFault)
 
 	var wg sync.WaitGroup
 	errs := make(chan error, clients)
@@ -230,25 +335,15 @@ func runConcurrentClient(url string, i int) error {
 	if _, err := c.Initialize(ctx, initRequest()); err != nil {
 		return fmt.Errorf("client %d initialize: %w", i, err)
 	}
+	trigger := "400"
+	if i%2 == 0 {
+		trigger = "401"
+	}
 	for round := 0; round < 5; round++ {
-		trigger := "400"
-		check := func(err error) bool {
-			var wire *jsonrpc.Error
-			return errors.As(err, &wire) && wire.Code == -32602 && !errors.Is(err, transport.ErrUnauthorized)
-		}
-		if i%2 == 0 {
-			trigger = "401"
-			check = func(err error) bool {
-				var are *transport.AuthorizationRequiredError
-				return errors.As(err, &are) && are.ResourceMetadataURL == resourceMetadataURL
+		for _, msg := range []string{trigger, "ok"} {
+			if err := checkTriggeredCall(ctx, c, msg); err != nil {
+				return fmt.Errorf("client %d round %d: %w", i, round, err)
 			}
-		}
-		if _, err := callEcho(ctx, c, trigger); !check(err) {
-			return fmt.Errorf("client %d round %d: unexpected error for %s: %v", i, round, trigger, err)
-		}
-		got, err := callEcho(ctx, c, "ok")
-		if err != nil || got != "echo: ok" {
-			return fmt.Errorf("client %d round %d: recovery failed: %q %v", i, round, got, err)
 		}
 	}
 	return nil
@@ -274,7 +369,6 @@ func TestProtocolStatus_TimeoutAndCancellation(t *testing.T) {
 			entered := make(chan struct{})
 			release := make(chan struct{})
 			ss := newStatusServer(t, onMethod("tools/call", arm, func(w http.ResponseWriter, _ rpcCall) {
-				arm.Store(false)
 				close(entered)
 				select { // stall until released or the test ends
 				case <-release:
@@ -321,6 +415,10 @@ func TestProtocolStatus_TimeoutAndCancellation(t *testing.T) {
 			assert.False(t, errors.Is(err, transport.ErrUnauthorized))
 			assert.False(t, errors.Is(err, transport.ErrSessionTerminated))
 
+			// The deadline can expire before the stalled call reaches the
+			// server, leaving the fault armed; disarm it so the recovery call
+			// below is served by the real server rather than stalled.
+			arm.Store(false)
 			releaseOnce()
 			requireUsable(t, c, "after-"+tc.name)
 		})

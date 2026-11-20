@@ -44,8 +44,21 @@ const (
 
 // rpcCall is the JSON-RPC envelope fields a fault hook needs to match on.
 type rpcCall struct {
-	Method string `json:"method"`
-	ID     any    `json:"id"`
+	Method string          `json:"method"`
+	ID     any             `json:"id"`
+	Params json.RawMessage `json:"params"`
+}
+
+// echoMessage returns the echo tool's "message" argument of a tools/call, or ""
+// for any other request. Faults use it to pick a failure per call.
+func (c rpcCall) echoMessage() string {
+	var p struct {
+		Arguments echoInput `json:"arguments"`
+	}
+	if c.Method != "tools/call" || json.Unmarshal(c.Params, &p) != nil {
+		return ""
+	}
+	return p.Arguments.Message
 }
 
 // fault decides whether to answer a request itself. It returns true when it has
@@ -61,16 +74,10 @@ type statusServer struct {
 
 func newStatusServer(t *testing.T, f fault, serverOpts ...func(*gosdk.Server)) *statusServer {
 	t.Helper()
-	srv := gosdk.NewServer(&gosdk.Implementation{Name: "status-server", Version: "1.0.0"}, nil)
+	srv := newEchoSDKServer(&gosdk.Implementation{Name: "status-server", Version: "1.0.0"})
 	for _, opt := range serverOpts {
 		opt(srv)
 	}
-	gosdk.AddTool(srv, &gosdk.Tool{Name: echoToolName, Description: "echo the message"},
-		func(_ context.Context, _ *gosdk.CallToolRequest, in echoInput) (*gosdk.CallToolResult, any, error) {
-			return &gosdk.CallToolResult{
-				Content: []gosdk.Content{&gosdk.TextContent{Text: "echo: " + in.Message}},
-			}, nil, nil
-		})
 	sdkHandler := gosdk.NewStreamableHTTPHandler(func(*http.Request) *gosdk.Server { return srv }, nil)
 
 	ss := &statusServer{}
@@ -113,11 +120,14 @@ func writeRPCError(w http.ResponseWriter, status int, id any, code int, msg stri
 	}{"2.0", id, rpcErr{code, msg, data}})
 }
 
-// onMethod returns a fault that applies h to POSTs for method while armed is
-// true. Arming lets a test initialize cleanly, then trigger exactly one fault.
+// onMethod returns a fault that applies h to the first POST for method while
+// armed is true, disarming it atomically so exactly one request is faulted even
+// when several are in flight. Arming lets a test initialize cleanly first; a
+// test may also disarm it itself if the targeted request never reached the
+// server.
 func onMethod(method string, armed *atomic.Bool, h func(w http.ResponseWriter, call rpcCall)) fault {
 	return func(w http.ResponseWriter, r *http.Request, call rpcCall) bool {
-		if r.Method != http.MethodPost || call.Method != method || !armed.Load() {
+		if r.Method != http.MethodPost || call.Method != method || !armed.CompareAndSwap(true, false) {
 			return false
 		}
 		h(w, call)
@@ -138,11 +148,21 @@ func newStatusClient(t *testing.T, url string) *client.Client {
 }
 
 func newIsolatedClient(url string) (*client.Client, error) {
+	hc, err := isolatedHTTPClient()
+	if err != nil {
+		return nil, err
+	}
+	return client.NewStreamableHttpClient(url, transport.WithHTTPBasicClient(hc))
+}
+
+// isolatedHTTPClient returns an *http.Client with its own clone of the default
+// transport, so its connection pool is not shared with other parallel tests.
+func isolatedHTTPClient() (*http.Client, error) {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
 		return nil, errors.New("http.DefaultTransport is not an *http.Transport")
 	}
-	return client.NewStreamableHttpClient(url, transport.WithHTTPBasicClient(&http.Client{Transport: base.Clone()}))
+	return &http.Client{Transport: base.Clone()}, nil
 }
 
 func newInitializedClient(t *testing.T, url string) *client.Client {
