@@ -487,18 +487,25 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	nonce := crand.Text()
 	s.mcp.setPendingRequestContext(r.Context(), nonce)
 	r.Header.Set(reqNonceHeader, nonce)
-	// KNOWN LIMITATION (issue #156, finding 6): this bridge covers request/
-	// response calls (tools/call, tools/list, initialize), which block in
-	// servePOST until the response is ready, so the deferred clear runs only
-	// AFTER the session goroutine has dispatched the message and read the nonce.
-	// It does NOT cover notification-only POSTs (e.g. notifications/initialized,
-	// notifications/cancel): those are acknowledged with an immediate 202 before
-	// the session goroutine dispatches the message, so the deferred clear can
-	// run before the dispatch middleware looks up the nonce → per-request
-	// context values are silently absent for notification handling. There is no
-	// cross-request bleed (the entry is keyed by a unique nonce), but the bridge
-	// is best-effort for notifications. A proper fix awaits go-sdk per-request
-	// context propagation (upstream ask).
+	// KNOWN LIMITATION (issue #156, finding 6): the bridge is only guaranteed
+	// while this ServeHTTP is still running, because the deferred clear below
+	// drops the entry as soon as it returns. Two cases:
+	//
+	//   - Notification-only POSTs (e.g. notifications/initialized,
+	//     notifications/cancelled) are acknowledged with an immediate 202 before
+	//     the session goroutine dispatches the message, so the clear can run
+	//     before the dispatch middleware looks up the nonce. Per-request context
+	//     values are then silently absent for notification handling. There is no
+	//     cross-request bleed (the entry is keyed by a unique nonce); the bridge
+	//     is best-effort for notifications.
+	//   - Request/response calls (tools/call, tools/list, ...) normally block in
+	//     servePOST until the response is ready, but go-sdk returns from servePOST
+	//     as soon as the client's context is cancelled (hangResponse) while the
+	//     queued message stays queued. If the entry is gone when such a request
+	//     is dispatched, the dispatch middleware refuses it instead of running it
+	//     on the session's base context (see sessionDispatchMiddleware).
+	//
+	// A proper fix awaits go-sdk per-request context propagation (upstream ask).
 	defer s.mcp.clearPendingRequestContext(nonce)
 
 	// Stateless short-circuit. The identity contextFunc, the denial gate, and
@@ -513,6 +520,11 @@ func (s *StreamableHTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	// entirely is what makes that safe (see contextWithSession/
 	// bindEphemeralSession in session.go for the per-request isolation this
 	// depends on).
+	//
+	// Stateless mode also cannot hit the abandoned-request race above:
+	// serveStateless defers session.Close(), which waits for in-flight requests
+	// and rejects new ones, and all of that finishes inside s.handler.ServeHTTP,
+	// before the deferred nonce clear runs.
 	if s.stateless {
 		s.handler.ServeHTTP(w, r)
 		return
