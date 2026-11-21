@@ -253,6 +253,30 @@ func (c *clientSession) SetSessionPrompts(prompts map[string]ServerPrompt) {
 	}
 }
 
+// release drops the per-session state this clientSession owns. It is called
+// when the session's registry entry is removed (forgetSessionLocked) so that a
+// lingering reference to the clientSession — for example the list_changed sink a
+// backend connector holds after the session's MultiSession is closed — does not
+// keep the per-session go-sdk server (and its converted tool schemas) or the
+// overlay maps alive. It is idempotent and safe to call concurrently with the
+// setters: after release, SetSessionTools and friends still record their overlay
+// but no longer reconcile it onto a live server (boundServer and owner are nil),
+// which is the correct behavior for a session that is already gone.
+func (c *clientSession) release() {
+	c.boundServer.Store(nil)
+	c.goSession.Store(nil)
+	c.owner.Store(nil)
+	c.initializedOn.Store(nil)
+	c.negotiated.Store(nil)
+	c.mu.Lock()
+	c.tools = nil
+	c.resources = nil
+	c.resourceTemplates = nil
+	c.prompts = nil
+	c.sdkToolNames = nil
+	c.mu.Unlock()
+}
+
 // sessionContextKey is the context key under which the ClientSession is stored.
 type sessionContextKey struct{}
 
@@ -609,14 +633,16 @@ func (s *MCPServer) forgetSession(id string) {
 	s.forgetSessionLocked(id)
 }
 
-// forgetSessionLocked removes the registry entries for id and closes the
-// session's notification channel so the drain goroutine started in
-// newClientSession exits. The caller must hold sessionsMu.
+// forgetSessionLocked removes the registry entries for id, releases the
+// session's per-session state, and closes the session's notification channel so
+// the drain goroutine started in newClientSession exits. The caller must hold
+// sessionsMu.
 func (s *MCPServer) forgetSessionLocked(id string) {
 	v, ok := s.sessions.LoadAndDelete(id)
 	s.localSessions.Delete(id)
 	if ok {
 		cs := v.(*clientSession)
+		cs.release()
 		cs.notifClose.Do(func() { close(cs.notifCh) })
 	}
 }
