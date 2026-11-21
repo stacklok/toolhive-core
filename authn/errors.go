@@ -171,6 +171,15 @@ const (
 	// endpoint: its `typ` is on the default deny list, or it carries a `cnf`
 	// claim and Config.AllowCNF is not set.
 	ReasonTokenKind Reason = "token_kind"
+	// ReasonCheck indicates a Check rejected the token, returned an error or
+	// panicked.
+	ReasonCheck Reason = "check"
+	// ReasonUnknownIssuer indicates a TrustSet has no trust for the token's
+	// `iss` claim, or the token carries no string `iss`. No key was tried.
+	ReasonUnknownIssuer Reason = "unknown_issuer"
+	// ReasonTrustStale indicates the TrustSet trust for the token's issuer is
+	// past its NotAfter; paired with CodeUnavailable.
+	ReasonTrustStale Reason = "trust_stale"
 	// ReasonScope indicates the token is valid but lacks a required scope;
 	// paired with CodeInsufficientScope.
 	ReasonScope Reason = "scope"

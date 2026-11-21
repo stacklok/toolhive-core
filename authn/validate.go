@@ -116,14 +116,16 @@ type Principal struct {
 	Subject string
 	// Name is the `name` claim, may be empty.
 	Name string
-	// Claims is the full verified claim set. It is the raw credential (the
-	// serialized token) that is deliberately absent, never claim data. Claims
-	// beyond iss/sub/name — e.g. the `email` claim ToolHive's claimsToIdentity
-	// uses for its display-name fallback, or an IdP-specific claim like Okta's
-	// `tsid` — are read here by consumers; they are intentionally NOT
-	// first-class fields, since the struct carries only what every resource
-	// server needs.
+	// Claims is a deep copy of the verified claim set, holding only
+	// encoding/json types. It shares no memory with the validator or any Check.
 	Claims map[string]any
+	// Scopes are the token's scopes, read from `scope` (else `scp`); nil when
+	// absent or malformed.
+	// It never includes `roles`: a Microsoft Entra app-only token has `roles` and
+	// no `scp`, so its Scopes is nil. Read `roles` from Claims.
+	Scopes []string
+	// Trust identifies the trust that verified the token; zero for a Validator.
+	Trust TrustRef
 }
 
 // ParseBearer extracts the token from an Authorization header value. The
@@ -207,7 +209,12 @@ func ParseBearer(headerValue string) (string, error) {
 // Every failure is a *Error. It reads the clock once and runs verify
 // (signature and temporal checks), then accept (audience, `typ`, `cnf`).
 func (v *Validator) Validate(ctx context.Context, token string) (Principal, error) {
-	now := time.Now()
+	return v.validateAt(ctx, token, time.Now())
+}
+
+// validateAt is Validate with the clock reading supplied, so a TrustSet can
+// use one reading for its own checks and the validator's.
+func (v *Validator) validateAt(ctx context.Context, token string, now time.Time) (Principal, error) {
 	claims, header, err := v.verify(ctx, token, now)
 	if err != nil {
 		return Principal{}, err
@@ -248,7 +255,7 @@ func (v *Validator) verify(ctx context.Context, token string, now time.Time) (jw
 	if malformedErr != nil {
 		return nil, nil, &Error{Code: CodeInvalidToken, Reason: ReasonMalformed, err: malformedErr}
 	}
-	if !slices.Contains(allowedAlgs, alg) {
+	if !slices.Contains(v.algs, alg) {
 		return nil, nil, &Error{Code: CodeInvalidToken, Reason: ReasonUnsupportedAlg,
 			err: fmt.Errorf("alg %q is not in the allow-list", alg)}
 	}
@@ -313,7 +320,8 @@ func buildPrincipal(claims jwt.MapClaims) Principal {
 		Issuer:  stringClaim(claims, "iss"),
 		Subject: stringClaim(claims, "sub"),
 		Name:    stringClaim(claims, "name"),
-		Claims:  claims,
+		Claims:  deepCopy(map[string]any(claims)).(map[string]any),
+		Scopes:  parseScopes(claims),
 	}
 }
 
@@ -326,7 +334,7 @@ func (v *Validator) parserOptions(now time.Time) []jwt.ParserOption {
 	// the verified path cannot be bypassed by a header that disagrees with
 	// itself, and so the gate cannot be forgotten by a second key path.
 	opts := []jwt.ParserOption{
-		jwt.WithValidMethods(allowedAlgs),
+		jwt.WithValidMethods(v.algs),
 		// Strict base64url, no padding (RFC 7515 §2); padding-allowed decode
 		// is the WithPaddingAllowed escape hatch and is NOT enabled.
 		jwt.WithStrictDecoding(),
@@ -639,7 +647,7 @@ func (v *Validator) providerKeySet(ctx context.Context, kid, alg string) (any, b
 // stage is appended to the detail message ("" or " after refresh") so the two
 // call sites stay distinguishable in a log.
 func (v *Validator) lookupCandidates(ctx context.Context, kid, alg, stage string) ([]jwk.Key, error) {
-	set, err := v.jwksCache.Lookup(ctx, v.jwksURL)
+	set, err := v.lookupJWKS(ctx)
 	if err != nil {
 		// "Registered but first fetch pending" is reported distinctly; any
 		// other lookup failure also means key material is unreachable.
@@ -657,6 +665,35 @@ func (v *Validator) lookupCandidates(ctx context.Context, kid, alg, stage string
 			err: fmt.Errorf("no usable key for alg %q%s: %s", alg, stage, why)}
 	}
 	return keys, nil
+}
+
+// lookupJWKS reads the cached JWKS. The jwkfetch cache type-asserts the
+// resource its controller returns, and a controller stopped by Close can hand
+// back a nil one, so a Close that lands while a lookup is in flight panics
+// inside the library. That panic is reported as an error; a panic on a
+// validator that is still open is not this race and is re-raised.
+func (v *Validator) lookupJWKS(ctx context.Context) (set jwk.Set, err error) {
+	defer v.recoverClosed(&err)
+	return v.jwksCache.Lookup(ctx, v.jwksURL)
+}
+
+// refreshJWKS refetches the JWKS. Cache.Refresh ends in the same lookup as
+// lookupJWKS and has the same Close race, so it is guarded the same way.
+func (v *Validator) refreshJWKS(ctx context.Context) (err error) {
+	defer v.recoverClosed(&err)
+	_, err = v.jwksCache.Refresh(ctx, v.jwksURL)
+	return err
+}
+
+// recoverClosed turns a panic into *err only when the validator is closed.
+// Call it directly from a defer.
+func (v *Validator) recoverClosed(err *error) {
+	if r := recover(); r != nil {
+		if !v.closed() {
+			panic(r)
+		}
+		*err = errors.New("validator was closed during the JWKS operation")
+	}
 }
 
 // candidateKeys filters the JWKS set down to the keys eligible to verify a
@@ -861,7 +898,7 @@ func (v *Validator) refreshOnce() (bool, error) {
 	// validator's lifetime context, not the per-request ctx.
 	refreshCtx, cancel := context.WithTimeout(v.ctx, defaultHTTPTimeout)
 	defer cancel()
-	_, err := v.jwksCache.Refresh(refreshCtx, v.jwksURL)
+	err := v.refreshJWKS(refreshCtx)
 	now := time.Now()
 	v.lastRefresh = now
 	if err == nil {
