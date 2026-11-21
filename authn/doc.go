@@ -66,9 +66,13 @@
 //     claim from one trust with a claim from another.
 //   - Read Principal.Claims as JSON types. A number is a float64. An array is
 //     a []any. An object is a map[string]any.
-//   - Map errors to responses. Use Code.HTTPStatus. CodeUnavailable is not an
-//     OAuth2 error value: return a plain 503. Use PossiblyOpaque to find a
-//     token that may be opaque and need introspection.
+//   - Map errors to responses. Use (*Error).HTTPStatus, not Code.HTTPStatus:
+//     only the method on *Error answers missing credentials with 401. When
+//     (*Error).MissingCredentials reports true, send a bare
+//     "WWW-Authenticate: Bearer" challenge with no error, error_description
+//     or scope parameter (RFC 6750 §3.1). CodeUnavailable is not an OAuth2
+//     error value: return a plain 503. Use PossiblyOpaque to find a token
+//     that may be opaque and need introspection.
 //   - Add rules with Config.Checks when the built-in rules are not enough.
 //
 // # Several issuers
