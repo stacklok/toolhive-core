@@ -4,6 +4,7 @@
 package authn
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
@@ -11,7 +12,10 @@ import (
 // Check is a rule over verified claims. It runs after every built-in check, so
 // it can only add restrictions; it must not do I/O. It returns nil to accept
 // the token. Any error or panic rejects it with CodeInvalidToken and
-// ReasonCheck; the returned error is never exposed or wrapped.
+// ReasonCheck. The returned error is wrapped in the *Error, so it appears in
+// Error() and is reachable with errors.Is and errors.As; like every *Error
+// detail it is for logs only and never part of a response. Do not put values
+// in it that must not reach logs. A panic value is not recorded.
 //
 // Each check receives its own deep copy of the claims, and the instant the
 // validator used for every temporal check of this token.
@@ -40,28 +44,39 @@ var RejectIDTokens Check = CheckFunc(func(claims map[string]any, _ time.Time) er
 })
 
 // runChecks runs the checks in order, each on its own copy of claims. The
-// detail is fixed text naming the check index, profile and trust ID.
+// detail names the check index and, in a TrustSet, the trust ID, and wraps the
+// check's error.
 func (p *acceptPolicy) runChecks(claims map[string]any, now time.Time) error {
 	for i, c := range p.checks {
-		if failure := runCheck(c, deepCopy(claims).(map[string]any), now); failure != "" {
-			return &Error{Code: CodeInvalidToken, Reason: ReasonCheck,
-				err: fmt.Errorf("check %d %s (profile %q, trust %q)", i, failure, p.profile, p.trustID)}
+		err := runCheck(c, deepCopy(claims).(map[string]any), now)
+		if err == nil {
+			continue
 		}
+		label := fmt.Sprintf("check %d", i)
+		if p.trustID != "" {
+			label += fmt.Sprintf(" of trust %q", p.trustID)
+		}
+		if errors.Is(err, errCheckPanicked) {
+			err = fmt.Errorf("%s panicked", label)
+		} else {
+			err = fmt.Errorf("%s rejected the token: %w", label, err)
+		}
+		return &Error{Code: CodeInvalidToken, Reason: ReasonCheck, err: err}
 	}
 	return nil
 }
 
-// runCheck returns "rejected the token", "panicked", or "" when c passed.
-func runCheck(c Check, claims map[string]any, now time.Time) (failure string) {
+// errCheckPanicked is what runCheck returns for a check that panicked.
+var errCheckPanicked = errors.New("check panicked")
+
+// runCheck returns the check's error, errCheckPanicked, or nil when c passed.
+func runCheck(c Check, claims map[string]any, now time.Time) (err error) {
 	defer func() {
 		if recover() != nil {
-			failure = "panicked"
+			err = errCheckPanicked
 		}
 	}()
-	if c.Check(claims, now) != nil {
-		return "rejected the token"
-	}
-	return ""
+	return c.Check(claims, now)
 }
 
 // deepCopy copies a decoded JSON value so the result shares no memory with it.

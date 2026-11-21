@@ -126,6 +126,9 @@ func TestTrustSetPerTrustPolicy(t *testing.T) {
 			p, err := s.Verify(context.Background(), tt.token)
 			if tt.want != "" {
 				requireAuthnError(t, err, CodeInvalidToken, tt.want)
+				if tt.want == ReasonCheck {
+					assert.Contains(t, err.Error(), `check 0 of trust "a" rejected the token: blocked subject`)
+				}
 				return
 			}
 			require.NoError(t, err)

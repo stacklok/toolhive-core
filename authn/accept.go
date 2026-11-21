@@ -47,8 +47,9 @@ type acceptPolicy struct {
 	allowCNF         bool
 	maxRemaining     time.Duration
 	checks           []Check
-	// profile and trustID label Check failures in the error detail.
-	profile, trustID string
+	// trustID names the TrustSet trust in Check failure details; it is empty
+	// for a plain Validator.
+	trustID string
 }
 
 func newAcceptPolicy(cfg Config) acceptPolicy {

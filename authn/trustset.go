@@ -189,6 +189,7 @@ func NewTrustSet(ctx context.Context, trusts []Trust, opts ...SetOption) (*Trust
 			report = append(report, TrustError{ID: t.ID, Err: errs[i]})
 			continue
 		}
+		built[i].policy.trustID = t.ID
 		s.routes[t.Config.Issuer] = &trustEntry{
 			ref:      TrustRef{ID: t.ID, Issuer: t.Config.Issuer, Tag: t.Tag},
 			v:        built[i],

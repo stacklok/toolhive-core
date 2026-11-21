@@ -13,36 +13,41 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const secretDetail = "secret-detail"
+const checkDetail = "check-detail"
 
 func TestAcceptChecks(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
-	reject := CheckFunc(func(map[string]any, time.Time) error { return errors.New(secretDetail) })
-	explode := CheckFunc(func(map[string]any, time.Time) error { panic(secretDetail) })
+	errReject := errors.New(checkDetail)
+	reject := CheckFunc(func(map[string]any, time.Time) error { return errReject })
+	explode := CheckFunc(func(map[string]any, time.Time) error { panic(checkDetail) })
 	pass := CheckFunc(func(map[string]any, time.Time) error { return nil })
 
 	tests := []struct {
-		name   string
-		checks []Check
-		want   Reason
-		detail string
+		name      string
+		checks    []Check
+		trustID   string
+		detail    string
+		wantsWrap bool
 	}{
-		{"error rejects", []Check{pass, reject}, ReasonCheck, "check 1 rejected the token"},
-		{"panic rejects", []Check{explode}, ReasonCheck, "check 0 panicked"},
+		{"error rejects", []Check{pass, reject}, "", "check 1 rejected the token: " + checkDetail, true},
+		{"error rejects in a trust", []Check{pass, reject}, "t1", `check 1 of trust "t1" rejected the token: ` + checkDetail, true},
+		{"panic rejects", []Check{explode}, "", "check 0 panicked", false},
+		{"panic rejects in a trust", []Check{explode}, "t1", `check 0 of trust "t1" panicked`, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			p := acceptPolicy{allowAnyAudience: true, checks: tt.checks, profile: "prof", trustID: "t1"}
+			p := acceptPolicy{allowAnyAudience: true, checks: tt.checks, trustID: tt.trustID}
 			err := accept(&p, jwt.MapClaims{}, nil, now)
-			require.Equal(t, tt.want, reasonOf(t, err))
-			if err != nil {
-				assert.Contains(t, err.Error(), tt.detail+` (profile "prof", trust "t1")`)
-				assert.NotContains(t, err.Error(), secretDetail)
-				assert.False(t, PossiblyOpaque(err))
+			require.Equal(t, ReasonCheck, reasonOf(t, err))
+			assert.Contains(t, err.Error(), tt.detail)
+			assert.Equal(t, tt.wantsWrap, errors.Is(err, errReject))
+			if !tt.wantsWrap {
+				assert.NotContains(t, err.Error(), checkDetail, "a panic value is not recorded")
 			}
+			assert.False(t, PossiblyOpaque(err))
 		})
 	}
 
