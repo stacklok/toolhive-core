@@ -278,8 +278,8 @@ github.com/mitchellh/mapstructure v1.5.0 h1:jeMsZIYE/09sWLaz43PL7Gy6RuMjD2eJVyua
 github.com/mitchellh/mapstructure v1.5.0/go.mod h1:bFUtVrKA4DC2yAKiSyO/QUcy7e+RRV2QTWOzhPopBRo=
 github.com/modelcontextprotocol/go-sdk v1.8.0 h1:KIvahhYqwtbeniWVPs3TcXEA7b8jEtwfBpOTAI+Urx4=
 github.com/modelcontextprotocol/go-sdk v1.8.0/go.mod h1:dL7u98E/zjJTGzEq+j30jQ8K2k1mb6LeAH4inEcSGts=
-github.com/modelcontextprotocol/registry v1.8.10 h1:jZnRrTo0pfG/cnDIO2konaK+nmxDqrPdqal/oyMmIyU=
-github.com/modelcontextprotocol/registry v1.8.10/go.mod h1:Wk8hJLBwmPimwsxiDVqZt/gN1vfW57jPbsGR+iOCB68=
+github.com/modelcontextprotocol/registry v1.8.11 h1:jrJT2efe2IW1+a8Zv189eF61qSf39QMaWLkh7UFDg9Q=
+github.com/modelcontextprotocol/registry v1.8.11/go.mod h1:eDFOOk1wouZ2RL+HJ1l9DJDrRFcqYT9XmV5FrmWFeeE=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
 github.com/natefinch/atomic v1.0.1 h1:ZPYKxkqQOx3KZ+RsbnP/YsgvxWQPGxjC0oBt2AhwV0A=
