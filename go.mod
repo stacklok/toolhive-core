@@ -32,7 +32,7 @@ require (
 	github.com/shirou/gopsutil/v4 v4.26.10
 	github.com/sigstore/protobuf-specs v0.5.2
 	github.com/sigstore/rekor v1.6.3
-	github.com/sigstore/sigstore v1.11.3
+	github.com/sigstore/sigstore v1.11.4
 	github.com/sigstore/sigstore-go v1.3.0
 	github.com/stretchr/testify v1.12.1
 	github.com/xeipuuv/gojsonschema v1.2.0
@@ -62,6 +62,7 @@ require (
 require (
 	cel.dev/expr v0.26.0 // indirect
 	cloud.google.com/go/compute/metadata v0.10.0 // indirect
+	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.13.0 // indirect
 	github.com/AzureAD/microsoft-authentication-library-for-go v1.10.1 // indirect
 	github.com/ProtonMail/go-crypto v1.5.2 // indirect
