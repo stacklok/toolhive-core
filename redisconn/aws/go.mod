@@ -6,7 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.48.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.21
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.9
-	github.com/stacklok/toolhive-core/redisconn v0.0.61
+	github.com/stacklok/toolhive-core/redisconn v0.0.62
 )
 
 require (
