@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
@@ -330,10 +333,13 @@ func TestHandlerMiddleware_FailedWriteCounted(t *testing.T) {
 		)),
 	)
 
+	// Each iteration fails two audit records: one through LogTo and one
+	// through a direct Handle call.
+	const failuresPerIteration = 2
 	for i := range 3 {
 		require.NotPanics(t, func() { testEvent().LogTo(t.Context(), logger, LevelAudit) })
 		require.NoError(t, logger.Handler().Handle(t.Context(), slog.NewRecord(time.Now(), LevelAudit, "audit_event", 0)))
-		assert.Equal(t, int64(2*(i+1)), failures(), "one failure per failed audit record")
+		assert.Equal(t, int64(failuresPerIteration*(i+1)), failures(), "one failure per failed audit record")
 	}
 
 	logger.Info("after failure")
@@ -392,14 +398,20 @@ func TestHandlerMiddleware_ConcurrentWritesWholeLines(t *testing.T) {
 
 	const goroutines, perGoroutine = 64, 100
 
-	var auditOut, opOut lockedBuffer
-	logger := logging.New(
-		logging.WithOutput(&opOut),
-		logging.WithHandlerMiddleware(HandlerMiddleware(WithWriter(&auditOut))),
-	)
+	// One middleware applied to two loggers: both must serialize on the same
+	// lock. overlapWriter fails the test if two Write calls overlap, so the
+	// assertion does not depend on the race detector.
+	auditOut := &overlapWriter{}
+	var opOut lockedBuffer
+	mw := HandlerMiddleware(WithWriter(auditOut))
+	loggers := []*slog.Logger{
+		logging.New(logging.WithOutput(&opOut), logging.WithHandlerMiddleware(mw)),
+		logging.New(logging.WithOutput(&opOut), logging.WithHandlerMiddleware(mw)),
+	}
 
 	var wg sync.WaitGroup
-	for range goroutines {
+	for g := range goroutines {
+		logger := loggers[g%len(loggers)]
 		wg.Go(func() {
 			for range perGoroutine {
 				testEvent().LogTo(t.Context(), logger, LevelAudit)
@@ -409,7 +421,8 @@ func TestHandlerMiddleware_ConcurrentWritesWholeLines(t *testing.T) {
 	}
 	wg.Wait()
 
-	lines := jsonLines(t, auditOut.String())
+	assert.False(t, auditOut.overlapped.Load(), "audit writes must never overlap")
+	lines := jsonLines(t, auditOut.buf.String())
 	assert.Len(t, lines, goroutines*perGoroutine)
 	for _, line := range lines {
 		assert.Equal(t, "AUDIT", line["level"])
@@ -503,4 +516,160 @@ func TestRenderAuditLine(t *testing.T) {
 			tt.check(t, m)
 		})
 	}
+}
+
+// overlapWriter records whether two Write calls were ever in flight at once.
+// It yields inside Write to widen the window an unsynchronized caller would
+// hit.
+type overlapWriter struct {
+	inFlight   atomic.Int32
+	overlapped atomic.Bool
+	buf        lockedBuffer
+}
+
+func (w *overlapWriter) Write(p []byte) (int, error) {
+	if w.inFlight.Add(1) != 1 {
+		w.overlapped.Store(true)
+	}
+	defer w.inFlight.Add(-1)
+	runtime.Gosched()
+	return w.buf.Write(p)
+}
+
+// writeStep scripts one Write call: n bytes land (n < 0 means all of them)
+// and err is returned.
+type writeStep struct {
+	n   int
+	err error
+}
+
+// scriptedWriter plays its steps in order, then accepts every later write in
+// full.
+type scriptedWriter struct {
+	steps []writeStep
+	buf   bytes.Buffer
+}
+
+func (w *scriptedWriter) Write(p []byte) (int, error) {
+	if len(w.steps) == 0 {
+		return w.buf.Write(p)
+	}
+	step := w.steps[0]
+	w.steps = w.steps[1:]
+	n := step.n
+	if n < 0 || n > len(p) {
+		n = len(p)
+	}
+	w.buf.Write(p[:n])
+	return n, step.err
+}
+
+func TestHandlerMiddleware_LineBoundaryTransitions(t *testing.T) {
+	t.Parallel()
+
+	const partial = 10 // bytes of a record that land on a short write
+	errBroken := errors.New("broken pipe")
+
+	tests := []struct {
+		name      string
+		steps     []writeStep
+		wantFails int64
+	}{
+		{
+			name:      "short write with nil error",
+			steps:     []writeStep{{n: partial}},
+			wantFails: 1,
+		},
+		{
+			name:      "short write with error",
+			steps:     []writeStep{{n: partial, err: io.ErrShortWrite}},
+			wantFails: 1,
+		},
+		{
+			name:      "zero-byte failure after a partial line keeps the repair pending",
+			steps:     []writeStep{{n: partial, err: io.ErrShortWrite}, {n: 0, err: errBroken}},
+			wantFails: 2,
+		},
+		{
+			name:      "write that lands only the repair newline restores the boundary",
+			steps:     []writeStep{{n: partial, err: io.ErrShortWrite}, {n: 1, err: io.ErrShortWrite}},
+			wantFails: 2,
+		},
+		{
+			name:      "short write of a repaired line leaves a new partial line",
+			steps:     []writeStep{{n: partial, err: io.ErrShortWrite}, {n: 1 + partial, err: io.ErrShortWrite}},
+			wantFails: 2,
+		},
+		{
+			name:      "zero-byte failure on a clean boundary adds no newline",
+			steps:     []writeStep{{n: 0, err: errBroken}},
+			wantFails: 1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mp, failures := newMeter(t)
+			w := &scriptedWriter{steps: append([]writeStep(nil), tt.steps...)}
+			logger := logging.New(
+				logging.WithOutput(io.Discard),
+				logging.WithHandlerMiddleware(HandlerMiddleware(WithWriter(w), WithMeterProvider(mp))),
+			)
+
+			// One record per scripted step, then one record that must land
+			// whole on its own line.
+			for range tt.steps {
+				testEvent().LogTo(t.Context(), logger, LevelAudit)
+			}
+			last := testEvent()
+			last.LogTo(t.Context(), logger, LevelAudit)
+
+			assert.Equal(t, tt.wantFails, failures())
+
+			out := w.buf.String()
+			require.True(t, strings.HasSuffix(out, "\n"))
+			lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+			for i, line := range lines {
+				assert.NotEmptyf(t, line, "line %d is blank: no stray newline may be written", i)
+			}
+			var m map[string]any
+			require.NoError(t, json.Unmarshal([]byte(lines[len(lines)-1]), &m),
+				"the record after the failures must parse as one JSON object")
+			assert.Equal(t, last.Metadata.AuditID, m["audit_id"])
+		})
+	}
+}
+
+// failingMeterProvider returns meters whose instrument creation fails.
+type failingMeterProvider struct{ noop.MeterProvider }
+
+func (failingMeterProvider) Meter(string, ...metric.MeterOption) metric.Meter { return failingMeter{} }
+
+type failingMeter struct{ noop.Meter }
+
+func (failingMeter) Int64Counter(string, ...metric.Int64CounterOption) (metric.Int64Counter, error) {
+	return nil, errors.New("instrument rejected")
+}
+
+func TestHandlerMiddleware_CounterCreationFailureFallsBackToNoop(t *testing.T) {
+	t.Parallel()
+
+	var opOut bytes.Buffer
+	h := HandlerMiddleware(
+		WithWriter(failingWriter{}),
+		WithMeterProvider(failingMeterProvider{}),
+	)(logging.NewHandler(logging.WithOutput(&opOut)))
+
+	require.NotNil(t, h.(*auditHandler).sink.failures, "a no-op counter must replace the failed one")
+	logger := slog.New(h)
+	require.NotPanics(t, func() { testEvent().LogTo(t.Context(), logger, LevelAudit) })
+	require.NoError(t, h.Handle(t.Context(), slog.NewRecord(time.Now(), LevelAudit, "audit_event", 0)))
+	assert.Empty(t, opOut.String())
+
+	// Audit output still works when the counter could not be created.
+	var auditOut bytes.Buffer
+	ok := HandlerMiddleware(WithWriter(&auditOut), WithMeterProvider(failingMeterProvider{}))(slog.NewJSONHandler(io.Discard, nil))
+	testEvent().LogTo(t.Context(), slog.New(ok), LevelAudit)
+	assert.Len(t, jsonLines(t, auditOut.String()), 1)
 }
