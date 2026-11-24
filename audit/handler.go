@@ -30,9 +30,11 @@ const (
 	// meterName is the instrumentation scope of the middleware's metrics.
 	meterName = "github.com/stacklok/toolhive-core/audit"
 
-	// writeFailuresMetric counts audit records whose write to the audit
-	// writer failed or was short.
-	writeFailuresMetric = "audit.write.failures"
+	// WriteFailuresMetricName is the name of the counter [HandlerMiddleware]
+	// increments once for each audit record whose write to the audit writer
+	// failed or was short. It has no attributes. Alert on it to detect lost
+	// audit records.
+	WriteFailuresMetricName = "stacklok.audit.write.failures"
 )
 
 // MiddlewareOption configures [HandlerMiddleware].
@@ -45,17 +47,17 @@ type middlewareConfig struct {
 }
 
 // WithEnabled sets the audit gate. When false, [LevelAudit] records are
-// dropped and the handler reports them as disabled, so callers skip building
-// their attributes. The default is true.
+// dropped and the handler reports them as disabled, so slog neither
+// constructs nor dispatches the record. The default is true.
 func WithEnabled(enabled bool) MiddlewareOption {
 	return func(c *middlewareConfig) {
 		c.enabled = enabled
 	}
 }
 
-// WithAuditWriter sets where audit lines are written. The default is
+// WithWriter sets where audit lines are written. The default is
 // [os.Stdout]. A nil writer keeps the default.
-func WithAuditWriter(w io.Writer) MiddlewareOption {
+func WithWriter(w io.Writer) MiddlewareOption {
 	return func(c *middlewareConfig) {
 		if w != nil {
 			c.writer = w
@@ -64,7 +66,7 @@ func WithAuditWriter(w io.Writer) MiddlewareOption {
 }
 
 // WithMeterProvider sets the meter provider used for the
-// audit.write.failures counter. The default is the global provider returned
+// [WriteFailuresMetricName] counter. The default is the global provider returned
 // by [otel.GetMeterProvider]. A nil provider keeps the default.
 func WithMeterProvider(mp metric.MeterProvider) MiddlewareOption {
 	return func(c *middlewareConfig) {
@@ -88,10 +90,11 @@ func WithMeterProvider(mp metric.MeterProvider) MiddlewareOption {
 //   - never calls the wrapped handler, so attributes and groups added with
 //     [log/slog.Logger.With] or [log/slog.Logger.WithGroup] do not appear;
 //   - never returns a write error to the caller. Each failed or short write
-//     increments the audit.write.failures counter and is otherwise silent.
+//     increments the [WriteFailuresMetricName] counter and is otherwise silent.
 //
-// The returned function may be applied to several handlers; each application
-// gets its own audit sink.
+// The returned function may be applied to several handlers. They all share
+// one audit sink, so their records are serialized on the audit writer and
+// counted on one counter.
 func HandlerMiddleware(opts ...MiddlewareOption) func(slog.Handler) slog.Handler {
 	cfg := middlewareConfig{
 		enabled: true,
@@ -104,11 +107,9 @@ func HandlerMiddleware(opts ...MiddlewareOption) func(slog.Handler) slog.Handler
 		cfg.meterProvider = otel.GetMeterProvider()
 	}
 
+	sink := newAuditSink(cfg)
 	return func(next slog.Handler) slog.Handler {
-		return &auditHandler{
-			next: next,
-			sink: newAuditSink(cfg),
-		}
+		return &auditHandler{next: next, sink: sink}
 	}
 }
 
@@ -152,7 +153,8 @@ func (h *auditHandler) WithGroup(name string) slog.Handler {
 }
 
 // auditSink is the audit writer and its state, shared by every handler
-// derived from one [HandlerMiddleware] application.
+// built from one [HandlerMiddleware] result and every handler derived from
+// those.
 type auditSink struct {
 	enabled  bool
 	failures metric.Int64Counter
@@ -166,7 +168,7 @@ type auditSink struct {
 
 func newAuditSink(cfg middlewareConfig) *auditSink {
 	counter, err := cfg.meterProvider.Meter(meterName).Int64Counter(
-		writeFailuresMetric,
+		WriteFailuresMetricName,
 		metric.WithDescription("Number of audit records whose write to the audit writer failed or was short."),
 		metric.WithUnit("{record}"),
 	)
@@ -174,7 +176,7 @@ func newAuditSink(cfg middlewareConfig) *auditSink {
 		// The SDK returns a usable instrument alongside a name or unit
 		// validation error, but the API does not promise it. Fall back to a
 		// no-op counter so a metrics problem never blocks audit output.
-		counter, _ = noop.NewMeterProvider().Meter(meterName).Int64Counter(writeFailuresMetric)
+		counter, _ = noop.NewMeterProvider().Meter(meterName).Int64Counter(WriteFailuresMetricName)
 	}
 	return &auditSink{
 		enabled:  cfg.enabled,
@@ -196,12 +198,17 @@ func (s *auditSink) write(ctx context.Context, r slog.Record) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	prefix := 0
 	if s.midLine {
 		line = append([]byte{'\n'}, line...)
+		prefix = 1
 	}
 	n, err := s.w.Write(line)
 	if n > 0 {
-		s.midLine = n < len(line)
+		// The writer is mid-line only if some, but not all, of the record's
+		// own bytes landed. A write that landed only the repair newline has
+		// restored the boundary.
+		s.midLine = n > prefix && n < len(line)
 	}
 	if err != nil || n < len(line) {
 		s.failures.Add(ctx, 1)

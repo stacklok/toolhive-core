@@ -91,7 +91,7 @@ func jsonLines(t *testing.T, s string) []map[string]any {
 }
 
 // newMeter returns a meter provider backed by a manual reader, and a function
-// that reads the current value of audit.write.failures.
+// that reads the current value of the write-failures counter.
 func newMeter(t *testing.T) (*sdkmetric.MeterProvider, func() int64) {
 	t.Helper()
 	reader := sdkmetric.NewManualReader()
@@ -104,13 +104,13 @@ func newMeter(t *testing.T) (*sdkmetric.MeterProvider, func() int64) {
 		var total int64
 		for _, sm := range rm.ScopeMetrics {
 			for _, m := range sm.Metrics {
-				if m.Name != writeFailuresMetric {
+				if m.Name != WriteFailuresMetricName {
 					continue
 				}
 				sum, ok := m.Data.(metricdata.Sum[int64])
-				require.True(t, ok, "audit.write.failures must be an int64 sum")
+				require.True(t, ok, "the write-failures counter must be an int64 sum")
 				for _, dp := range sum.DataPoints {
-					assert.Zero(t, dp.Attributes.Len(), "audit.write.failures must have no attributes")
+					assert.Zero(t, dp.Attributes.Len(), "the write-failures counter must have no attributes")
 					total += dp.Value
 				}
 			}
@@ -125,7 +125,7 @@ func TestHandlerMiddleware_RoutesAuditRecordToAuditWriter(t *testing.T) {
 	var auditOut, opOut bytes.Buffer
 	logger := logging.New(
 		logging.WithOutput(&opOut),
-		logging.WithHandlerMiddleware(HandlerMiddleware(WithAuditWriter(&auditOut))),
+		logging.WithHandlerMiddleware(HandlerMiddleware(WithWriter(&auditOut))),
 	)
 
 	event := testEvent()
@@ -166,7 +166,7 @@ func TestHandlerMiddleware_LeavesOperatorRecordsUnchanged(t *testing.T) {
 					logging.WithOutput(&opOut),
 					logging.WithFormat(format),
 					logging.WithLevel(slog.LevelDebug),
-					logging.WithHandlerMiddleware(HandlerMiddleware(WithAuditWriter(&auditOut))),
+					logging.WithHandlerMiddleware(HandlerMiddleware(WithWriter(&auditOut))),
 				)
 
 				assert.Equal(t, plain.Enabled(t.Context(), level), wrapped.Enabled(t.Context(), level))
@@ -190,7 +190,7 @@ func TestHandlerMiddleware_DropsWithAttrsAndGroups(t *testing.T) {
 	var auditOut, opOut bytes.Buffer
 	logger := logging.New(
 		logging.WithOutput(&opOut),
-		logging.WithHandlerMiddleware(HandlerMiddleware(WithAuditWriter(&auditOut))),
+		logging.WithHandlerMiddleware(HandlerMiddleware(WithWriter(&auditOut))),
 	).With("k", "v").WithGroup("g")
 
 	testEvent().LogTo(t.Context(), logger, LevelAudit)
@@ -221,7 +221,7 @@ func TestHandlerMiddleware_IgnoresOperatorLevel(t *testing.T) {
 			logger := logging.New(
 				logging.WithOutput(&opOut),
 				logging.WithLevel(level),
-				logging.WithHandlerMiddleware(HandlerMiddleware(WithAuditWriter(&auditOut))),
+				logging.WithHandlerMiddleware(HandlerMiddleware(WithWriter(&auditOut))),
 			)
 
 			assert.True(t, logger.Enabled(t.Context(), LevelAudit))
@@ -272,7 +272,7 @@ func TestHandlerMiddleware_InnerMiddlewareCannotTouchAuditRecords(t *testing.T) 
 				logging.WithHandlerMiddleware(func(h slog.Handler) slog.Handler {
 					return everySecondDropper{Handler: h, n: &seen}
 				}),
-				logging.WithHandlerMiddleware(HandlerMiddleware(WithAuditWriter(&auditOut))),
+				logging.WithHandlerMiddleware(HandlerMiddleware(WithWriter(&auditOut))),
 			)
 
 			const n = 10
@@ -299,7 +299,7 @@ func TestHandlerMiddleware_GateOff(t *testing.T) {
 	var auditOut, opOut, plainOut bytes.Buffer
 	logger := logging.New(
 		logging.WithOutput(&opOut),
-		logging.WithHandlerMiddleware(HandlerMiddleware(WithEnabled(false), WithAuditWriter(&auditOut))),
+		logging.WithHandlerMiddleware(HandlerMiddleware(WithEnabled(false), WithWriter(&auditOut))),
 	)
 	plain := logging.New(logging.WithOutput(&plainOut))
 
@@ -325,7 +325,7 @@ func TestHandlerMiddleware_FailedWriteCounted(t *testing.T) {
 	logger := logging.New(
 		logging.WithOutput(&opOut),
 		logging.WithHandlerMiddleware(HandlerMiddleware(
-			WithAuditWriter(failingWriter{}),
+			WithWriter(failingWriter{}),
 			WithMeterProvider(mp),
 		)),
 	)
@@ -349,7 +349,7 @@ func TestHandlerMiddleware_FailedWriteNotLogged(t *testing.T) {
 	logger := logging.New(
 		logging.WithOutput(&opOut),
 		logging.WithLevel(slog.LevelDebug),
-		logging.WithHandlerMiddleware(HandlerMiddleware(WithAuditWriter(failingWriter{}))),
+		logging.WithHandlerMiddleware(HandlerMiddleware(WithWriter(failingWriter{}))),
 	)
 
 	for range 5 {
@@ -365,7 +365,7 @@ func TestHandlerMiddleware_ShortWriteRestoresLineBoundary(t *testing.T) {
 	w := &shortOnceWriter{}
 	logger := logging.New(
 		logging.WithOutput(io.Discard),
-		logging.WithHandlerMiddleware(HandlerMiddleware(WithAuditWriter(w), WithMeterProvider(mp))),
+		logging.WithHandlerMiddleware(HandlerMiddleware(WithWriter(w), WithMeterProvider(mp))),
 	)
 
 	testEvent().LogTo(t.Context(), logger, LevelAudit)
@@ -395,7 +395,7 @@ func TestHandlerMiddleware_ConcurrentWritesWholeLines(t *testing.T) {
 	var auditOut, opOut lockedBuffer
 	logger := logging.New(
 		logging.WithOutput(&opOut),
-		logging.WithHandlerMiddleware(HandlerMiddleware(WithAuditWriter(&auditOut))),
+		logging.WithHandlerMiddleware(HandlerMiddleware(WithWriter(&auditOut))),
 	)
 
 	var wg sync.WaitGroup
@@ -427,10 +427,10 @@ func TestHandlerMiddleware_Options(t *testing.T) {
 		wantStdout  bool
 	}{
 		{name: "defaults", wantEnabled: true, wantStdout: true},
-		{name: "nil writer keeps stdout", opts: []MiddlewareOption{WithAuditWriter(nil)}, wantEnabled: true, wantStdout: true},
+		{name: "nil writer keeps stdout", opts: []MiddlewareOption{WithWriter(nil)}, wantEnabled: true, wantStdout: true},
 		{name: "nil meter provider keeps default", opts: []MiddlewareOption{WithMeterProvider(nil)}, wantEnabled: true, wantStdout: true},
 		{name: "gate off", opts: []MiddlewareOption{WithEnabled(false)}, wantEnabled: false, wantStdout: true},
-		{name: "custom writer", opts: []MiddlewareOption{WithAuditWriter(io.Discard)}, wantEnabled: true},
+		{name: "custom writer", opts: []MiddlewareOption{WithWriter(io.Discard)}, wantEnabled: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -446,13 +446,13 @@ func TestHandlerMiddleware_Options(t *testing.T) {
 	}
 }
 
-func TestHandlerMiddleware_EachApplicationHasOwnSink(t *testing.T) {
+func TestHandlerMiddleware_ApplicationsShareOneSink(t *testing.T) {
 	t.Parallel()
 
-	mw := HandlerMiddleware(WithAuditWriter(io.Discard))
+	mw := HandlerMiddleware(WithWriter(io.Discard))
 	a := mw(slog.NewJSONHandler(io.Discard, nil)).(*auditHandler)
 	b := mw(slog.NewJSONHandler(io.Discard, nil)).(*auditHandler)
-	assert.NotSame(t, a.sink, b.sink)
+	assert.Same(t, a.sink, b.sink, "every application of one middleware shares its sink and lock")
 
 	derived := a.WithAttrs([]slog.Attr{slog.String("k", "v")}).WithGroup("g").(*auditHandler)
 	assert.Same(t, a.sink, derived.sink, "derived handlers share the parent's sink")

@@ -27,7 +27,7 @@ func NewAuditLogger(w io.Writer) *slog.Logger {
 		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.LevelKey {
 				if level, ok := a.Value.Any().(slog.Level); ok && level == LevelAudit {
-					a.Value = slog.StringValue("AUDIT")
+					a.Value = slog.StringValue(levelAuditName)
 				}
 			}
 			return a

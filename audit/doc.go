@@ -102,21 +102,23 @@ middleware:
 The middleware behaves as follows, and each rule has a reason:
 
   - Audit records are written to [os.Stdout] by default (override with
-    [WithAuditWriter]); operator records keep their own output, normally
+    [WithWriter]); operator records keep their own output, normally
     stderr. Keeping audit events on their own stream lets a log collector
     ship them without parsing operator output.
   - Each audit record is one JSON line, whatever format the operator logger
     uses. The level is rendered as "AUDIT" rather than slog's "INFO+2", and
     every line carries logger=audit, so a collector selects audit events from
-    every service with a single rule.
+    every service with a single rule. Only the middleware stamps logger=audit;
+    lines written through [NewAuditLogger] do not carry it.
   - Audit records ignore the operator log level. A service running at warn or
     error still writes its audit events.
   - [WithEnabled] is the only gate. When it is false, Enabled reports
-    [LevelAudit] as disabled, so [AuditEvent.LogTo] does not even build the
+    [LevelAudit] as disabled, so slog neither constructs nor dispatches the
     record, and any audit record that reaches the handler is dropped.
   - Attributes and groups added with [log/slog.Logger.With] and
     [log/slog.Logger.WithGroup] apply to operator records only. An audit
-    record contains exactly the fields of its event, at the top level, so
+    line contains only the fields of its event, plus time, level, msg and
+    logger=audit, all at the top level, so
     request-scoped logger context cannot leak into or reshape the audit
     record.
   - The middleware must be registered last, making it the outermost handler.
@@ -125,11 +127,14 @@ The middleware behaves as follows, and each rule has a reason:
     audit record. A middleware registered after it would see audit records,
     and the library cannot prevent that.
   - The write is synchronous, and each record is written with one Write call
-    under a lock, so concurrent records never interleave. A failed or short
+    under a lock shared by every handler built from one [HandlerMiddleware]
+    result, so concurrent records never interleave. Applying two separate
+    HandlerMiddleware results to one writer gives two locks; build the
+    middleware once per writer. A failed or short
     write never returns an error to the caller and is never logged, so a
     broken audit stream neither fails the action being audited nor floods
     the operator output. Instead each failed record increments the
-    audit.write.failures counter (no attributes) on the meter provider set
+    [WriteFailuresMetricName] counter (no attributes) on the meter provider set
     with [WithMeterProvider], or the global provider by default. After a
     short write, the next record starts on a new line so it still parses.
 
