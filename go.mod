@@ -86,7 +86,7 @@ require (
 	github.com/coreos/go-oidc/v3 v3.21.0 // indirect
 	github.com/digitorus/pkcs7 v0.0.0-20261104125046-a476de3098e4 // indirect
 	github.com/digitorus/timestamp v0.0.0-20260914073129-b4b58b92aa51 // indirect
-	github.com/docker/cli v29.10.0+incompatible // indirect
+	github.com/docker/cli v29.10.1+incompatible // indirect
 	github.com/docker/docker-credential-helpers v0.9.13 // indirect
 	github.com/ebitengine/purego v0.11.3 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.9 // indirect
