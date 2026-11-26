@@ -243,14 +243,16 @@ it, such as the deletion that cascaded to it.
 
 Container runtimes split a stdout line longer than 16 KiB into partial
 records, and a collector that does not join them breaks the event. The
-builder therefore keeps every line, measured with the audit handler
+builder therefore keeps each line, measured with the audit handler
 middleware's own renderer and newline included, within [MaxLineBytes]. It
 packs to 16,000 bytes, which leaves headroom for the record time.
 
   - Each actor string, enricher value and component value is capped at
     [MaxActorStringBytes], because actor strings come from token claims with
-    no length limit. The target id and each delegation hop's issuer and
-    subject are capped the same way.
+    no length limit. The target id, the source value, each source extra
+    value, each change field name and each delegation hop's issuer and
+    subject are capped the same way. At most 16 enricher, component and
+    source extra keys are kept.
   - The change list, the member ids and the delegation chain are split, never
     cut, so an auditor can still find when a given member was added. When they
     do not fit, the first event is followed by continuation events. Each has
@@ -262,14 +264,21 @@ packs to 16,000 bytes, which leaves headroom for the record time.
     and the target name.
   - Any other overflow is cut, in order: the payload set with [WithPayload],
     which becomes a JSON string of its leading bytes; then the target name;
-    then each change value or member id over 4 KiB that does not fit in an
-    event on its own.
+    then each change value or member id whose encoding is over 4 KiB, cut to
+    4 KiB, when its entry does not fit in an event on its own. Sizes are
+    measured in encoded bytes, so characters JSON escapes count in full.
   - The builder never cuts the audit id, the time, the type, the outcome, the
-    reason, the request id, the actor (beyond its cap) or the cause.
+    reason, the request id, the actor (beyond its cap), the cause, the
+    component or the target type. These are set by the component, not the
+    caller, and normally take a few hundred bytes. If they alone leave no
+    room, the builder cuts nothing that would not help and returns a single
+    event, best effort, rather than one oversized event per list entry.
 
 Every cut or dropped value is listed in metadata.extra.truncated with its
 field name, original length and SHA-256 digest. A digest lets an auditor
-match a value they already hold; it does not recover the value.
+match a value they already hold; it does not recover the value. At most 16
+dropped keys of one source are listed individually; one summary record, whose
+field is the source, counts the rest and digests their sorted names.
 
 # Conformance Helper
 

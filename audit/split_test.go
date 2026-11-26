@@ -16,6 +16,7 @@ import (
 
 // Expected payload states in TestNewEvent_CutOrderAndTruncatedRecord.
 const (
+	descAfterField = "changes.description.after"
 	payloadPartial = "partial"
 	payloadEmpty   = "empty"
 )
@@ -172,14 +173,14 @@ func TestNewEvent_CutOrderAndTruncatedRecord(t *testing.T) {
 	bigID := strings.Repeat("i", 30000)
 
 	tests := []struct {
-		name         string
-		target       Target
-		opts         []EventOption
-		wantEvents   int
-		wantPayload  string // "" means the payload is unchanged or absent
-		wantNameCut  bool
-		wantCut      map[string]string // field -> full value, on the event that holds it
-		wantCutEvent int
+		name          string
+		target        Target
+		opts          []EventOption
+		wantEvents    int
+		wantPayload   string // "" means the payload is unchanged or absent
+		wantNameCut   bool
+		wantCut       map[string]string // field -> full value
+		wantValuesCut bool
 	}{
 		{
 			name:        "payload is cut first and becomes a string of its leading bytes",
@@ -199,28 +200,40 @@ func TestNewEvent_CutOrderAndTruncatedRecord(t *testing.T) {
 			wantCut:     map[string]string{"data": bigPayload, "target.name": bigName},
 		},
 		{
-			name:         "a change value over 4 KiB is cut when it cannot fit on its own",
-			target:       testTarget,
-			opts:         []EventOption{WithChanges(FieldChange("description", "old", bigValue))},
-			wantEvents:   2,
-			wantCut:      map[string]string{"changes.description.after": bigValue},
-			wantCutEvent: 1,
+			name:          "a change value over 4 KiB is cut when it cannot fit on its own",
+			target:        testTarget,
+			opts:          []EventOption{WithChanges(FieldChange("description", "old", bigValue))},
+			wantEvents:    1,
+			wantCut:       map[string]string{descAfterField: bigValue},
+			wantValuesCut: true,
 		},
 		{
-			name:         "a member id over 4 KiB is cut when it cannot fit on its own",
-			target:       testTarget,
-			opts:         []EventOption{WithChanges(MembersChange("members", []string{bigID}, nil))},
-			wantEvents:   2,
-			wantCut:      map[string]string{"changes.members.added": bigID},
-			wantCutEvent: 1,
+			name:          "a member id over 4 KiB is cut when it cannot fit on its own",
+			target:        testTarget,
+			opts:          []EventOption{WithChanges(MembersChange("members", []string{bigID}, nil))},
+			wantEvents:    1,
+			wantCut:       map[string]string{"changes.members.added": bigID},
+			wantValuesCut: true,
 		},
 		{
-			name:         "both values of one change are cut",
-			target:       testTarget,
-			opts:         []EventOption{WithChanges(FieldChange("description", bigValue, bigValue+"!"))},
-			wantEvents:   2,
-			wantCut:      map[string]string{"changes.description.before": bigValue, "changes.description.after": bigValue + "!"},
-			wantCutEvent: 1,
+			name:   "escaped characters are measured in encoded bytes",
+			target: testTarget,
+			opts: []EventOption{WithChanges(FieldChange("description",
+				strings.Repeat("<", 6000), strings.Repeat("\x01", 6000)))},
+			wantEvents: 1,
+			wantCut: map[string]string{
+				"changes.description.before": strings.Repeat("<", 6000),
+				descAfterField:               strings.Repeat("\x01", 6000),
+			},
+			wantValuesCut: true,
+		},
+		{
+			name:          "both values of one change are cut",
+			target:        testTarget,
+			opts:          []EventOption{WithChanges(FieldChange("description", bigValue, bigValue+"!"))},
+			wantEvents:    1,
+			wantCut:       map[string]string{"changes.description.before": bigValue, descAfterField: bigValue + "!"},
+			wantValuesCut: true,
 		},
 	}
 	for _, tt := range tests {
@@ -253,7 +266,7 @@ func TestNewEvent_CutOrderAndTruncatedRecord(t *testing.T) {
 				assert.Equal(t, tt.target.Name, first.Target[TargetKeyName])
 			}
 
-			holder := events[tt.wantCutEvent]
+			holder := events[0]
 			for field, full := range tt.wantCut {
 				tr, ok := findTruncation(holder, field)
 				require.True(t, ok, "missing record for %s", field)
@@ -261,14 +274,15 @@ func TestNewEvent_CutOrderAndTruncatedRecord(t *testing.T) {
 				assert.Equal(t, digest(full), tr.SHA256)
 				assert.False(t, tr.Dropped)
 			}
-			if tt.wantCutEvent > 0 {
+			if tt.wantValuesCut {
 				changes := holder.Metadata.Extra[MetadataExtraKeyChanges].([]Change)
 				require.Len(t, changes, 1)
 				c := changes[0]
-				assert.LessOrEqual(t, len(c.before), maxFieldValueBytes)
-				assert.LessOrEqual(t, len(c.after), maxFieldValueBytes)
-				for _, id := range c.added {
-					assert.LessOrEqual(t, len(id), maxFieldValueBytes)
+				for _, v := range append([]string{c.before, c.after}, c.added...) {
+					assert.LessOrEqual(t, encodedLen(v), maxFieldValueBytes)
+					if len(v) > 3 {
+						assert.Greater(t, encodedLen(v), maxFieldValueBytes-8, "a value is cut to 4 KiB, no further")
+					}
 				}
 			}
 		})
@@ -406,26 +420,155 @@ func TestCapString(t *testing.T) {
 func TestNewEvent_OversizedNeverCutFieldsDoNotMultiplyEvents(t *testing.T) {
 	t.Parallel()
 
+	t.Run("never-cut fields over the target", func(t *testing.T) {
+		t.Parallel()
+		b, _ := newTestBuilder(t)
+		events, err := b.NewEvent(userCtx(), strings.Repeat("t", 17000), testTarget, OutcomeSuccess,
+			WithChanges(MembersChange("members", ids("m", 200, 36), nil)))
+		require.NoError(t, err)
+		require.Len(t, events, 1, "splitting cannot help, so one best-effort event is returned")
+		got := collectEntries(t, render(t, events))
+		assert.Len(t, got.added, 200, "no list entry is lost")
+		assert.Equal(t, testTarget.Name, events[0].Target[TargetKeyName], "a futile cut leaves the target name")
+		assert.NotContains(t, events[0].Metadata.Extra, MetadataExtraKeyTruncated)
+	})
+
+	// Never-cut fields in the band just under the target: an empty
+	// continuation fits, but no continuation can hold an entry.
+	for _, size := range []int{15000, 15350, 15450, 15700} {
+		t.Run(fmt.Sprintf("event type of %d bytes", size), func(t *testing.T) {
+			t.Parallel()
+			b, _ := newTestBuilder(t)
+			events, err := b.NewEvent(userCtx(), strings.Repeat("t", size), testTarget, OutcomeSuccess,
+				WithChanges(MembersChange("members", ids("m", 200, 36), nil)))
+			require.NoError(t, err)
+			assert.LessOrEqual(t, len(events), 200/2, "events are not multiplied per entry")
+			got := collectEntries(t, render(t, events))
+			assert.Len(t, got.added, 200)
+			for _, id := range got.added {
+				assert.Len(t, id, 36, "no member id is cut")
+			}
+		})
+	}
+}
+
+func TestNewEvent_DropRecordsBounded(t *testing.T) {
+	t.Parallel()
+
+	keys := func(n int) map[string]string {
+		m := make(map[string]string, n)
+		for i := 0; i < n; i++ {
+			m[fmt.Sprintf("k%04d", i)] = "v"
+		}
+		return m
+	}
+	anyKeys := func(n int) map[string]any {
+		m := make(map[string]any, n)
+		for k, v := range keys(n) {
+			m[k] = v
+		}
+		return m
+	}
 	tests := []struct {
-		name   string
-		source EventSource
+		name    string
+		builder []BuilderOption
+		opts    []EventOption
+		prefix  string
 	}{
-		{name: "oversized source value", source: EventSource{Type: SourceTypeLocal, Value: strings.Repeat("s", 17000)}},
-		{name: "oversized source extra", source: EventSource{Type: SourceTypeLocal, Extra: map[string]any{
-			"x": strings.Repeat("s", 17000),
-		}}},
+		{
+			name:    "enricher",
+			builder: []BuilderOption{WithSubjectEnricher(func(context.Context) map[string]string { return keys(500) })},
+			prefix:  "subjects",
+		},
+		{name: "component extra", opts: []EventOption{WithExtra(anyKeys(500))}, prefix: "metadata.extra"},
+		{
+			name:   "source extra",
+			opts:   []EventOption{WithSource(EventSource{Type: SourceTypeLocal, Extra: anyKeys(500)})},
+			prefix: "source.extra",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			b, _ := newTestBuilder(t)
-			events, err := b.NewEvent(userCtx(), testType, testTarget, OutcomeSuccess,
-				WithSource(tt.source),
-				WithChanges(MembersChange("members", ids("m", 200, 36), nil)))
-			require.NoError(t, err)
-			require.Len(t, events, 1, "splitting cannot help, so one best-effort event is returned")
-			got := collectEntries(t, render(t, events))
-			assert.Len(t, got.added, 200, "no list entry is lost")
+			b, _ := newTestBuilder(t, tt.builder...)
+			events := mustBuild(userCtx(), t, b, append(tt.opts,
+				WithChanges(MembersChange("members", ids("m", 2, 36), nil)))...)
+			require.Len(t, events, 1)
+			line := render(t, events)[0]
+			assert.LessOrEqual(t, len(line), MaxLineBytes)
+
+			var individual int
+			var summary *truncation
+			for _, tr := range truncations(events[0]) {
+				if tr.Field == tt.prefix {
+					summary = &tr
+				} else if strings.HasPrefix(tr.Field, tt.prefix+".") && tr.Dropped {
+					individual++
+				}
+			}
+			assert.Equal(t, maxDropRecords, individual)
+			require.NotNil(t, summary)
+			assert.True(t, summary.Dropped)
+			assert.Equal(t, 500-maxExtraKeys-maxDropRecords, summary.Count)
+			var rest []string
+			for i := maxExtraKeys + maxDropRecords; i < 500; i++ {
+				rest = append(rest, fmt.Sprintf("k%04d", i))
+			}
+			assert.Equal(t, digest(strings.Join(rest, "\n")), summary.SHA256)
+		})
+	}
+}
+
+func TestNewEvent_CallerStringsCapped(t *testing.T) {
+	t.Parallel()
+
+	long := strings.Repeat("f", 20000)
+	b, _ := newTestBuilder(t)
+	events := mustBuild(userCtx(), t, b,
+		WithSource(EventSource{Type: SourceTypeNetwork, Value: long}),
+		WithChanges(SecretFieldChange(long), MembersChange(long, []string{"m-1"}, nil)))
+	require.Len(t, events, 1)
+	e := events[0]
+	assert.Len(t, e.Source.Value, MaxActorStringBytes)
+	for _, c := range e.Metadata.Extra[MetadataExtraKeyChanges].([]Change) {
+		assert.Len(t, c.field, MaxActorStringBytes)
+	}
+	tr, ok := findTruncation(e, "source.value")
+	require.True(t, ok)
+	assert.Equal(t, digest(long), tr.SHA256)
+	var fieldRecords int
+	for _, tr := range truncations(e) {
+		if tr.Field == "changes.field" {
+			fieldRecords++
+		}
+	}
+	assert.Equal(t, 2, fieldRecords)
+	assert.LessOrEqual(t, len(render(t, events)[0]), MaxLineBytes)
+}
+
+func TestCapEncoded(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		n    int
+		want string
+	}{
+		{name: "plain", in: "xyzw", n: 3, want: "xyz"},
+		{name: "fits", in: "xy", n: 2, want: "xy"},
+		{name: "escaped quote", in: `a"b`, n: 2, want: "a"},
+		{name: "html escaped", in: "<<", n: 6, want: "<"},
+		{name: "control character", in: "\x01a", n: 5, want: ""},
+		{name: "newline", in: "\na", n: 3, want: "\na"},
+		{name: "multibyte", in: "éé", n: 3, want: "é"},
+		{name: "invalid byte", in: "\xffa", n: 6, want: "\xff"},
+		{name: "line separator", in: "\u2028", n: 3, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, capEncoded(tt.in, tt.n))
 		})
 	}
 }

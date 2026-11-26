@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -119,22 +120,33 @@ func (b *EventBuilder) newPlan(
 	p.requestID, _ = RequestIDFromContext(ctx)
 	p.subjects, p.common = b.subjects(ctx, actor)
 	p.targetID = capValue("target.id", target.ID, &p.common)
+	p.source.Value = capValue("source.value", p.source.Value, &p.common)
+	var sourceRecords []truncation
+	p.source.Extra, sourceRecords = boundedExtra("source.extra", nil, p.source.Extra)
+	p.common = append(p.common, sourceRecords...)
 	sortTruncations(p.common)
-	p.extra, p.first = componentExtra(in.extra)
+	p.extra, p.first = boundedExtra("metadata.extra", reservedExtraKeys, in.extra)
 	sortTruncations(p.first)
 
 	p.changeFields = make([]string, len(in.changes))
 	for i, c := range in.changes {
+		// A field name is capped like an actor string. Its record travels
+		// with the change, or with the first member id of a membership
+		// change.
+		var records []truncation
+		c.field = capValue("changes.field", c.field, &records)
 		p.changeFields[i] = c.field
 		if c.kind != changeKindMembers || len(c.added)+len(c.removed) == 0 {
-			p.items = append(p.items, item{kind: itemChange, change: i, ch: c})
+			p.items = append(p.items, item{kind: itemChange, change: i, ch: c, records: records})
 			continue
 		}
 		for _, id := range c.added {
-			p.items = append(p.items, item{kind: itemAdded, change: i, id: id})
+			p.items = append(p.items, item{kind: itemAdded, change: i, id: id, records: records})
+			records = nil
 		}
 		for _, id := range c.removed {
-			p.items = append(p.items, item{kind: itemRemoved, change: i, id: id})
+			p.items = append(p.items, item{kind: itemRemoved, change: i, id: id, records: records})
+			records = nil
 		}
 	}
 	if !in.chain.IsZero() {
@@ -283,17 +295,15 @@ func (p *plan) build() []*AuditEvent {
 	if e := single(); len(p.items) == 0 || lineSize(e) <= targetLineBytes {
 		return []*AuditEvent{e}
 	}
-	// When fields the builder never cuts already overflow an empty
-	// continuation, splitting cannot bring any line under the limit and would
-	// only repeat the oversized fields once per list entry. Return the single
-	// event, best effort.
-	if lineSize(p.event(firstID, firstID, false, nil, partPlaceholder, partPlaceholder)) > targetLineBytes {
+	groups, ok := p.pack(firstID)
+	switch {
+	case !ok:
+		// The fields every event repeats leave no room for some entry, so
+		// no split brings every line under the limit. Splitting would only
+		// repeat those fields once per entry: return one event, best effort.
 		return []*AuditEvent{single()}
-	}
-
-	groups := p.pack(firstID)
-	if len(groups) == 1 {
-		return []*AuditEvent{single()}
+	case len(groups) == 1:
+		return []*AuditEvent{p.event(firstID, p.cause, true, groups[0], 0, 0)}
 	}
 	events := make([]*AuditEvent, len(groups))
 	for i, g := range groups {
@@ -307,29 +317,49 @@ func (p *plan) build() []*AuditEvent {
 }
 
 // fitHead cuts the payload, then the target name, until the first event
-// without list entries fits in targetLineBytes.
+// without list entries fits in targetLineBytes. It cuts nothing when even
+// an empty payload and target name would not fit, since the overflow then
+// comes from fields the builder never cuts.
 func (p *plan) fitHead(firstID string, placeholder int) {
 	size := func() int {
 		return lineSize(p.event(firstID, p.cause, true, nil, placeholder, placeholder))
 	}
 	s := size()
-	if s > targetLineBytes && p.payload != nil {
+	if s <= targetLineBytes {
+		return
+	}
+	payload, name := p.payload, p.targetName
+	if payload != nil {
+		p.payload = jsonString("")
+	}
+	p.targetName = ""
+	floor := size()
+	p.payload, p.targetName = payload, name
+	if floor > targetLineBytes {
+		return
+	}
+
+	if p.payload != nil {
 		full := string(p.payload)
 		p.first = append(p.first, newTruncation("data", full, false))
-		cut := full
-		for s > targetLineBytes && cut != "" {
-			cut = capString(cut, len(cut)-(s-targetLineBytes))
-			p.payload = jsonString(cut)
-			s = size()
-		}
-		p.payload = jsonString(cut)
+		s = cutUntilFits(full, s, size, func(v string) { p.payload = jsonString(v) })
 	}
 	if s > targetLineBytes && p.targetName != "" {
-		full := p.targetName
-		p.first = append(p.first, newTruncation("target.name", full, false))
-		for s > targetLineBytes && p.targetName != "" {
-			p.targetName = capString(p.targetName, len(p.targetName)-(s-targetLineBytes))
-			s = size()
+		p.first = append(p.first, newTruncation("target.name", p.targetName, false))
+		cutUntilFits(p.targetName, s, size, func(v string) { p.targetName = v })
+	}
+}
+
+// cutUntilFits cuts value at rune boundaries, by the overflow measured in
+// encoded bytes, until size reports a fit or nothing is left. set stores
+// each cut. It returns the final size.
+func cutUntilFits(value string, s int, size func() int, set func(string)) int {
+	for {
+		value = capEncoded(value, encodedLen(value)-(s-targetLineBytes))
+		set(value)
+		s = size()
+		if s <= targetLineBytes || value == "" {
+			return s
 		}
 	}
 }
@@ -338,6 +368,47 @@ func (p *plan) fitHead(firstID string, placeholder int) {
 func jsonString(s string) json.RawMessage {
 	enc, _ := json.Marshal(s) // a string always encodes
 	return enc
+}
+
+// runeEncodedLen returns an upper bound on the bytes a rune takes inside a
+// JSON string.
+func runeEncodedLen(r rune, size int) int {
+	switch {
+	case r == utf8.RuneError && size == 1:
+		return 6 // invalid byte, rendered as \ufffd
+	case r == '"' || r == '\\' || r == '\n' || r == '\r' || r == '\t':
+		return 2
+	case r < 0x20, r == '<', r == '>', r == '&', r == '\u2028', r == '\u2029':
+		return 6
+	default:
+		return size
+	}
+}
+
+// encodedLen returns an upper bound on the bytes s takes inside a JSON string.
+func encodedLen(s string) int {
+	n := 0
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		n += runeEncodedLen(r, size)
+		i += size
+	}
+	return n
+}
+
+// capEncoded returns the longest prefix of s, cut at a rune boundary, whose
+// JSON string encoding takes at most n bytes.
+func capEncoded(s string, n int) string {
+	used := 0
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		used += runeEncodedLen(r, size)
+		if used > n {
+			return s[:i]
+		}
+		i += size
+	}
+	return s
 }
 
 // packState tracks what the event being filled already holds, so the size
@@ -383,6 +454,23 @@ func (s *packState) estimate(p *plan, it item) int {
 	return n + wrapperSlack/2
 }
 
+// tryAdd adds it to the event when it fits, using the estimate when that
+// suffices and rendering the event otherwise.
+func (s *packState) tryAdd(p *plan, it item, measure func([]item) int) bool {
+	est := s.estimate(p, it)
+	if s.size+est <= targetLineBytes {
+		s.add(it, est)
+		return true
+	}
+	trial := append(append([]item(nil), s.items...), it)
+	if m := measure(trial); m <= targetLineBytes {
+		s.add(it, est)
+		s.size = m
+		return true
+	}
+	return false
+}
+
 func (s *packState) add(it item, estimate int) {
 	s.items = append(s.items, it)
 	s.size += estimate
@@ -406,9 +494,11 @@ func jsonLen(v any) int {
 }
 
 // pack distributes the list entries over the first event and as many
-// continuation events as needed, each within targetLineBytes. An entry
-// that does not fit in an empty continuation is cut.
-func (p *plan) pack(firstID string) [][]item {
+// continuation events as needed, each within targetLineBytes. An entry that
+// does not fit in an empty event has its values over maxFieldValueBytes cut.
+// pack reports false when an entry does not fit even then in an empty
+// continuation, because the fields every event repeats leave no room.
+func (p *plan) pack(firstID string) ([][]item, bool) {
 	var groups [][]item
 	first := true
 	measure := func(items []item) int {
@@ -424,93 +514,56 @@ func (p *plan) pack(firstID string) [][]item {
 
 	for i := 0; i < len(p.items); i++ {
 		it := p.items[i]
-		est := state.estimate(p, it)
-		if state.size+est <= targetLineBytes {
-			state.add(it, est)
+		if state.tryAdd(p, it, measure) {
 			continue
 		}
-		trial := append(append([]item(nil), state.items...), it)
-		if s := measure(trial); s <= targetLineBytes {
-			state.add(it, est)
-			state.size = s
-			continue
-		}
-		if len(state.items) == 0 && !first {
-			// Alone in an empty continuation and still too large.
-			it = p.cutItem(it, func(it item) int { return measure([]item{it}) })
-			state.add(it, 0)
-			state.size = measure(state.items)
-			continue
+		if len(state.items) == 0 {
+			if state.tryAdd(p, p.cutItem(it), measure) {
+				continue
+			}
+			if !first {
+				return nil, false
+			}
 		}
 		groups = append(groups, state.items)
 		first = false
 		state = newState()
 		i-- // place the entry in the new continuation
 	}
-	return append(groups, state.items)
+	return append(groups, state.items), true
 }
 
-// cutItem cuts a list entry that does not fit in an event on its own. Each
-// value over maxFieldValueBytes is cut to that size first; values are then
-// cut further until the entry fits, or until there is nothing left to cut.
-func (p *plan) cutItem(it item, size func(item) int) item {
+// cutItem cuts each value of a list entry whose JSON encoding is over
+// maxFieldValueBytes to that size. Shorter values, secret changes and
+// delegation hops are never cut.
+func (p *plan) cutItem(it item) item {
+	it.records = append([]truncation(nil), it.records...)
 	switch it.kind {
 	case itemChange:
 		if it.ch.kind != changeKindValue {
 			return it
 		}
 		field := "changes." + it.ch.field + "."
-		before := cutValue{field: field + "before", full: it.ch.before, cur: it.ch.before}
-		after := cutValue{field: field + "after", full: it.ch.after, cur: it.ch.after}
-		apply := func() {
-			it.ch.before, it.ch.after = before.cur, after.cur
-			it.records = append(before.record(), after.record()...)
-		}
-		before.cut(maxFieldValueBytes)
-		after.cut(maxFieldValueBytes)
-		apply()
-		for s := size(it); s > targetLineBytes && (before.cur != "" || after.cur != ""); s = size(it) {
-			longer := &before
-			if len(after.cur) > len(before.cur) {
-				longer = &after
-			}
-			longer.cut(len(longer.cur) - (s - targetLineBytes))
-			apply()
-		}
-	case itemAdded, itemRemoved:
-		field := "changes." + p.changeFields[it.change] + ".added"
-		if it.kind == itemRemoved {
-			field = "changes." + p.changeFields[it.change] + ".removed"
-		}
-		id := cutValue{field: field, full: it.id, cur: it.id}
-		id.cut(maxFieldValueBytes)
-		it.id, it.records = id.cur, id.record()
-		for s := size(it); s > targetLineBytes && id.cur != ""; s = size(it) {
-			id.cut(len(id.cur) - (s - targetLineBytes))
-			it.id, it.records = id.cur, id.record()
-		}
+		it.ch.before = capFieldValue(field+"before", it.ch.before, &it.records)
+		it.ch.after = capFieldValue(field+"after", it.ch.after, &it.records)
+	case itemAdded:
+		it.id = capFieldValue("changes."+p.changeFields[it.change]+".added", it.id, &it.records)
+	case itemRemoved:
+		it.id = capFieldValue("changes."+p.changeFields[it.change]+".removed", it.id, &it.records)
 	case itemHop:
 		// Hop strings are already capped at MaxActorStringBytes.
 	}
 	return it
 }
 
-// cutValue tracks one value being cut and its truncation record.
-type cutValue struct {
-	field string
-	full  string
-	cur   string
-}
-
-func (c *cutValue) cut(n int) {
-	c.cur = capString(c.cur, n)
-}
-
-func (c *cutValue) record() []truncation {
-	if len(c.cur) == len(c.full) {
-		return nil
+// capFieldValue cuts value to an encoding of at most maxFieldValueBytes,
+// appending a truncation record for field when it was cut.
+func capFieldValue(field, value string, records *[]truncation) string {
+	cut := capEncoded(value, maxFieldValueBytes)
+	if len(cut) < len(value) {
+		*records = append(*records, newTruncation(field, value, false))
 	}
-	return []truncation{newTruncation(c.field, c.full, false)}
+	return cut
 }
 
 func sortTruncations(records []truncation) {

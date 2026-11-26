@@ -12,6 +12,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strings"
 	"unicode/utf8"
 
 	"go.opentelemetry.io/otel"
@@ -354,11 +355,50 @@ func (b *EventBuilder) refuse(ctx context.Context, reason string, err error) err
 }
 
 // truncation records one value the builder cut or dropped.
+//
+// A summary record, which stands for keys dropped past the first
+// maxDropRecords of one source, has the source as its field, the number of
+// keys it stands for in Count, and the length and digest of their sorted
+// names joined by newlines.
 type truncation struct {
 	Field   string `json:"field"`
 	Length  int    `json:"length"`
 	SHA256  string `json:"sha256"`
 	Dropped bool   `json:"dropped,omitempty"`
+	Count   int    `json:"count,omitempty"`
+}
+
+// maxDropRecords caps the individual records for keys dropped from one
+// source, so the records cannot grow the event without bound.
+const maxDropRecords = 16
+
+// dropRecorder records the keys dropped from one source: the first
+// maxDropRecords individually, then one summary record for the rest.
+type dropRecorder struct {
+	prefix  string
+	records *[]truncation
+	n       int
+	rest    []string
+}
+
+func (d *dropRecorder) drop(key, value string) {
+	if d.n < maxDropRecords {
+		*d.records = append(*d.records, newTruncation(d.prefix+"."+key, value, true))
+		d.n++
+		return
+	}
+	d.rest = append(d.rest, key)
+}
+
+// flush adds the summary record, if any keys are left over. Keys are
+// dropped in sorted order, so the summary is deterministic.
+func (d *dropRecorder) flush() {
+	if len(d.rest) == 0 {
+		return
+	}
+	summary := newTruncation(d.prefix, strings.Join(d.rest, "\n"), true)
+	summary.Count = len(d.rest)
+	*d.records = append(*d.records, summary)
 }
 
 func newTruncation(field, full string, dropped bool) truncation {
@@ -412,37 +452,44 @@ func (b *EventBuilder) subjects(ctx context.Context, actor Actor) (map[string]st
 			}
 		}
 		sort.Strings(keys)
-		for i, k := range keys {
-			field := "subjects." + k
-			if i >= maxExtraKeys || len(k) > MaxActorStringBytes {
-				records = append(records, newTruncation(field, extra[k], true))
+		drops := dropRecorder{prefix: "subjects", records: &records}
+		kept := 0
+		for _, k := range keys {
+			if kept >= maxExtraKeys || len(k) > MaxActorStringBytes {
+				drops.drop(k, extra[k])
 				continue
 			}
-			out[k] = capValue(field, extra[k], &records)
+			out[k] = capValue("subjects."+k, extra[k], &records)
+			kept++
 		}
+		drops.flush()
 	}
 	return out, records
 }
 
-// componentExtra bounds the component's metadata.extra keys: reserved keys
-// are dropped, at most maxExtraKeys are kept in sorted order, and each value
-// is capped at MaxActorStringBytes.
-func componentExtra(extra map[string]any) (map[string]any, []truncation) {
+// boundedExtra bounds a map of component keys written under prefix, such as
+// metadata.extra: reserved keys are dropped silently, at most maxExtraKeys
+// are kept in sorted order, and each value is capped at MaxActorStringBytes.
+func boundedExtra(prefix string, reserved map[string]struct{}, extra map[string]any) (map[string]any, []truncation) {
 	var records []truncation
 	keys := make([]string, 0, len(extra))
 	for k := range extra {
-		if _, reserved := reservedExtraKeys[k]; !reserved && k != "" {
+		if _, isReserved := reserved[k]; !isReserved && k != "" {
 			keys = append(keys, k)
 		}
 	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
 	sort.Strings(keys)
 	out := make(map[string]any, min(len(keys), maxExtraKeys))
-	for i, k := range keys {
-		field := "metadata.extra." + k
+	drops := dropRecorder{prefix: prefix, records: &records}
+	for _, k := range keys {
+		field := prefix + "." + k
 		v := extra[k]
 		enc, encodable := encodeExtraValue(v)
-		if i >= maxExtraKeys || len(k) > MaxActorStringBytes || !encodable {
-			records = append(records, newTruncation(field, enc, true))
+		if len(out) >= maxExtraKeys || len(k) > MaxActorStringBytes || !encodable {
+			drops.drop(k, enc)
 			continue
 		}
 		switch tv := v.(type) {
@@ -460,6 +507,7 @@ func componentExtra(extra map[string]any) (map[string]any, []truncation) {
 			out[k] = capValue(field, enc, &records)
 		}
 	}
+	drops.flush()
 	return out, records
 }
 
