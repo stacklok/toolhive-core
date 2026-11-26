@@ -91,6 +91,18 @@ const (
 	// maxExtraKeys caps the keys a subject enricher or a component adds.
 	maxExtraKeys = 16
 
+	// maxExtraKeyBytes caps the length of a key a subject enricher or a
+	// component adds. A longer key is dropped.
+	maxExtraKeyBytes = 64
+
+	// Byte budgets for the keys and values each source adds. Together with
+	// the caps above they keep the fields every event repeats well under
+	// targetLineBytes, so list entries always have room. Keys past a budget,
+	// in sorted order, are dropped.
+	enricherBudgetBytes    = 2048
+	sourceExtraBudgetBytes = 512
+	componentBudgetBytes   = 2048
+
 	// maxFieldValueBytes is the size above which a single change value or
 	// member id is cut when it does not fit in an event on its own.
 	maxFieldValueBytes = 4096
@@ -297,7 +309,8 @@ func WithSource(source EventSource) EventOption {
 }
 
 // WithExtra adds component keys to metadata.extra. At most 16 are kept, in
-// sorted key order, and each value is capped at [MaxActorStringBytes]. A key
+// sorted key order and within a 2 KiB budget; each key is at most 64 bytes
+// and each value is capped at [MaxActorStringBytes]. A key
 // the builder writes itself, such as "reason" or "request_id", is dropped.
 // Repeated calls merge.
 func WithExtra(extra map[string]any) EventOption {
@@ -370,7 +383,7 @@ type truncation struct {
 
 // maxDropRecords caps the individual records for keys dropped from one
 // source, so the records cannot grow the event without bound.
-const maxDropRecords = 16
+const maxDropRecords = 4
 
 // dropRecorder records the keys dropped from one source: the first
 // maxDropRecords individually, then one summary record for the rest.
@@ -383,7 +396,7 @@ type dropRecorder struct {
 
 func (d *dropRecorder) drop(key, value string) {
 	if d.n < maxDropRecords {
-		*d.records = append(*d.records, newTruncation(d.prefix+"."+key, value, true))
+		*d.records = append(*d.records, newTruncation(d.prefix+"."+capString(key, maxExtraKeyBytes), value, true))
 		d.n++
 		return
 	}
@@ -444,33 +457,29 @@ func (b *EventBuilder) subjects(ctx context.Context, actor Actor) (map[string]st
 		out[k] = capValue("subjects."+k, v, &records)
 	}
 	if b.enricher != nil {
-		extra := b.enricher(ctx)
-		keys := make([]string, 0, len(extra))
-		for k := range extra {
-			if _, contract := contractSubjectKeys[k]; !contract && k != "" {
-				keys = append(keys, k)
-			}
+		enriched := b.enricher(ctx)
+		values := make(map[string]any, len(enriched))
+		for k, v := range enriched {
+			values[k] = v
 		}
-		sort.Strings(keys)
-		drops := dropRecorder{prefix: "subjects", records: &records}
-		kept := 0
-		for _, k := range keys {
-			if kept >= maxExtraKeys || len(k) > MaxActorStringBytes {
-				drops.drop(k, extra[k])
-				continue
-			}
-			out[k] = capValue("subjects."+k, extra[k], &records)
-			kept++
+		kept, enricherRecords := boundedExtra("subjects", contractSubjectKeys, enricherBudgetBytes, values)
+		for k, v := range kept {
+			out[k] = v.(string) // string in, string out
 		}
-		drops.flush()
+		records = append(records, enricherRecords...)
 	}
 	return out, records
 }
 
-// boundedExtra bounds a map of component keys written under prefix, such as
-// metadata.extra: reserved keys are dropped silently, at most maxExtraKeys
-// are kept in sorted order, and each value is capped at MaxActorStringBytes.
-func boundedExtra(prefix string, reserved map[string]struct{}, extra map[string]any) (map[string]any, []truncation) {
+// boundedExtra bounds a map of keys written under prefix, such as
+// metadata.extra. Reserved keys are dropped silently. Keys are then taken in
+// sorted order: a key longer than maxExtraKeyBytes, a value that cannot be
+// encoded, a key past the first maxExtraKeys, or a key whose bytes would take
+// the source past budget is dropped. Each kept value is capped at
+// MaxActorStringBytes.
+func boundedExtra(
+	prefix string, reserved map[string]struct{}, budget int, extra map[string]any,
+) (map[string]any, []truncation) {
 	var records []truncation
 	keys := make([]string, 0, len(extra))
 	for k := range extra {
@@ -484,31 +493,47 @@ func boundedExtra(prefix string, reserved map[string]struct{}, extra map[string]
 	sort.Strings(keys)
 	out := make(map[string]any, min(len(keys), maxExtraKeys))
 	drops := dropRecorder{prefix: prefix, records: &records}
+	used := 0
 	for _, k := range keys {
-		field := prefix + "." + k
 		v := extra[k]
 		enc, encodable := encodeExtraValue(v)
-		if len(out) >= maxExtraKeys || len(k) > MaxActorStringBytes || !encodable {
+		if len(out) >= maxExtraKeys || len(k) > maxExtraKeyBytes || !encodable {
 			drops.drop(k, enc)
 			continue
 		}
-		switch tv := v.(type) {
-		case nil, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
-			out[k] = v
-		case string:
-			out[k] = capValue(field, tv, &records)
-		default:
-			// A composite value is kept as is when its encoding fits, and is
-			// otherwise replaced by its cut encoding.
-			if len(enc) <= MaxActorStringBytes {
-				out[k] = v
-				continue
-			}
-			out[k] = capValue(field, enc, &records)
+		value, cost, cut := boundValue(v, enc)
+		if used+len(k)+cost > budget {
+			drops.drop(k, enc)
+			continue
+		}
+		used += len(k) + cost
+		out[k] = value
+		if cut {
+			records = append(records, newTruncation(prefix+"."+k, enc, false))
 		}
 	}
 	drops.flush()
 	return out, records
+}
+
+// boundValue returns v capped at MaxActorStringBytes, the bytes it takes,
+// and whether it was cut. enc is v's encoding from encodeExtraValue. A
+// composite value whose encoding fits is kept as is; one that does not is
+// replaced by its cut encoding.
+func boundValue(v any, enc string) (any, int, bool) {
+	switch tv := v.(type) {
+	case nil, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return v, len(enc), false
+	case string:
+		cut := capString(tv, MaxActorStringBytes)
+		return cut, len(cut), len(cut) < len(tv)
+	default:
+		if len(enc) <= MaxActorStringBytes {
+			return v, len(enc), false
+		}
+		cut := capString(enc, MaxActorStringBytes)
+		return cut, len(cut), true
+	}
 }
 
 // encodeExtraValue returns v itself when it is a string and its JSON

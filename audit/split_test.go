@@ -433,6 +433,23 @@ func TestNewEvent_OversizedNeverCutFieldsDoNotMultiplyEvents(t *testing.T) {
 		assert.NotContains(t, events[0].Metadata.Extra, MetadataExtraKeyTruncated)
 	})
 
+	t.Run("the fallback still cuts values over 4 KiB", func(t *testing.T) {
+		t.Parallel()
+		b, _ := newTestBuilder(t)
+		huge := strings.Repeat("v", 200000)
+		events, err := b.NewEvent(userCtx(), strings.Repeat("t", 13000), testTarget, OutcomeSuccess,
+			WithChanges(FieldChange("d", "x", huge)))
+		require.NoError(t, err)
+		require.Len(t, events, 1)
+		changes := events[0].Metadata.Extra[MetadataExtraKeyChanges].([]Change)
+		require.Len(t, changes, 1)
+		assert.LessOrEqual(t, encodedLen(changes[0].after), maxFieldValueBytes)
+		tr, ok := findTruncation(events[0], "changes.d.after")
+		require.True(t, ok)
+		assert.Equal(t, digest(huge), tr.SHA256)
+		assert.Less(t, len(render(t, events)[0]), 20000)
+	})
+
 	// Never-cut fields in the band just under the target: an empty
 	// continuation fits, but no continuation can hold an entry.
 	for _, size := range []int{15000, 15350, 15450, 15700} {
@@ -569,6 +586,60 @@ func TestCapEncoded(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			assert.Equal(t, tt.want, capEncoded(tt.in, tt.n))
+		})
+	}
+}
+
+func TestNewEvent_EverySourceAtItsCapFitsTheLimit(t *testing.T) {
+	t.Parallel()
+
+	long := strings.Repeat("v", 400)
+	keyed := func(n int) map[string]string {
+		m := make(map[string]string, n)
+		for i := 0; i < n; i++ {
+			m[fmt.Sprintf("%s%03d", strings.Repeat("k", maxExtraKeyBytes-3), i)] = long
+		}
+		return m
+	}
+	anyKeyed := func(n int) map[string]any {
+		m := make(map[string]any, n)
+		for k, v := range keyed(n) {
+			m[k] = v
+		}
+		return m
+	}
+	b, _ := newTestBuilder(t, WithSubjectEnricher(func(context.Context) map[string]string { return keyed(100) }))
+	actor := NewUserActor(long, long, WithDisplayName(long), WithClientID(long), WithClientInfo(long, long),
+		WithTokenFingerprint(long))
+	ctx := ContextWithRequestID(ContextWithActor(context.Background(), actor), "req-1")
+	target := Target{Type: testTargetType, ID: long, Name: long}
+
+	tests := []struct {
+		name    string
+		changes []Change
+	}{
+		{name: "membership list", changes: []Change{MembersChange("members", ids("m", 500, 36), nil)}},
+		{name: "one huge value", changes: []Change{FieldChange("d", "x", strings.Repeat("v", 200000))}},
+		{name: "many field changes", changes: func() []Change {
+			out := make([]Change, 100)
+			for i := range out {
+				out[i] = FieldChange(fmt.Sprintf("f%03d", i), long, long)
+			}
+			return out
+		}()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			events, err := b.NewEvent(ctx, testType, target, OutcomeSuccess,
+				WithSource(EventSource{Type: SourceTypeNetwork, Value: long, Extra: anyKeyed(100)}),
+				WithExtra(anyKeyed(100)),
+				WithPayload(json.RawMessage(`"`+strings.Repeat("p", 5000)+`"`)),
+				WithChanges(tt.changes...))
+			require.NoError(t, err)
+			for i, line := range render(t, events) {
+				assert.LessOrEqual(t, len(line), MaxLineBytes, "line %d of %d", i+1, len(events))
+			}
 		})
 	}
 }

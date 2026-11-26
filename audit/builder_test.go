@@ -340,7 +340,7 @@ func TestNewEvent_EnricherOutputBounded(t *testing.T) {
 			enriched:    map[string]string{longKey: "v", "ok": "v"},
 			wantKept:    []string{"ok"},
 			wantCount:   3 + 1,
-			wantDropped: []string{"subjects." + strings.Repeat("k", MaxActorStringBytes-len("subjects."))},
+			wantDropped: []string{"subjects." + strings.Repeat("k", maxExtraKeyBytes)},
 		},
 	}
 	for _, tt := range tests {

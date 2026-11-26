@@ -166,7 +166,7 @@ subjects keys, plus any optional field set with an [ActorOption]:
 A [SubjectEnricher], set with [WithSubjectEnricher], adds component keys to
 the subjects. It can never set an actor key: any it returns is dropped, so an
 enricher cannot give an anonymous event a user id. At most 16 enricher keys
-are kept, in sorted key order.
+are kept, in sorted key order; see Size Limit for the other bounds.
 
 The component generates a request id when a request arrives and stores it
 with [ContextWithRequestID]; the builder copies it to
@@ -225,8 +225,9 @@ when:
     ([ErrAnonymousOutcome], reason anonymous_invalid_outcome).
 
 Component keys passed with [WithExtra] go to metadata.extra. At most 16 are
-kept, in sorted key order, each value is capped at [MaxActorStringBytes], and
-a key the builder writes itself, such as "reason" or "request_id", is
+kept, in sorted key order and within a 2 KiB budget, each key is at most 64
+bytes, each value is capped at [MaxActorStringBytes], and a key the builder
+writes itself, such as "reason" or "request_id", is
 dropped, so a component cannot forge one.
 
 # Change Detail
@@ -252,7 +253,10 @@ packs to 16,000 bytes, which leaves headroom for the record time.
     no length limit. The target id, the source value, each source extra
     value, each change field name and each delegation hop's issuer and
     subject are capped the same way. At most 16 enricher, component and
-    source extra keys are kept.
+    source extra keys are kept, each at most 64 bytes long, and within a
+    byte budget per source (2 KiB for the enricher and the component keys,
+    512 bytes for the source extra), so these inputs at their caps still
+    leave room for list entries.
   - The change list, the member ids and the delegation chain are split, never
     cut, so an auditor can still find when a given member was added. When they
     do not fit, the first event is followed by continuation events. Each has
@@ -270,13 +274,16 @@ packs to 16,000 bytes, which leaves headroom for the record time.
   - The builder never cuts the audit id, the time, the type, the outcome, the
     reason, the request id, the actor (beyond its cap), the cause, the
     component or the target type. These are set by the component, not the
-    caller, and normally take a few hundred bytes. If they alone leave no
-    room, the builder cuts nothing that would not help and returns a single
-    event, best effort, rather than one oversized event per list entry.
+    caller, and normally take a few hundred bytes. If the fields every event
+    repeats leave no room for a list entry, which takes an oversized value
+    among these, the builder returns a single event, best effort, rather
+    than one oversized event per list entry. That event keeps every entry,
+    with each value over 4 KiB still cut, and cuts nothing that would not
+    help.
 
 Every cut or dropped value is listed in metadata.extra.truncated with its
 field name, original length and SHA-256 digest. A digest lets an auditor
-match a value they already hold; it does not recover the value. At most 16
+match a value they already hold; it does not recover the value. At most 4
 dropped keys of one source are listed individually; one summary record, whose
 field is the source, counts the rest and digests their sorted names.
 

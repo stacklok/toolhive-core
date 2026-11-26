@@ -122,10 +122,10 @@ func (b *EventBuilder) newPlan(
 	p.targetID = capValue("target.id", target.ID, &p.common)
 	p.source.Value = capValue("source.value", p.source.Value, &p.common)
 	var sourceRecords []truncation
-	p.source.Extra, sourceRecords = boundedExtra("source.extra", nil, p.source.Extra)
+	p.source.Extra, sourceRecords = boundedExtra("source.extra", nil, sourceExtraBudgetBytes, p.source.Extra)
 	p.common = append(p.common, sourceRecords...)
 	sortTruncations(p.common)
-	p.extra, p.first = boundedExtra("metadata.extra", reservedExtraKeys, in.extra)
+	p.extra, p.first = boundedExtra("metadata.extra", reservedExtraKeys, componentBudgetBytes, in.extra)
 	sortTruncations(p.first)
 
 	p.changeFields = make([]string, len(in.changes))
@@ -300,8 +300,13 @@ func (p *plan) build() []*AuditEvent {
 	case !ok:
 		// The fields every event repeats leave no room for some entry, so
 		// no split brings every line under the limit. Splitting would only
-		// repeat those fields once per entry: return one event, best effort.
-		return []*AuditEvent{single()}
+		// repeat those fields once per entry: return one event, best effort,
+		// with every entry kept and each value over 4 KiB cut.
+		cut := make([]item, len(p.items))
+		for i, it := range p.items {
+			cut[i] = p.cutItem(it)
+		}
+		return []*AuditEvent{p.event(firstID, p.cause, true, cut, 0, 0)}
 	case len(groups) == 1:
 		return []*AuditEvent{p.event(firstID, p.cause, true, groups[0], 0, 0)}
 	}
