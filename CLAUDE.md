@@ -68,7 +68,8 @@ task license-fix   # Add missing license headers
 
 | Package | Purpose |
 |---------|---------|
-| `audit` | Audit event envelope (`AuditEvent`, `LevelAudit`) and `HandlerMiddleware`, a `slog` handler middleware that routes audit records to stdout as JSON behind an enable gate and counts failed writes (Alpha) |
+| `audit` | Audit event envelope (`AuditEvent`, `LevelAudit`); `HandlerMiddleware`, a `slog` handler middleware that routes audit records to stdout as JSON behind an enable gate and counts failed writes; `Actor` in context and `EventBuilder`, which builds events with the actor from context, bounded change detail, and continuation events that keep each line under 16 KiB (Alpha) |
+| `audit/audittest` | Conformance checker that tests a component's audit output lines against the audit rules (Alpha) |
 | `cel` | Generic CEL expression compilation and evaluation (Alpha) |
 | `config` | Embeddable `BaseConfig` (service name, log level) + strict YAML loader; consumers embed and extend with their own fields (Alpha) |
 | `env` | Environment variable abstraction with `Reader` interface for testable code |

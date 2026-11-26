@@ -176,7 +176,14 @@ const LevelAudit = slog.Level(2)
 
 // LogTo logs the audit event to the provided slog.Logger using the custom audit level.
 func (e *AuditEvent) LogTo(ctx context.Context, logger *slog.Logger, level slog.Level) {
-	// Create slog attributes for the audit event
+	logger.LogAttrs(ctx, level, auditEventMessage, e.logAttrs()...)
+}
+
+// auditEventMessage is the log message of every audit record.
+const auditEventMessage = "audit_event"
+
+// logAttrs returns the slog attributes [AuditEvent.LogTo] logs for e.
+func (e *AuditEvent) logAttrs() []slog.Attr {
 	attrs := []slog.Attr{
 		slog.String("audit_id", e.Metadata.AuditID),
 		slog.String("type", e.Type),
@@ -217,8 +224,7 @@ func (e *AuditEvent) LogTo(ctx context.Context, logger *slog.Logger, level slog.
 		attrs = append(attrs, slog.Any("delegation", e.DelegationChain))
 	}
 
-	// Log with the specified level
-	logger.LogAttrs(ctx, level, "audit_event", attrs...)
+	return attrs
 }
 
 // Common event outcomes
