@@ -22,6 +22,7 @@ The ToolHive ecosystem spans multiple Go repositories, and several of these proj
 
 | Package | Stability | Description |
 |---------|-----------|-------------|
+| `audit` | Alpha | Audit event envelope and a `slog` handler middleware that routes audit records to stdout as JSON |
 | `cel` | Alpha | Generic CEL expression compilation and evaluation |
 | `env` | Stable | Environment variable abstraction with `Reader` interface |
 | `httperr` | Stable | Wrap errors with HTTP status codes |

@@ -77,6 +77,67 @@ Use [AuditEvent.LogTo] to emit the event to a [log/slog.Logger] at a
 specified level. This produces structured JSON output suitable for audit log
 collection.
 
+# Audit Handler Middleware
+
+A service that already has one operator logger does not need a second logger
+for audit events. [HandlerMiddleware] wraps the service's [log/slog.Handler]
+so that [LevelAudit] records go to a dedicated audit writer, while every other
+record goes to the wrapped handler unchanged. Register it with
+logging.WithHandlerMiddleware when building the logger, as the last
+middleware:
+
+	logger := logging.New(
+		logging.WithLevel(slog.LevelWarn),
+		logging.WithHandlerMiddleware(traceContextMiddleware),
+		logging.WithHandlerMiddleware(audit.HandlerMiddleware(
+			audit.WithEnabled(cfg.AuditEnabled),
+			audit.WithMeterProvider(meterProvider),
+		)), // must be last
+	)
+
+	event := audit.NewAuditEvent("widgets.widget.update", source,
+		audit.OutcomeSuccess, subjects, "example-service")
+	event.LogTo(ctx, logger, audit.LevelAudit)
+
+The middleware behaves as follows, and each rule has a reason:
+
+  - Audit records are written to [os.Stdout] by default (override with
+    [WithWriter]); operator records keep their own output, normally
+    stderr. Keeping audit events on their own stream lets a log collector
+    ship them without parsing operator output.
+  - Each audit record is one JSON line, whatever format the operator logger
+    uses. The level is rendered as "AUDIT" rather than slog's "INFO+2", and
+    every line carries logger=audit, so a collector selects audit events from
+    every service with a single rule. Only the middleware stamps logger=audit;
+    lines written through [NewAuditLogger] do not carry it.
+  - Audit records ignore the operator log level. A service running at warn or
+    error still writes its audit events.
+  - [WithEnabled] is the only gate. When it is false, Enabled reports
+    [LevelAudit] as disabled, so slog neither constructs nor dispatches the
+    record, and any audit record that reaches the handler is dropped.
+  - Attributes and groups added with [log/slog.Logger.With] and
+    [log/slog.Logger.WithGroup] apply to operator records only. An audit
+    line contains only the fields of its event, plus time, level, msg and
+    logger=audit, all at the top level, so
+    request-scoped logger context cannot leak into or reshape the audit
+    record.
+  - The middleware must be registered last, making it the outermost handler.
+    It handles audit records itself and never passes them to the handler it
+    wraps, so no middleware registered before it can see, change or drop an
+    audit record. A middleware registered after it would see audit records,
+    and the library cannot prevent that.
+  - The write is synchronous, and each record is written with one Write call
+    under a lock shared by every handler built from one [HandlerMiddleware]
+    result, so concurrent records never interleave. Applying two separate
+    HandlerMiddleware results to one writer gives two locks; build the
+    middleware once per writer. A failed or short
+    write never returns an error to the caller and is never logged, so a
+    broken audit stream neither fails the action being audited nor floods
+    the operator output. Instead each failed record increments the
+    [WriteFailuresMetricName] counter (no attributes) on the meter provider set
+    with [WithMeterProvider], or the global provider by default. After a
+    short write, the next record starts on a new line so it still parses.
+
 # Well-Known Constants
 
 The package defines well-known constants for event types, outcomes, source
