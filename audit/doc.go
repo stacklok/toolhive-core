@@ -138,6 +138,161 @@ The middleware behaves as follows, and each rule has a reason:
     with [WithMeterProvider], or the global provider by default. After a
     short write, the next record starts on a new line so it still parses.
 
+# Actor From Context
+
+Call sites do not pass the actor. The authentication middleware that verifies
+a caller stores one [Actor] in the request context with [ContextWithActor],
+and the [EventBuilder] writes every actor key of the event's subjects from it.
+This removes the class of defect where a call site forgets the actor or names
+it differently, and gives one place to change how actors are identified.
+
+Each principal kind has its own constructor, and each writes a fixed set of
+subjects keys, plus any optional field set with an [ActorOption]:
+
+  - [NewUserActor]: principal_kind, user_id, issuer. The user id is the stable
+    id the issuer assigns, never a mutable attribute such as an email, so the
+    trail survives a rename.
+  - [NewServiceAccountActor]: principal_kind, user_id.
+  - [NewSCIMIssuerActor]: principal_kind, user_id and issuer (both the issuer
+    id), token_fingerprint. The fingerprint is keyed, because a static token
+    can be weak and an unkeyed hash kept for years can be guessed offline.
+  - [NewSystemActor]: principal_kind, user_id (the fixed name of the
+    runnable). Only work that no caller started, such as a boot-time job,
+    builds one.
+  - [NewAnonymousActor]: principal_kind and never user_id. Only an
+    authentication refusal builds one, so its outcome is denied, or error when
+    the service failed before it could verify the caller.
+
+A [SubjectEnricher], set with [WithSubjectEnricher], adds component keys to
+the subjects. It can never set an actor key: any it returns is dropped, so an
+enricher cannot give an anonymous event a user id. At most 16 enricher keys
+are kept, in sorted key order; see Size Limit for the other bounds.
+
+The component generates a request id when a request arrives and stores it
+with [ContextWithRequestID]; the builder copies it to
+metadata.extra.request_id, which joins the event to the access logs. It never
+reuses an id the client sent, because a client can choose it.
+
+# Event Builder
+
+[EventBuilder.NewEvent] takes the context, the type, the [Target], the
+outcome and optional inputs, and returns the events to log:
+
+	builder := audit.NewEventBuilder("example-service",
+		audit.WithBuilderMeterProvider(meterProvider))
+
+	// In the authentication middleware:
+	ctx = audit.ContextWithActor(ctx, audit.NewUserActor(userID, issuer))
+	ctx = audit.ContextWithRequestID(ctx, requestID)
+
+	// At the call site:
+	events, err := builder.NewEvent(ctx, "widgets.widget.update",
+		audit.Target{Type: "widget", ID: widget.ID, Name: widget.Name},
+		audit.OutcomeSuccess,
+		audit.WithChanges(
+			audit.FieldChange("color", "blue", "red"),
+			audit.SecretFieldChange("api_key"),
+			audit.MembersChange("owners", added, removed),
+		),
+	)
+	if err != nil {
+		return err // a defect in the call site; see below
+	}
+	for _, event := range events {
+		event.LogTo(ctx, logger, audit.LevelAudit)
+	}
+
+Every event it builds has metadata.extra.schema_version equal to
+[SchemaVersion], a new audit id and a UTC loggedAt. The default source is
+[SourceTypeLocal] with the host name, which in a Kubernetes pod is the pod
+name; override it with [WithSourceName] or, per event, [WithSource].
+
+NewEvent refuses to build an event, returns an error and no event, and
+increments the [EventErrorsMetricName] counter with a "reason" attribute,
+when:
+
+  - the context has no actor, or a non-anonymous actor with no user id
+    ([ErrNoActor], reason no_actor). Every audited request needs a known
+    actor;
+  - the outcome is not success, failure, error or denied
+    ([ErrInvalidOutcome], reason invalid_outcome). The set is closed so a
+    SIEM rule can enumerate it;
+  - the reason set with [WithReason] is not a lower snake case token of at
+    most 64 bytes ([ErrInvalidReason], reason invalid_reason). A reason is a
+    bounded token such as "not_found", never free text, an error message or
+    a value the caller controls;
+  - an anonymous actor has an outcome other than denied or error
+    ([ErrAnonymousOutcome], reason anonymous_invalid_outcome).
+
+Component keys passed with [WithExtra] go to metadata.extra. At most 16 are
+kept, in sorted key order and within a 2 KiB budget, each key is at most 64
+bytes, each value is capped at [MaxActorStringBytes], and a key the builder
+writes itself, such as "reason" or "request_id", is
+dropped, so a component cannot forge one.
+
+# Change Detail
+
+[WithChanges] records what a write changed in metadata.extra.changes.
+[FieldChange] records a field's value before and after the write, so the trail
+shows every value a field has held. [MembersChange] records the ids of the
+members added and removed. [SecretFieldChange] records a secret-bearing field
+by name only: it has no slot for a value, so a call site cannot put a secret
+in the trail by mistake. [WithCause] links an event to the event that caused
+it, such as the deletion that cascaded to it.
+
+# Size Limit
+
+Container runtimes split a stdout line longer than 16 KiB into partial
+records, and a collector that does not join them breaks the event. The
+builder therefore keeps each line, measured with the audit handler
+middleware's own renderer and newline included, within [MaxLineBytes]. It
+packs to 16,000 bytes, which leaves headroom for the record time.
+
+  - Each actor string, enricher value and component value is capped at
+    [MaxActorStringBytes], because actor strings come from token claims with
+    no length limit. The target id, the source value, each source extra
+    value, each change field name and each delegation hop's issuer and
+    subject are capped the same way. At most 16 enricher, component and
+    source extra keys are kept, each at most 64 bytes long, and within a
+    byte budget per source (2 KiB for the enricher and the component keys,
+    512 bytes for the source extra), so these inputs at their caps still
+    leave room for list entries.
+  - The change list, the member ids and the delegation chain are split, never
+    cut, so an auditor can still find when a given member was added. When they
+    do not fit, the first event is followed by continuation events. Each has
+    its own audit id, sets metadata.extra.cause to the first event's audit id,
+    and repeats the type, outcome, reason, request id, actor and the target's
+    type and id. Every event of the set carries metadata.extra.part and
+    metadata.extra.parts, and each list entry appears in exactly one of them.
+    The first event keeps the caller's cause, the component keys, the payload
+    and the target name.
+  - Any other overflow is cut, in order: the payload set with [WithPayload],
+    which becomes a JSON string of its leading bytes; then the target name;
+    then each change value or member id whose encoding is over 4 KiB, cut to
+    4 KiB, when its entry does not fit in an event on its own. Sizes are
+    measured in encoded bytes, so characters JSON escapes count in full.
+  - The builder never cuts the audit id, the time, the type, the outcome, the
+    reason, the request id, the actor (beyond its cap), the cause, the
+    component or the target type. These are set by the component, not the
+    caller, and normally take a few hundred bytes. If the fields every event
+    repeats leave no room for a list entry, which takes an oversized value
+    among these, the builder returns a single event, best effort, rather
+    than one oversized event per list entry. That event keeps every entry,
+    with each value over 4 KiB still cut, and cuts nothing that would not
+    help.
+
+Every cut or dropped value is listed in metadata.extra.truncated with its
+field name, original length and SHA-256 digest. A digest lets an auditor
+match a value they already hold; it does not recover the value. At most 4
+dropped keys of one source are listed individually; one summary record, whose
+field is the source, counts the rest and digests their sorted names.
+
+# Conformance Helper
+
+The audittest subpackage checks a component's audit output against these
+rules. Each component runs it in its unit tests against every event type it
+declares; see that package for the checks.
+
 # Well-Known Constants
 
 The package defines well-known constants for event types, outcomes, source
