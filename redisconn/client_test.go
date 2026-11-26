@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"os"
@@ -39,6 +40,7 @@ func TestConfigValidate(t *testing.T) {
 		{"nil", nil, "config is nil"},
 		{"negative pool size", &Config{Addr: testAddr, PoolSize: -1}, "pool size must not be negative"},
 		{"negative max active connections", &Config{Addr: testAddr, MaxActiveConns: -1}, "max active connections must not be negative"},
+		{"negative connect retry timeout", &Config{Addr: testAddr, ConnectRetryTimeout: -1}, "connect retry timeout must not be negative"},
 		{"missing topology", &Config{}, "one of addr"},
 		{"conflicting topology", &Config{Addr: testAddr, SentinelConfig: &SentinelConfig{}}, "mutually exclusive"},
 		{"sentinel master", &Config{SentinelConfig: &SentinelConfig{SentinelAddrs: []string{"s:26379"}}}, "master name"},
@@ -250,6 +252,99 @@ func TestNewClientPingFailure(t *testing.T) {
 	if err == nil || !contains(err.Error(), "failed to connect") {
 		t.Fatalf("NewClient() error = %v", err)
 	}
+}
+
+func TestNewClientConnectRetry(t *testing.T) {
+	t.Parallel()
+	const errConnRefused = "connection refused"
+	// startAfter < 0 means Redis never starts; 0 means it is up before the call.
+	// The first late start is past go-redis's own ~400ms of dial retries, so
+	// only pingWithRetry's loop can reach it.
+	tests := []struct {
+		name         string
+		retryTimeout time.Duration
+		startAfter   time.Duration
+		requireAuth  string
+		deadline     time.Duration
+		wantErr      string
+		wantCtxErr   bool
+		minElapsed   time.Duration
+		maxElapsed   time.Duration
+	}{
+		{name: "connects once redis starts", retryTimeout: 5 * time.Second, startAfter: 1500 * time.Millisecond, minElapsed: 1500 * time.Millisecond, maxElapsed: 4 * time.Second},
+		{name: "gives up after retry timeout", retryTimeout: 500 * time.Millisecond, startAfter: -1, wantErr: errConnRefused, minElapsed: 500 * time.Millisecond, maxElapsed: 2 * time.Second},
+		{name: "stops at caller deadline", retryTimeout: time.Minute, startAfter: -1, deadline: time.Second, wantErr: errConnRefused, wantCtxErr: true, minElapsed: time.Second, maxElapsed: 3 * time.Second},
+		{name: "does not retry auth errors", retryTimeout: 5 * time.Second, requireAuth: "secret", wantErr: "WRONGPASS", maxElapsed: time.Second},
+		{name: "zero timeout tries once", startAfter: -1, wantErr: errConnRefused, maxElapsed: time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			addr := reserveAddr(t)
+			if tt.startAfter >= 0 {
+				srv := miniredis.NewMiniRedis()
+				t.Cleanup(srv.Close)
+				if tt.requireAuth != "" {
+					srv.RequireAuth(tt.requireAuth)
+				}
+				start := func() {
+					if err := srv.StartAddr(addr); err != nil {
+						t.Errorf("StartAddr() error = %v", err)
+					}
+				}
+				if tt.startAfter == 0 {
+					start()
+				} else {
+					timer := time.AfterFunc(tt.startAfter, start)
+					t.Cleanup(func() { timer.Stop() })
+				}
+			}
+			ctx := t.Context()
+			if tt.deadline > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, tt.deadline)
+				t.Cleanup(cancel)
+			}
+
+			cfg := &Config{Addr: addr, DialTimeout: 50 * time.Millisecond, ConnectRetryTimeout: tt.retryTimeout}
+			if tt.requireAuth != "" {
+				cfg.Password = "wrong"
+			}
+			start := time.Now()
+			client, err := NewClient(ctx, cfg)
+			elapsed := time.Since(start)
+
+			if tt.wantErr != "" {
+				if err == nil || !contains(err.Error(), "failed to connect") || !contains(err.Error(), tt.wantErr) {
+					t.Fatalf("NewClient() error = %v, want containing %q", err, tt.wantErr)
+				}
+				if got := errors.Is(err, context.DeadlineExceeded); got != tt.wantCtxErr {
+					t.Fatalf("errors.Is(err, context.DeadlineExceeded) = %v, want %v (error %v)", got, tt.wantCtxErr, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("NewClient() error = %v", err)
+				}
+				t.Cleanup(func() { _ = client.Close() })
+			}
+			if elapsed < tt.minElapsed || elapsed > tt.maxElapsed {
+				t.Fatalf("NewClient() took %v, want between %v and %v", elapsed, tt.minElapsed, tt.maxElapsed)
+			}
+		})
+	}
+}
+
+func reserveAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return addr
 }
 
 func TestBuildTLSConfig(t *testing.T) {

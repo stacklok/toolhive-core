@@ -67,6 +67,9 @@ type Config struct {
 	SentinelTLS *TLSConfig
 	// ConnMaxLifetime overrides DynamicAuth.ConnMaxLifetime when non-zero.
 	ConnMaxLifetime time.Duration
+	// ConnectRetryTimeout bounds how long NewClient retries a failed initial
+	// PING with backoff. Zero keeps a single attempt.
+	ConnectRetryTimeout time.Duration
 }
 
 // SentinelConfig identifies a Sentinel-managed Redis master.
@@ -105,6 +108,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxActiveConns < 0 {
 		return errors.New("max active connections must not be negative")
+	}
+	if c.ConnectRetryTimeout < 0 {
+		return errors.New("connect retry timeout must not be negative")
 	}
 	if c.ClusterMode && c.SentinelConfig != nil {
 		return errors.New("cluster mode cannot be used with sentinel configuration")
