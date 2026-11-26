@@ -593,7 +593,21 @@ func TestCapEncoded(t *testing.T) {
 func TestNewEvent_EverySourceAtItsCapFitsTheLimit(t *testing.T) {
 	t.Parallel()
 
-	long := strings.Repeat("v", 400)
+	for _, char := range []string{"v", "\x01", "\xff", "<"} {
+		t.Run(fmt.Sprintf("%q", char), func(t *testing.T) {
+			t.Parallel()
+			everySourceAtItsCap(t, char)
+		})
+	}
+}
+
+// everySourceAtItsCap fills the enricher, source extra and component extra
+// to their caps with values made of char, which may expand when JSON escapes
+// it, and checks every line stays within MaxLineBytes.
+func everySourceAtItsCap(t *testing.T, char string) {
+	t.Helper()
+	long := strings.Repeat(char, 400)
+	actorString := strings.Repeat("a", 400)
 	keyed := func(n int) map[string]string {
 		m := make(map[string]string, n)
 		for i := 0; i < n; i++ {
@@ -609,10 +623,10 @@ func TestNewEvent_EverySourceAtItsCapFitsTheLimit(t *testing.T) {
 		return m
 	}
 	b, _ := newTestBuilder(t, WithSubjectEnricher(func(context.Context) map[string]string { return keyed(100) }))
-	actor := NewUserActor(long, long, WithDisplayName(long), WithClientID(long), WithClientInfo(long, long),
-		WithTokenFingerprint(long))
+	actor := NewUserActor(actorString, actorString, WithDisplayName(actorString), WithClientID(actorString),
+		WithClientInfo(actorString, actorString), WithTokenFingerprint(actorString))
 	ctx := ContextWithRequestID(ContextWithActor(context.Background(), actor), "req-1")
-	target := Target{Type: testTargetType, ID: long, Name: long}
+	target := Target{Type: testTargetType, ID: actorString, Name: long}
 
 	tests := []struct {
 		name    string

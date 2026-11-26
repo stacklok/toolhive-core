@@ -502,11 +502,12 @@ func boundedExtra(
 			continue
 		}
 		value, cost, cut := boundValue(v, enc)
-		if used+len(k)+cost > budget {
+		cost += encodedLen(k)
+		if used+cost > budget {
 			drops.drop(k, enc)
 			continue
 		}
-		used += len(k) + cost
+		used += cost
 		out[k] = value
 		if cut {
 			records = append(records, newTruncation(prefix+"."+k, enc, false))
@@ -516,8 +517,8 @@ func boundedExtra(
 	return out, records
 }
 
-// boundValue returns v capped at MaxActorStringBytes, the bytes it takes,
-// and whether it was cut. enc is v's encoding from encodeExtraValue. A
+// boundValue returns v capped at MaxActorStringBytes, the bytes it takes
+// once encoded (JSON escapes counted in full), and whether it was cut. enc is v's encoding from encodeExtraValue. A
 // composite value whose encoding fits is kept as is; one that does not is
 // replaced by its cut encoding.
 func boundValue(v any, enc string) (any, int, bool) {
@@ -526,13 +527,13 @@ func boundValue(v any, enc string) (any, int, bool) {
 		return v, len(enc), false
 	case string:
 		cut := capString(tv, MaxActorStringBytes)
-		return cut, len(cut), len(cut) < len(tv)
+		return cut, encodedLen(cut), len(cut) < len(tv)
 	default:
 		if len(enc) <= MaxActorStringBytes {
 			return v, len(enc), false
 		}
 		cut := capString(enc, MaxActorStringBytes)
-		return cut, len(cut), true
+		return cut, encodedLen(cut), true
 	}
 }
 
