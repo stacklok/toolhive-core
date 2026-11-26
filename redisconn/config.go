@@ -65,6 +65,13 @@ type Config struct {
 	// Sentinel discovery connections.
 	TLS         *TLSConfig
 	SentinelTLS *TLSConfig
+	// SentinelUsername and SentinelPassword are static credentials for
+	// Sentinel discovery connections. They are independent of Username,
+	// Password, and DynamicAuth, which apply only to data-node connections,
+	// and require SentinelConfig. SentinelPassword alone authenticates as the
+	// default user; SentinelUsername requires SentinelPassword.
+	SentinelUsername string
+	SentinelPassword string //nolint:gosec // field name, not a hardcoded credential
 	// ConnMaxLifetime overrides DynamicAuth.ConnMaxLifetime when non-zero.
 	ConnMaxLifetime time.Duration
 }
@@ -95,7 +102,8 @@ type TLSConfig struct {
 	ClientKey  []byte
 }
 
-// Validate checks connection topology, TLS, and dynamic-auth safety.
+// Validate checks connection topology, TLS, Sentinel credentials, and
+// dynamic-auth safety.
 func (c *Config) Validate() error {
 	if c == nil {
 		return errors.New("config is nil")
@@ -132,7 +140,31 @@ func (c *Config) Validate() error {
 	if err := validateTLSConfig(c.SentinelTLS); err != nil {
 		return fmt.Errorf("sentinel TLS config: %w", err)
 	}
+	return validateCredentials(c)
+}
+
+func validateCredentials(c *Config) error {
+	if err := validateSentinelAuth(c); err != nil {
+		return err
+	}
 	return validateDynamicAuth(c)
+}
+
+// validateSentinelAuth rejects Sentinel credentials that go-redis would
+// silently ignore: credentials without Sentinel mode, and a username without a
+// password, for which go-redis skips AUTH unless SentinelAuthEmptyPassword is
+// set (redisconn does not expose it).
+func validateSentinelAuth(c *Config) error {
+	if c.SentinelUsername == "" && c.SentinelPassword == "" {
+		return nil
+	}
+	if c.SentinelConfig == nil {
+		return errors.New("sentinel credentials require sentinel configuration")
+	}
+	if c.SentinelPassword == "" {
+		return errors.New("sentinel username requires a sentinel password")
+	}
+	return nil
 }
 
 func validateDynamicAuth(c *Config) error {
