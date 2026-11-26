@@ -283,6 +283,13 @@ func (p *plan) build() []*AuditEvent {
 	if e := single(); len(p.items) == 0 || lineSize(e) <= targetLineBytes {
 		return []*AuditEvent{e}
 	}
+	// When fields the builder never cuts already overflow an empty
+	// continuation, splitting cannot bring any line under the limit and would
+	// only repeat the oversized fields once per list entry. Return the single
+	// event, best effort.
+	if lineSize(p.event(firstID, firstID, false, nil, partPlaceholder, partPlaceholder)) > targetLineBytes {
+		return []*AuditEvent{single()}
+	}
 
 	groups := p.pack(firstID)
 	if len(groups) == 1 {

@@ -402,3 +402,30 @@ func TestCapString(t *testing.T) {
 		})
 	}
 }
+
+func TestNewEvent_OversizedNeverCutFieldsDoNotMultiplyEvents(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		source EventSource
+	}{
+		{name: "oversized source value", source: EventSource{Type: SourceTypeLocal, Value: strings.Repeat("s", 17000)}},
+		{name: "oversized source extra", source: EventSource{Type: SourceTypeLocal, Extra: map[string]any{
+			"x": strings.Repeat("s", 17000),
+		}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			b, _ := newTestBuilder(t)
+			events, err := b.NewEvent(userCtx(), testType, testTarget, OutcomeSuccess,
+				WithSource(tt.source),
+				WithChanges(MembersChange("members", ids("m", 200, 36), nil)))
+			require.NoError(t, err)
+			require.Len(t, events, 1, "splitting cannot help, so one best-effort event is returned")
+			got := collectEntries(t, render(t, events))
+			assert.Len(t, got.added, 200, "no list entry is lost")
+		})
+	}
+}
