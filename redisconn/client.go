@@ -17,8 +17,14 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
+const (
+	initialConnectRetryDelay = 100 * time.Millisecond
+	maxConnectRetryDelay     = 2 * time.Second
+)
+
 // NewClient constructs and verifies a Redis client. The caller's configuration
-// is not mutated. A client that fails its initial PING is closed.
+// is not mutated. A client that fails its initial PING, after retrying for up
+// to ConnectRetryTimeout, is closed.
 func NewClient(ctx context.Context, cfg *Config) (goredis.UniversalClient, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("redis: config is nil")
@@ -32,11 +38,56 @@ func NewClient(ctx context.Context, cfg *Config) (goredis.UniversalClient, error
 	if err != nil {
 		return nil, err
 	}
-	if err := client.Ping(ctx).Err(); err != nil {
+	if err := pingWithRetry(ctx, client, local.ConnectRetryTimeout); err != nil {
 		_ = client.Close()
 		return nil, fmt.Errorf("redis: failed to connect: %w", err)
 	}
 	return client, nil
+}
+
+// pingWithRetry bounds every attempt, including the first, by timeout, and stops
+// early on errors a retry cannot fix. When its own deadline expires it returns
+// the last PING error rather than the deadline error, so callers see why Redis
+// was unreachable; when the caller's context ends, that error is joined in.
+func pingWithRetry(parent context.Context, client goredis.UniversalClient, timeout time.Duration) error {
+	if timeout <= 0 {
+		return client.Ping(parent).Err()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	err := client.Ping(ctx).Err()
+	delay := initialConnectRetryDelay
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	for {
+		if err == nil || isPermanentConnectError(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return retryStopError(parent, err)
+		case <-timer.C:
+		}
+		pingErr := client.Ping(ctx).Err()
+		if pingErr != nil && ctx.Err() != nil {
+			return retryStopError(parent, err)
+		}
+		err = pingErr
+		delay = min(delay*2, maxConnectRetryDelay)
+		timer.Reset(delay)
+	}
+}
+
+func isPermanentConnectError(err error) bool {
+	var certErr *tls.CertificateVerificationError
+	return goredis.IsAuthError(err) || goredis.IsPermissionError(err) || errors.As(err, &certErr)
+}
+
+func retryStopError(parent context.Context, lastErr error) error {
+	if parent.Err() != nil {
+		return errors.Join(parent.Err(), lastErr)
+	}
+	return lastErr
 }
 
 // BuildTLSConfig builds a TLS 1.2-or-newer configuration. A nil input means
