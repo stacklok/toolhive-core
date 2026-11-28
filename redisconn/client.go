@@ -142,7 +142,8 @@ func buildClusterClient(cfg *Config) (goredis.UniversalClient, error) {
 
 // FailoverOptions intentionally applies dynamic credentials only to data-node
 // connections. go-redis does not copy CredentialsProviderContext into its
-// internal Sentinel options, unlike OnConnect.
+// internal Sentinel options, unlike OnConnect. Sentinel connections use only
+// the static SentinelUsername and SentinelPassword.
 func buildSentinelClient(cfg *Config) (goredis.UniversalClient, error) {
 	opts, err := buildSentinelOptions(cfg)
 	if err != nil {
@@ -155,6 +156,7 @@ func buildSentinelOptions(cfg *Config) (*goredis.FailoverOptions, error) {
 	provider, lifetime := dynamicAuthOptions(cfg)
 	opts := &goredis.FailoverOptions{
 		MasterName: cfg.SentinelConfig.MasterName, SentinelAddrs: cfg.SentinelConfig.SentinelAddrs,
+		SentinelUsername: cfg.SentinelUsername, SentinelPassword: cfg.SentinelPassword,
 		Username: cfg.Username, Password: cfg.Password, DB: cfg.DB,
 		DialTimeout: cfg.DialTimeout, ReadTimeout: cfg.ReadTimeout, WriteTimeout: cfg.WriteTimeout,
 		PoolSize: cfg.PoolSize, MaxActiveConns: cfg.MaxActiveConns,

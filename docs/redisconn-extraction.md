@@ -29,6 +29,13 @@ retired when it is reused; it is not proactive token refresh or active
 reauthentication. In Sentinel mode the callback applies only to Redis data-node
 connections and is never installed on Sentinel discovery connections.
 
+Sentinel discovery connections authenticate only with the static
+`SentinelUsername` and `SentinelPassword`, independent of the data-node
+credentials. Validation rejects them outside Sentinel mode and rejects a
+Sentinel username without a password, because go-redis would otherwise connect
+to the Sentinels without authenticating (`redisconn` does not expose go-redis'
+`SentinelAuthEmptyPassword`).
+
 The **module dependency graph** of `redisconn` excludes every cloud SDK,
 metadata client, Kubernetes module, and ToolHive application package. This is a
 stronger and more useful source dependency budget than merely avoiding cloud

@@ -17,7 +17,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,7 +28,17 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
-const testAddr = "redis:6379"
+const (
+	testAddr         = "redis:6379"
+	testDataUser     = "data-user"
+	testDataPass     = "data-pass"
+	testSentinelUser = "sentinel-user"
+	testSentinelPass = "sentinel-pass"
+)
+
+func testSentinelConfig() *SentinelConfig {
+	return &SentinelConfig{MasterName: "main", SentinelAddrs: []string{"s:26379"}}
+}
 
 func TestConfigValidate(t *testing.T) {
 	t.Parallel()
@@ -50,6 +62,10 @@ func TestConfigValidate(t *testing.T) {
 		{"dynamic unverified TLS", &Config{Addr: testAddr, TLS: &TLSConfig{InsecureSkipVerify: true}, DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider}}, "TLS must verify"},
 		{"dynamic verified TLS", &Config{Addr: testAddr, TLS: &TLSConfig{}, DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider}}, ""},
 		{"dynamic insecure opt-out", &Config{Addr: testAddr, DynamicAuth: &DynamicAuth{CredentialsProviderContext: provider, AllowInsecureTransport: true}}, ""},
+		{"sentinel credentials without sentinel", &Config{Addr: testAddr, SentinelPassword: testSentinelPass}, "require sentinel configuration"},
+		{"sentinel username without password", &Config{SentinelConfig: testSentinelConfig(), SentinelUsername: testSentinelUser}, "requires a sentinel password"},
+		{"sentinel password only", &Config{SentinelConfig: testSentinelConfig(), SentinelPassword: testSentinelPass}, ""},
+		{"sentinel username and password", &Config{SentinelConfig: testSentinelConfig(), SentinelUsername: testSentinelUser, SentinelPassword: testSentinelPass}, ""},
 		{"standalone", &Config{Addr: testAddr}, ""},
 		{"cluster", &Config{Addr: testAddr, ClusterMode: true}, ""},
 		{"pool size larger than max active connections", &Config{Addr: testAddr, PoolSize: 8, MaxActiveConns: 4}, ""},
@@ -359,6 +375,205 @@ func TestSentinelDynamicProviderStaysOnDataNodeOptions(t *testing.T) {
 	if opts.OnConnect != nil {
 		t.Fatal("OnConnect would propagate to Sentinel connections")
 	}
+}
+
+func TestBuildSentinelOptionsSeparatesCredentials(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{
+		SentinelConfig:   testSentinelConfig(),
+		Username:         testDataUser,
+		Password:         testDataPass,
+		SentinelUsername: testSentinelUser,
+		SentinelPassword: testSentinelPass,
+	}
+	cfg.applyDefaults()
+	opts, err := buildSentinelOptions(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.Username != testDataUser || opts.Password != testDataPass {
+		t.Fatalf("data-node credentials = (%q, %q)", opts.Username, opts.Password)
+	}
+	if opts.SentinelUsername != testSentinelUser || opts.SentinelPassword != testSentinelPass {
+		t.Fatalf("sentinel credentials = (%q, %q)", opts.SentinelUsername, opts.SentinelPassword)
+	}
+}
+
+func TestNewClientSentinelAuth(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name             string
+		sentinelUsername string
+		sentinelPassword string
+		wantAuth         string // credentials the Sentinel must receive
+		wantErr          string // empty for success
+	}{
+		{"username and password", testSentinelUser, testSentinelPass, testSentinelUser + ":" + testSentinelPass, ""},
+		{"password only", "", testSentinelPass, ":" + testSentinelPass, ""},
+		{"wrong password", testSentinelUser, "wrong-pass", testSentinelUser + ":wrong-pass", "WRONGPASS"},
+		{"no credentials", "", "", "", "NOAUTH"},
+	}
+	for _, handshake := range []struct {
+		name  string
+		hello bool
+	}{{"HELLO", true}, {"AUTH fallback", false}} {
+		for _, tt := range tests {
+			t.Run(handshake.name+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+				master := miniredis.RunT(t)
+				master.RequireUserAuth(testDataUser, testDataPass)
+				sentinel := startFakeSentinel(t, master.Addr(), testSentinelPass, handshake.hello)
+
+				client, err := NewClient(t.Context(), &Config{
+					SentinelConfig:   &SentinelConfig{MasterName: "main", SentinelAddrs: []string{sentinel.addr}},
+					Username:         testDataUser,
+					Password:         testDataPass,
+					SentinelUsername: tt.sentinelUsername,
+					SentinelPassword: tt.sentinelPassword,
+				})
+				if tt.wantErr != "" {
+					if err == nil {
+						_ = client.Close()
+						t.Fatal("NewClient() succeeded, want error")
+					}
+					if !contains(err.Error(), tt.wantErr) {
+						t.Fatalf("NewClient() error = %v, want containing %q", err, tt.wantErr)
+					}
+				} else {
+					if err != nil {
+						t.Fatalf("NewClient() error = %v", err)
+					}
+					t.Cleanup(func() { _ = client.Close() })
+					if err := client.Set(t.Context(), "key", "value", 0).Err(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				auth := sentinel.auth()
+				if tt.wantAuth == "" {
+					if len(auth) != 0 {
+						t.Fatalf("sentinel received credentials %q, want none", auth)
+					}
+					return
+				}
+				want := tt.wantAuth
+				if handshake.hello && strings.HasPrefix(want, ":") {
+					want = "default" + want // HELLO always names a user
+				}
+				if len(auth) == 0 || !allEqual(auth, want) {
+					t.Fatalf("sentinel received credentials %q, want only %q", auth, want)
+				}
+			})
+		}
+	}
+}
+
+// fakeSentinel answers the Sentinel commands go-redis needs to find a master.
+// It authenticates with HELLO (or, when HELLO is rejected, with AUTH, which is
+// the go-redis fallback) and records every credential pair it receives as
+// "username:password". Other commands need an authenticated peer.
+type fakeSentinel struct {
+	addr     string
+	mu       sync.Mutex
+	authSeen []string
+}
+
+func (f *fakeSentinel) auth() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.authSeen)
+}
+
+// check records the credentials and reports whether they are accepted.
+func (f *fakeSentinel) check(user, pass, password string) bool {
+	f.mu.Lock()
+	f.authSeen = append(f.authSeen, user+":"+pass)
+	f.mu.Unlock()
+	return pass == password
+}
+
+func startFakeSentinel(t *testing.T, masterAddr, password string, acceptHello bool) *fakeSentinel {
+	t.Helper()
+	srv, err := miniredisserver.NewServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Close)
+	f := &fakeSentinel{addr: srv.Addr().String()}
+	host, port, err := net.SplitHostPort(masterAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wrongPass = "WRONGPASS invalid username-password pair or user is disabled."
+	srv.SetPreHook(func(peer *miniredisserver.Peer, command string, _ ...string) bool {
+		switch strings.ToLower(command) {
+		case "hello":
+			if !acceptHello {
+				peer.WriteError("ERR unknown command 'hello'")
+				return true
+			}
+			return false
+		case "auth":
+			return false
+		}
+		if authed, _ := peer.Ctx.(bool); !authed {
+			peer.WriteError("NOAUTH Authentication required.")
+			return true
+		}
+		return false
+	})
+	mustRegister := func(cmd string, fn miniredisserver.Cmd) {
+		if err := srv.Register(cmd, fn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// HELLO <protover> [AUTH <username> <password>] [SETNAME <name>]
+	mustRegister("HELLO", func(peer *miniredisserver.Peer, _ string, args []string) {
+		for i := 1; i+2 < len(args); i++ {
+			if strings.EqualFold(args[i], "auth") {
+				if !f.check(args[i+1], args[i+2], password) {
+					peer.WriteError(wrongPass)
+					return
+				}
+				peer.Ctx = true
+				break
+			}
+		}
+		peer.Resp3 = true
+		peer.WriteMapLen(1)
+		peer.WriteBulk("proto")
+		peer.WriteInt(3)
+	})
+	mustRegister("AUTH", func(peer *miniredisserver.Peer, _ string, args []string) {
+		user, pass := "", args[len(args)-1]
+		if len(args) == 2 {
+			user = args[0]
+		}
+		if !f.check(user, pass, password) {
+			peer.WriteError(wrongPass)
+			return
+		}
+		peer.Ctx = true
+		peer.WriteOK()
+	})
+	mustRegister("PING", func(peer *miniredisserver.Peer, _ string, _ []string) { peer.WriteInline("PONG") })
+	mustRegister("CLIENT", func(peer *miniredisserver.Peer, _ string, _ []string) { peer.WriteOK() })
+	mustRegister("SENTINEL", func(peer *miniredisserver.Peer, _ string, args []string) {
+		if len(args) > 0 && strings.EqualFold(args[0], "get-master-addr-by-name") {
+			peer.WriteStrings([]string{host, port})
+			return
+		}
+		peer.WriteLen(0)
+	})
+	return f
+}
+
+func allEqual(values []string, want string) bool {
+	for _, v := range values {
+		if v != want {
+			return false
+		}
+	}
+	return true
 }
 
 func TestNewClientTLSCustomCAAndMutualTLS(t *testing.T) {
